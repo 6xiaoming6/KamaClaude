@@ -39,6 +39,7 @@ class SocketServer:
     # 启动 TCP 服务器；若端口已被占用则退出进程
     async def start(self) -> str:
         try:
+            # 巧妙的端口占用检测，如果能脸上目标端口，说明目标端口已经被占用了，抛出异常
             _r, w = await asyncio.open_connection(self._host, self._port)
             w.close()
             await w.wait_closed()
@@ -46,8 +47,9 @@ class SocketServer:
         except (ConnectionRefusedError, OSError):
             pass
 
+        # 端口没有被占用的话就启动服务
         self._server = await asyncio.start_server(
-            self._handle_connection,
+            self._handle_connection, # 每次新连接到来时执行的回调函数
             host=self._host,
             port=self._port,
             limit=_MAX_LINE_BYTES,
@@ -61,7 +63,8 @@ class SocketServer:
         self._server.close()
         await asyncio.wait_for(self._server.wait_closed(), timeout=2.0)
 
-    # 处理单个客户端连接，完成后关闭写流
+    # 处理单个客户端连接
+    # reader可以读取客户端的数据，writer可以向客户端发送数据
     async def _handle_connection(
         self,
         reader: asyncio.StreamReader,
@@ -70,6 +73,7 @@ class SocketServer:
         peer = writer.get_extra_info("peername", "<unknown>")
         logger.debug("client connected: %s", peer)
         try:
+            # 持续读取对应连接的请求
             await self._read_loop(reader, writer)
         finally:
             writer.close()
