@@ -15,7 +15,4 @@ uv.lock
 .idea/
 .DS_Store
 *.log
-docs/learning/**.md
-!docs/learning/S0-骨架与协议契约.md
-!docs/learning/S0-核心自测与面试标准答案.md
-!docs/learning/S0-socket_server逐行讲解.md
+docs/learning/
