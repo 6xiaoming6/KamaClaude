@@ -15,3 +15,9 @@ uv.lock
 .idea/
 .DS_Store
 *.log
+
+# Stage learning documents: keep the target branch policy when merging.
+/docs/*
+!/docs/learning/
+/docs/learning/*
+!/docs/learning/S2-*.md
