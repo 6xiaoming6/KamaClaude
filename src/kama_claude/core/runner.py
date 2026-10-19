@@ -57,6 +57,7 @@ class AgentRunner:
             max_steps=self._config.agent.max_steps,
         )
 
+        # 把事件写入工具注册到bus
         async with EventWriter(run_path / "events.jsonl") as writer:
             writer.subscribe(bus)
             await bus.publish(RunStartedEvent(run_id=run_id, goal=goal, ts=_now()))
