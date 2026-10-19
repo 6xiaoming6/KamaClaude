@@ -165,6 +165,272 @@ kama run --goal "请使用 read_file 读取 README.md，并介绍这个项目"
 
 建议先沿 `cmd_run → AgentRunner.run → AgentLoop.run` 读主流程，再分别进入 Provider、工具和事件模块。
 
+## S1 关键代码讲解
+
+下面沿 S1 的任务执行主线阅读本分支代码。标注“源码节选”的片段保留实际方法和字段；标注“伪代码”的片段省略参数组装、时间戳或事件对象构造，用于说明执行顺序。
+
+### 1. AgentRunner：组装一次任务的运行环境
+
+源码：[runner.py](./src/kama_claude/core/runner.py)，`AgentRunner.run()`。以下为源码节选，省略运行目录、订阅者注册和事件文件初始化：
+
+```python
+bus = EventBus()
+provider = self._provider or DeepseekProvider(self._config.llm.default_model)
+registry = ToolRegistry()
+registry.register(ReadFileTool())
+loop = AgentLoop(provider, registry, bus)
+
+context = ExecutionContext(
+    run_id=run_id,
+    goal=goal,
+    max_steps=self._config.agent.max_steps,
+)
+```
+
+这里是在“准备执行环境”。`provider` 负责访问模型，`registry` 保存工具实现，`bus` 传递运行事件，`context` 保存本次任务的消息和状态。将同一个总线传给各组件，才能把一次任务的不同进度交给同一组订阅者。
+
+`self._provider or DeepseekProvider(...)` 表示：显式注入 Provider 时使用注入的对象，否则创建默认 DeepSeek Provider。Provider 的选择发生在这里，`AgentLoop` 只依赖统一的 `chat()` 接口。
+
+创建 `ExecutionContext` 时，`__post_init__()` 会在历史为空时把 `goal` 加入第一条 `user` 消息。此时任务状态是 `running`，步数是 0。
+
+### 2. AgentLoop：驱动模型与工具的核心循环
+
+源码：[loop.py](./src/kama_claude/core/loop.py)，`AgentLoop.run()`。以下是正常执行路径的简化伪代码，异常处理见后面的第 7 节：
+
+```python
+while not context.is_done():
+    context.step += 1
+    await bus.publish(step_started)
+
+    response = await provider.chat(
+        context.messages, registry.tool_schemas(), bus, context.run_id
+    )
+    # 省略：把 response 的文字和工具调用组装成 blocks
+    context.add_assistant_message(blocks)  # 先记下模型的回复
+
+    if response.stop_reason == "tool_use":
+        for tool_call in response.tool_calls:
+            result = await invoke_tool(registry, tool_call, bus, context.run_id)
+            context.add_tool_result(
+                tool_call.id, result.content, is_error=result.is_error
+            )  # 再追加实际工具结果
+
+    if response.stop_reason == "end_turn":
+        context.mark_success()
+    elif context.step >= context.max_steps:
+        context.mark_failed("exceeded_max_steps")
+
+    await bus.publish(step_finished)
+```
+
+`step_started` 和 `step_finished` 在伪代码中表示对应的事件对象。`blocks` 是模型文字形成的 `text` 块，以及各次工具调用形成的 `tool_use` 块；实际源码在循环中逐个组装它们。
+
+阅读时重点看三个顺序：
+
+- **先保存模型请求，再保存工具结果。** 这样历史中才有“模型申请调用 → 程序提供结果”的对应关系。
+- **先处理本轮结果，再判断是否继续。** `is_done()` 检查状态是否已经不为 `running`；状态未结束时，下一轮携带更新后的历史再次调用模型。
+- **优先判断 `end_turn`，再判断步数上限。** 如果最后允许的一轮恰好完成任务，代码将其标记为成功。
+
+一次 `AgentLoop.run()` 驱动整个任务，一次 `while` 迭代只是其中一个 step。同一轮申请的多个工具当前依次执行；正常走到末尾的每一轮都会发布 `step.finished`，并不只在整次任务结束时发布。
+
+### 3. ExecutionContext：工具结果如何进入下一轮对话
+
+源码：[context.py](./src/kama_claude/core/context.py)，`add_tool_result()`。下面节选了结果块和分组判断：
+
+```python
+block = {
+    "type": "tool_result",
+    "tool_use_id": tool_use_id,
+    "content": content,
+}
+if is_error:
+    block["is_error"] = True
+
+last = self.messages[-1] if self.messages else None
+if (
+    last is not None
+    and last["role"] == "user"
+    and isinstance(last["content"], list)
+    and last["content"]
+    and all(b.get("type") == "tool_result" for b in last["content"])
+):
+    last["content"].append(block)
+else:
+    self.messages.append({"role": "user", "content": [block]})
+```
+
+这段判断只做一件事：最后一条消息如果已经专门存放工具结果，就继续往里面追加；否则新建一条结果消息。
+
+第一个工具结果到来时，最后一条通常是模型的 `assistant` 消息，因此进入 `else`。同轮第二个结果到来时，最后一条已经是只含 `tool_result` 的 `user` 消息，因此进入 `if`。`last` 引用列表中的原字典，所以向 `last["content"]` 追加内容会直接更新消息历史。
+
+例如模型同一轮请求读取 A、B 两个文件，历史会形成：
+
+```text
+messages[0] user：读取 A 和 B
+messages[1] assistant：[tool_use(call_A), tool_use(call_B)]
+messages[2] user：[tool_result(call_A), tool_result(call_B)]
+messages[3] assistant：根据两个文件给出的回答
+```
+
+`tool_use_id` 对应的是一次调用的 ID。同一个工具可以调用多次，不能仅凭工具名称关联结果。这里的 `user` 是当前 Anthropic 格式中承载工具结果的消息角色，不表示用户手动输入了文件内容。
+
+方法本身没有比较 step 编号；分组依赖调用顺序。下一轮模型回复加入新的 `assistant` 消息后，后续工具结果自然会再新建一条消息。
+
+### 4. Provider：一次模型调用怎样变成统一响应
+
+源码：[provider.py](./src/kama_claude/core/llm/provider.py)。`AnthropicProvider.chat()` 的关键流式处理如下，`kwargs` 为此前已组装的模型、系统提示词、历史和工具参数：
+
+```python
+async with self._client.messages.stream(**kwargs) as stream:
+    async for text in stream.text_stream:
+        await bus.publish(LlmTokenEvent(run_id=run_id, token=text, ts=_now()))
+        text_parts.append(text)
+    final_message = await stream.get_final_message()
+```
+
+收到文字后，同时发布事件供终端展示，并保存片段供最终拼接。`get_final_message()` 取得 SDK 汇总后的完整响应，后续从中提取用量、停止原因和 `tool_use` 内容块。它不是另外发起一次模型生成请求。
+
+最终转换关系可以写成下面的伪代码：
+
+```python
+return LlmResponse(
+    text="".join(text_parts),
+    tool_calls=parsed_tool_calls,
+    stop_reason=final_message.stop_reason or "end_turn",
+    usage=usage_stats,
+)
+```
+
+`parsed_tool_calls` 和 `usage_stats` 在这里表示此前整理好的工具调用列表与用量对象。返回类型定义在 [llm/types.py](./src/kama_claude/core/llm/types.py)。Loop 取得工具调用后才实际执行，Provider 不直接读取本地文件。
+
+**DeepSeek 复用的是协议处理。** `DeepseekProvider.__init__()` 用以下源码替换客户端，再交给父类初始化：
+
+```python
+client = anthropic.AsyncAnthropic(
+    api_key=api_key,
+    base_url="https://api.deepseek.com/anthropic",
+)
+super().__init__(model=model, client=client)
+```
+
+因此继承的 `chat()` 发请求时，目标已经是 DeepSeek，而事件和返回对象仍沿用统一结构。该片段省略了密钥检查及测试客户端注入分支。
+
+**OpenAI 在同一文件内完成格式转换。** 请求前将 `tool_use` 转为 `assistant.tool_calls`，将工具参数通过 `json.dumps()` 转成字符串，将 `tool_result` 转为独立的 `tool` 消息。响应流中的工具参数可能分段到达，关键处理节选为：
+
+```python
+call = pending.setdefault(
+    fragment.index, {"id": "", "name": "", "arguments": ""}
+)
+call["id"] += fragment.id or ""
+if fragment.function is not None:
+    call["name"] += fragment.function.name or ""
+    call["arguments"] += fragment.function.arguments or ""
+```
+
+按 `index` 分组可以分别累积多次工具调用，避免交错到达的参数混在一起。流结束后再对完整参数执行 `json.loads()`，校验其为对象，并转换为 `ToolCallBlock`；未完整结束或参数损坏时抛出异常，而不是返回一个成功结果。
+
+### 5. invoke_tool：在执行前后统一处理查找、检查与错误
+
+源码：[tools/invocation.py](./src/kama_claude/core/tools/invocation.py)，`invoke_tool()`。下面的伪代码省略了事件字段、耗时计算和 `_fail()` 参数：
+
+```python
+tool = registry.get(tool_call.name)
+if tool is None:
+    return await _fail(...)  # 未注册的工具
+
+required = tool.input_schema.get("required", [])
+missing = [name for name in required if name not in tool_call.input]
+if missing:
+    return await _fail(...)  # 缺少必填参数
+
+try:
+    result = await asyncio.wait_for(
+        tool.invoke(dict(tool_call.input)), timeout=timeout
+    )
+except TimeoutError:
+    return await _fail(...)  # 超时也包装成工具结果
+except Exception:
+    return await _fail(...)  # 其他执行异常
+```
+
+`_fail()` 会发布工具失败事件，并返回 `ToolResult(is_error=True, ...)`。实际代码还会处理工具主动返回的错误结果，并在成功时发布工具完成事件。Loop 再通过 `add_tool_result()` 将结果交回模型，因此工具失败通常仍有机会在后续轮次修正。
+
+这里的参数检查只确认必填字段存在，尚未完整验证字段类型或全部 JSON Schema 约束。默认超时是 10 秒；`wait_for()` 依赖异步取消，不能保证中断工具中的同步阻塞操作。实际文件读取发生在 [ReadFileTool.invoke()](./src/kama_claude/core/tools/builtin/read_file.py)，不在注册表或模型中。
+
+### 6. EventBus：一次通知怎样到达终端和文件
+
+源码：[events/bus.py](./src/kama_claude/core/events/bus.py) 和 [events/writer.py](./src/kama_claude/core/events/writer.py)。注册和分发的关键逻辑如下：
+
+```python
+# Runner 把展示回调注册到总线
+bus.subscribe(printer.handle)
+
+# EventWriter.subscribe() 内部注册自己的处理方法
+bus.subscribe(writer.handle)
+
+# EventBus.publish() 内部按注册顺序执行
+for handler in self._subscribers:
+    await handler(event)
+```
+
+上面的 `printer` 是 CLI 创建的展示器，实际通过 `extra_handlers` 传入 Runner；`writer` 在 Runner 中通过 `async with EventWriter(...)` 打开。片段合并展示三个位置的逻辑，不是完整的 Runner 方法。
+
+同一条事件先由终端订阅者按类型显示，再由文件订阅者序列化。文件写入的核心只有两行：
+
+```python
+self._file.write(event.model_dump_json() + "\n")
+self._file.flush()
+```
+
+每行一个 JSON，使事件可以逐条读取。`publish()` 会等待订阅者完成，当前没有后台队列或并行广播；一个订阅者抛出未捕获异常，会中断本次分发。文件写入虽放在 `async def` 中，当前 `write()`、`flush()` 仍是同步调用。
+
+`context.messages` 保存模型继续推理所需的历史，事件记录用于展示与观察。工具成功事件只记录名称、调用 ID 和耗时等字段，不含完整文件内容，因此事件文件不能直接替代上下文或完整任务快照。
+
+### 7. 异常与取消：怎样结束整次任务
+
+源码：[loop.py](./src/kama_claude/core/loop.py) 中的模型调用异常处理节选：
+
+```python
+try:
+    response = await self._provider.chat(...)
+except asyncio.CancelledError:
+    context.mark_failed("cancelled")
+    raise
+except Exception:
+    context.mark_failed("llm_error")
+    break
+```
+
+模型调用异常与工具错误结果走不同路径：前者结束循环，后者通常加入历史让模型继续处理。取消单独处理并向上传播，以便 Runner 记录任务结束后，让 CLI 返回取消退出码。
+
+Runner 的收尾顺序可以简化为：
+
+```text
+发布 run.started
+    ↓
+等待 AgentLoop.run(context)
+    ↓
+若收到取消：记录 cancelled 状态
+    ↓
+发布 run.finished，记录状态、原因和步数
+    ↓
+退出 EventWriter 的 async with，关闭事件文件
+    ↓
+若是取消：继续向 CLI 抛出 CancelledError
+```
+
+这是 Runner 已处理的正常、循环内模型异常和取消路径；未被处理的其他异常仍可能提前向外传播，不能认为任意故障都一定写出完整的结束事件。
+
+| 触发条件 | 任务状态或行为 |
+| --- | --- |
+| 模型返回 `end_turn` | `success`；当前以模型结束标记判定，未独立验收目标 |
+| 达到最大 step 且没有 `end_turn` | `failed`，原因 `exceeded_max_steps` |
+| Provider 调用抛出普通异常 | `failed`，原因 `llm_error` |
+| 执行被取消 | `failed`，原因 `cancelled`，并向上层传播取消 |
+| 单个工具返回错误 | 写入错误结果供模型继续处理，任务不因此立即失败 |
+
+最后区分两个限制：`max_steps` 限制整个循环的轮数；Provider 的 `max_tokens` 或 `max_completion_tokens` 限制单次模型请求的生成输出。当前没有整次任务的费用或总 token 预算控制。
+
 ## 上下文与事件怎样配合
 
 ```text
