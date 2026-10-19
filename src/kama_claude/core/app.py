@@ -6,6 +6,7 @@ import fnmatch
 import json
 import logging
 import signal
+import sys
 import time
 from typing import Any
 
@@ -124,15 +125,21 @@ class CoreApp:
 
         loop = asyncio.get_running_loop()
         shutdown = asyncio.Event()
-        loop.add_signal_handler(signal.SIGINT, shutdown.set)
-        loop.add_signal_handler(signal.SIGTERM, shutdown.set)
-
-        await shutdown.wait()
-
-        logger.info("shutting down")
-        await server.stop()
+        try:
+            if sys.platform != "win32":
+                # 用户按 Ctrl+C，或进程收到终止信号，就调用shutdown.set()，通知主协程停止等待
+                loop.add_signal_handler(signal.SIGINT, shutdown.set)
+                loop.add_signal_handler(signal.SIGTERM, shutdown.set)
+            # Windows 由 asyncio.run() 将 Ctrl+C 转为主任务取消，再进入 finally 清理。
+            await shutdown.wait()
+        finally:
+            logger.info("shutting down")
+            await server.stop()
 
 
 # 同步入口：启动 CoreApp 事件循环
 def run() -> None:
-    asyncio.run(CoreApp().run())
+    try:
+        asyncio.run(CoreApp().run())
+    except KeyboardInterrupt:
+        pass

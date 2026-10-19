@@ -10,7 +10,7 @@ from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus, EventHandler
 from kama_claude.core.events.writer import EventWriter
 from kama_claude.core.llm.base import LLMProvider
-from kama_claude.core.llm.provider import AnthropicProvider
+from kama_claude.core.llm.provider import DeepseekProvider
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.runs import RUNS_DIR, new_run_id
 from kama_claude.core.tools.builtin.read_file import ReadFileTool
@@ -54,11 +54,12 @@ class AgentRunner:
             max_steps=self._config.agent.max_steps,
         )
 
+        # 把事件写入工具注册到bus
         async with EventWriter(run_path / "events.jsonl") as writer:
             writer.subscribe(bus)
             await bus.publish(RunStartedEvent(run_id=run_id, goal=goal, ts=_now()))
 
-            provider = self._provider or AnthropicProvider(self._config.llm.default_model)
+            provider = self._provider or DeepseekProvider(self._config.llm.default_model)
             registry = ToolRegistry()
             registry.register(ReadFileTool())
             loop = AgentLoop(provider, registry, bus)
