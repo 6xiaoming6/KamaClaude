@@ -10,7 +10,7 @@ from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus, EventHandler
 from kama_claude.core.events.writer import EventWriter
 from kama_claude.core.llm.base import LLMProvider
-from kama_claude.core.llm.provider import AnthropicProvider
+from kama_claude.core.llm.provider import DeepseekProvider
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.runs import RUNS_DIR, new_run_id
 from kama_claude.core.tools.builtin.read_file import ReadFileTool
@@ -46,7 +46,7 @@ class AgentRunner:
         for h in self._extra_handlers:
             bus.subscribe(h)
 
-        provider = self._provider or AnthropicProvider(self._config.llm.default_model)
+        provider = self._provider or DeepseekProvider(self._config.llm.default_model)
         registry = ToolRegistry()
         registry.register(ReadFileTool())
         loop = AgentLoop(provider, registry, bus)

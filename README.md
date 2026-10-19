@@ -29,7 +29,7 @@ S0 的 Core、TCP 和 `kama ping` 路径仍然存在，但它们与 S1 的本地
 
 - `AgentRunner.run()`：生成运行 ID、组装依赖、连接事件订阅者、创建上下文，最后记录结束状态。
 - `AgentLoop.run()`：重复调用模型、保存模型回复、执行工具、保存工具结果，并判断是否结束。
-- `AnthropicProvider.chat()`：完成一次模型调用，把平台响应转换为统一的 `LlmResponse`。
+- Provider 的 `chat()`：完成一次模型调用，把平台响应转换为统一的 `LlmResponse`；当前默认使用 `DeepseekProvider`。
 
 一次 Runner 调用包含一次完整的 Loop 调用；一次 Loop 调用可以包含多次 Provider 调用。`while` 的一次迭代称为一个 step，通常包含一次模型调用，以及该轮提出的工具执行。
 
@@ -61,15 +61,17 @@ Provider 不维护独立的对话记忆。消息历史按照“用户目标 → 
 
 **答：** 收到 `end_turn` 时标记成功；达到 `max_steps`、模型调用失败或任务取消时，按相应原因结束。最大步数与 token 预算是不同的限制。
 
-默认 `max_steps=20`，限制循环轮数。Provider 中的 `max_tokens=4096` 限制单次模型调用的生成输出，当前没有任务总 token 或费用预算控制。若同一轮既收到 `end_turn` 又达到最大步数，代码优先判定成功。
+默认 `max_steps=20`，限制循环轮数。Anthropic/DeepSeek 请求中的 `max_tokens=4096`、OpenAI 请求中的 `max_completion_tokens=4096` 限制单次模型调用的生成输出，当前没有任务总 token 或费用预算控制。若同一轮既收到 `end_turn` 又达到最大步数，代码优先判定成功。
 
 “成功”目前表示模型返回了结束标记，尚未通过独立规则或测试验证用户目标真的完成。其他模型停止原因也没有在 Anthropic 路径中得到完整分类处理。
 
-### 8. 现在可以直接通过配置切换 OpenAI 吗？
+### 8. OpenAI 和 DeepSeek 怎样接入？可以通过配置切换吗？
 
-**答：** 当前新增了 `OpenaiProvider` 类，但默认 CLI 路径仍创建 `AnthropicProvider`，没有增加配置切换入口。
+**答：** 当前已有 `AnthropicProvider`、`OpenaiProvider` 和 `DeepseekProvider` 三个实现，默认 CLI 路径创建 `DeepseekProvider`，尚未增加配置切换入口。
 
-`OpenaiProvider` 在同一个文件内完成消息、工具定义及响应格式转换，保留统一的 `chat()` 接口。`AgentRunner` 支持通过 `provider` 参数注入其他实现，但设置 `OPENAI_API_KEY` 本身不会让 `kama run` 自动切换平台。当前依赖声明也尚未加入 OpenAI SDK。
+`OpenaiProvider` 在同一个文件内转换消息、工具定义及流式响应；`DeepseekProvider` 通过 DeepSeek 的 Anthropic 兼容地址复用 `AnthropicProvider.chat()`。二者均返回统一的 `LlmResponse`，不要求修改 AgentLoop 或上下文格式。
+
+`AgentRunner` 支持通过 `provider` 参数注入其他实现，但设置某个平台的密钥或修改模型名，不会自动切换 Provider。OpenAI SDK 仍需额外安装，当前 `pyproject.toml` 尚未声明该依赖。具体方式见下方“模型平台适配”。
 
 ## 本阶段完成了什么
 
@@ -77,7 +79,7 @@ Provider 不维护独立的对话记忆。消息历史按照“用户目标 → 
 | --- | --- |
 | 任务入口 | `kama run --goal "..."` |
 | 多轮执行 | 模型调用与工具执行循环 |
-| 模型适配 | 默认 Anthropic；另有尚未接入默认入口的 `OpenaiProvider` |
+| 模型适配 | Anthropic、OpenAI、DeepSeek；默认 DeepSeek，可注入其他 Provider |
 | 上下文管理 | 保存目标、消息历史、步数、状态和结束原因 |
 | 工具注册与调用 | 工具说明生成、按名称查找、执行与错误结果封装 |
 | 内置工具 | `read_file` |
@@ -153,7 +155,7 @@ kama run --goal "请使用 read_file 读取 README.md，并介绍这个项目"
 | [执行循环](./src/kama_claude/core/loop.py) | `AgentLoop.run()` | 模型调用、工具执行、历史更新与终止条件 |
 | [执行上下文](./src/kama_claude/core/context.py) | `add_assistant_message()`、`add_tool_result()` | 模型回复形成一条消息，同轮工具结果合并到一条结果消息 |
 | [模型接口](./src/kama_claude/core/llm/base.py) | `LLMProvider.chat()` | 各 Provider 遵循的调用约定；通过 Protocol 描述接口 |
-| [模型适配](./src/kama_claude/core/llm/provider.py) | `AnthropicProvider.chat()`、`OpenaiProvider.chat()` | 调用平台 API，转换为 `LlmResponse`，发布文字与用量事件 |
+| [模型适配](./src/kama_claude/core/llm/provider.py) | `AnthropicProvider.chat()`、`OpenaiProvider.chat()`、`DeepseekProvider.__init__()` | 适配平台 API；DeepSeek 复用 Anthropic 的消息处理与事件逻辑 |
 | [统一返回类型](./src/kama_claude/core/llm/types.py) | `LlmResponse`、`ToolCallBlock`、`UsageStats` | 将完整回复拆为文字、工具调用、停止原因和用量 |
 | [工具注册表](./src/kama_claude/core/tools/registry.py) | `register()`、`get()`、`tool_schemas()` | 保存工具实现，并提供模型需要的说明 |
 | [工具调用入口](./src/kama_claude/core/tools/invocation.py) | `invoke_tool()`、`_fail()` | 必填参数检查、超时控制、耗时记录、错误结果与事件 |
@@ -186,9 +188,46 @@ kama run --goal "请使用 read_file 读取 README.md，并介绍这个项目"
 
 文件中的 JSONL 与 S0 的 NDJSON 使用相同的“每行一个 JSON”组织方式，但这里用于事件记录，不是在 TCP 上传输任务。
 
+## 模型平台适配
+
+三个 Provider 均位于 [provider.py](./src/kama_claude/core/llm/provider.py)，遵循相同的 `chat(messages, tool_schemas, bus, run_id)` 接口：
+
+| 平台 | 实现类 | 接口与消息处理 | API key | 模型名示例 |
+| --- | --- | --- | --- | --- |
+| Anthropic | `AnthropicProvider` | Messages API；使用现有内容块结构 | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6` |
+| OpenAI | `OpenaiProvider` | Chat Completions；在类内转换工具定义、工具消息与流式调用参数 | `OPENAI_API_KEY` | `gpt-4.1-mini` |
+| DeepSeek（当前默认） | `DeepseekProvider` | `https://api.deepseek.com/anthropic`；继承 Anthropic Provider 的 `chat()` | `DEEPSEEK_API_KEY` | `deepseek-flash` |
+
+OpenAI 的工具参数以 JSON 字符串传递，工具结果使用 `role="tool"`；Provider 负责将这些格式与项目内部的 `tool_use`、`tool_result` 互相转换。DeepSeek 使用 Anthropic 兼容入口，复用已有流式文本、工具调用解析和事件发布，不额外增加一套格式转换。
+
+DeepSeek 兼容接口会忽略 `cache_control` 和工具结果的 `is_error`，因此错误描述仍需保留在结果内容中；也不能把 Anthropic 的缓存控制标记等同于 DeepSeek 的缓存行为。接口依据：[DeepSeek 官方兼容说明](https://api-docs.deepseek.com/guides/anthropic_api/)、[OpenAI 官方 Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)。
+
+当前 `AgentRunner.run()` 的默认构造行是：
+
+```python
+provider = self._provider or DeepseekProvider(self._config.llm.default_model)
+```
+
+需要从 Python 入口使用其他平台时，可以显式注入，例如下面的 OpenAI 调用方式；执行该入口前需要安装 `openai` SDK 并设置 `OPENAI_API_KEY`：
+
+```python
+import asyncio
+
+from kama_claude.core.config import get_config
+from kama_claude.core.llm.provider import OpenaiProvider
+from kama_claude.core.runner import AgentRunner
+
+config = get_config()
+provider = OpenaiProvider(model="gpt-4.1-mini")
+runner = AgentRunner(config, provider=provider)
+asyncio.run(runner.run("请使用 read_file 读取 README.md，并介绍这个项目"))
+```
+
+也可以按同样方式注入 `AnthropicProvider` 或 `DeepseekProvider`。注入时以 Provider 构造参数中的模型名为准。`KAMA_LLM_DEFAULT_MODEL` 只影响 Runner 默认创建的 Provider，代码没有 `KAMA_LLM_PROVIDER` 开关。
+
 ## 快速开始
 
-需要 Python 3.12.x 和 uv。在仓库根目录执行下面的命令。当前默认任务路径需要可用的 Anthropic API key；实际模型调用会产生服务端用量。
+需要 Python 3.12.x 和 uv。在仓库根目录执行下面的命令。当前默认任务路径需要可用的 DeepSeek API key；实际模型调用会产生服务端用量。
 
 ### Windows PowerShell
 
@@ -201,11 +240,11 @@ if (-not (Test-Path -LiteralPath .env)) {
 }
 ```
 
-编辑 `.env`，设置自己的密钥；模型与步数可以按需调整：
+编辑 `.env`，设置 DeepSeek 密钥并显式指定对应模型；`.env.example` 中仍保留原来的 Anthropic 示例，需要按下面的实际运行配置调整：
 
 ```dotenv
-ANTHROPIC_API_KEY=替换为你的密钥
-KAMA_LLM_DEFAULT_MODEL=claude-sonnet-4-6
+DEEPSEEK_API_KEY=替换为你的密钥
+KAMA_LLM_DEFAULT_MODEL=deepseek-flash
 KAMA_MAX_STEPS=20
 ```
 
@@ -224,7 +263,7 @@ uv sync
 if [ ! -e .env ]; then
     cp .env.example .env
 fi
-# 编辑 .env，填写 ANTHROPIC_API_KEY 后运行
+# 编辑 .env，填写 DEEPSEEK_API_KEY，并将 KAMA_LLM_DEFAULT_MODEL 设为 deepseek-flash
 uv run kama run --goal "请使用 read_file 读取 README.md，并用中文介绍这个项目"
 ```
 
@@ -258,8 +297,10 @@ uv run kama run --goal "请使用 read_file 读取 README.md，并用中文介�
 
 | 配置 | 默认值或来源 | 用途 |
 | --- | --- | --- |
-| `ANTHROPIC_API_KEY` | 无默认值 | 默认模型客户端的认证密钥 |
-| `KAMA_LLM_DEFAULT_MODEL` | `claude-sonnet-4-6` | 默认调用的模型名称 |
+| `DEEPSEEK_API_KEY` | 无默认值 | 当前默认 DeepSeek 客户端的认证密钥 |
+| `OPENAI_API_KEY` | 无默认值 | 显式使用 `OpenaiProvider` 时的认证密钥 |
+| `ANTHROPIC_API_KEY` | 无默认值 | 显式使用 `AnthropicProvider` 时的认证密钥 |
+| `KAMA_LLM_DEFAULT_MODEL` | 代码默认仍为 `claude-sonnet-4-6` | 默认入口已切到 DeepSeek，运行示例显式覆盖为 `deepseek-flash` |
 | `KAMA_MAX_STEPS` | `20` | 必须为正整数，限制循环轮数 |
 | `KAMA_CONFIG` | `~/.kama/config.toml` | TOML 配置路径 |
 | `KAMA_LOG_LEVEL` | `INFO` | 日志级别 |
@@ -273,11 +314,11 @@ TOML 示例：
 max_steps = 10
 
 [llm]
-default_model = "claude-sonnet-4-6"
+default_model = "deepseek-flash"
 router = "static"
 ```
 
-`router` 目前只是配置字段，Runner 仍按 `default_model` 创建固定的 Anthropic Provider，没有实现动态模型路由。密钥通过环境变量或 `.env` 提供。
+`router` 目前只是配置字段，Runner 按 `default_model` 创建固定的 DeepSeek Provider，没有实现动态模型路由或按模型名自动选择平台。密钥通过环境变量或 `.env` 提供。
 
 ## 验证与测试
 
@@ -291,13 +332,7 @@ uv run mypy src
 
 其中 `test_context.py` 验证消息历史与同轮结果合并，`test_loop.py` 验证循环和终止条件，`test_invocation.py` 验证工具错误与超时，`test_runner.py` 验证任务生命周期及事件文件。
 
-需要实际调用 Anthropic、验证读文件完整链路时，再执行：
-
-```text
-uv run python -m pytest tests/integration/test_run_e2e.py -v
-```
-
-该测试需要真实 API key，并会产生模型调用；缺少密钥时跳过。`test_ping_roundtrip.py` 则测试 Core 通信，受上述 Windows 启停限制影响。
+需要验证真实模型的读文件完整链路时，可使用上方配置和 CLI 命令。历史端到端测试 [test_run_e2e.py](./tests/integration/test_run_e2e.py) 仍以 `ANTHROPIC_API_KEY` 判断是否跳过，但 Runner 默认平台已经是 DeepSeek，测试的密钥门禁与模型配置尚待同步，不能将跳过视为 DeepSeek 验证通过。`test_ping_roundtrip.py` 测试 Core 通信，受上述 Windows 启停限制影响。
 
 协议文档检查命令，Windows 使用 UTF-8 模式避免默认编码问题：
 
@@ -311,7 +346,7 @@ uv run python -X utf8 scripts/gen_protocol_doc.py --check
 
 | 当前实现 | 可以继续改进的方向 |
 | --- | --- |
-| Runner 默认固定使用 Anthropic；OpenAI 类尚未接入入口 | 在后续明确需要时增加 Provider 选择与依赖管理 |
+| Runner 默认固定使用 DeepSeek；可注入其他 Provider，尚无配置切换入口 | 在后续明确需要时增加 Provider 选择与依赖管理，并同步集成测试条件 |
 | 工具入口只检查必填参数是否存在 | 校验参数类型、枚举、额外字段等完整 schema 约束 |
 | `read_file` 拒绝含 `..` 的路径，但未限制绝对路径或符号链接目标 | 基于工作目录解析真实路径并检查访问边界 |
 | `read_file` 先同步读取全部字节，再截取最多 512 KiB 返回 | 限量读取并避免阻塞事件循环 |

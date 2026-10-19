@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 import json
 import os
 from datetime import UTC, datetime
@@ -124,12 +123,12 @@ class OpenaiProvider:
             if not api_key:
                 raise SystemExit("OPENAI_API_KEY not set")
             try:
-                sdk = importlib.import_module("openai")
+                import openai
             except ModuleNotFoundError as exc:
                 if exc.name != "openai":
                     raise
                 raise SystemExit("OpenaiProvider requires the openai package") from exc
-            self._client: Any = sdk.AsyncOpenAI(api_key=api_key)
+            self._client: Any = openai.AsyncOpenAI(api_key=api_key)
         else:
             self._client = client
         self._model = model
@@ -286,3 +285,18 @@ class OpenaiProvider:
             text="".join(texts),
             usage=usage,
         )
+
+
+class DeepseekProvider(AnthropicProvider):
+    # 初始化 DeepSeek 客户端，复用 Anthropic 格式的消息处理
+    def __init__(self, model: str, client: Any = None) -> None:
+        if client is None:
+            api_key = os.environ.get("DEEPSEEK_API_KEY")
+            if not api_key:
+                raise SystemExit("DEEPSEEK_API_KEY not set")
+            client = anthropic.AsyncAnthropic(
+                api_key=api_key,
+                base_url='https://api.deepseek.com/anthropic',
+            )
+
+        super().__init__(model=model, client=client)
