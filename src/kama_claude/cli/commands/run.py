@@ -89,6 +89,8 @@ async def _run_async(goal: str, config: KamaConfig) -> int:
     # 注册事件回调函数，client收到事件后，交给这个函数处理
     client.on_event(on_event)
     # 创建任务持续读取core发来的数据
+    # 一定要先创建循环监听服务器消息再send_command，不然前面的请求可能会接收不到响应
+
     loop_task = asyncio.create_task(client.run_event_loop())
 
     try:
