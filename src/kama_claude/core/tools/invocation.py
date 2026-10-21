@@ -84,7 +84,9 @@ async def invoke_tool(
         )
 
     try:
+        # 工具执行
         result = await asyncio.wait_for(tool.invoke(dict(tool_call.input)), timeout=timeout)
+        # 记录工具执行事件
         ms = elapsed()
         if result.is_error:
             return await _fail(

@@ -73,19 +73,22 @@ class SocketClient:
                     break
                 await self._dispatch(line)
         finally:
+            # _pending里面存的是等待响应的请求
             for fut in self._pending.values():
                 if not fut.done():
                     fut.cancel()
             self._pending.clear()
 
     # 解析单行消息并路由到 pending future（RPC 响应）或 event handler（服务器推送）
+    # 区分出这行数据到底是某个请求的响应还是事件推送
     async def _dispatch(self, line: bytes) -> None:
         try:
             msg: dict[str, Any] = json.loads(line)
         except json.JSONDecodeError:
             return
-
+        # 如果拿到的是请求的响应
         if "jsonrpc" in msg:
+            # 拿到对应请求的id，更新_pending里面对应请求的状态
             req_id: str | None = msg.get("id")
             if req_id and req_id in self._pending:
                 fut = self._pending.pop(req_id)
@@ -97,6 +100,7 @@ class SocketClient:
                         )
                     else:
                         fut.set_result(msg.get("result") or {})
+        # 如果拿到的是事件推送，就广播事件，cli客户端中订阅的handler就能看到事件
         elif msg.get("kind") == "event":
             event_data: dict[str, Any] = msg.get("event", {})
             for handler in self._event_handlers:

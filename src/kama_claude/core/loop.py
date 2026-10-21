@@ -37,6 +37,7 @@ class AgentLoop:
 
             # [plan] call LLM — API errors terminate the run
             try:
+                # 获取模型回复结果
                 response = await self._provider.chat(
                     messages=context.messages,
                     tool_schemas=self._registry.tool_schemas(),
@@ -52,6 +53,7 @@ class AgentLoop:
                 break
 
             # [observe] append assistant content blocks to context
+            # 把模型回复的消息添加到上下文的历史消息中
             blocks: list[dict[str, object]] = []
             if response.text:
                 blocks.append({"type": "text", "text": response.text})
@@ -62,6 +64,8 @@ class AgentLoop:
             context.add_assistant_message(blocks)
 
             # [act] execute each requested tool; errors become tool results so loop continues
+            # 如果模型的回复中有工具调用，就执行对应工具，然后把结果添加到上下文中
+            # 一次回复的多个调用应放在一起
             if response.stop_reason == "tool_use":
                 for tc in response.tool_calls:
                     result = await invoke_tool(
@@ -70,12 +74,14 @@ class AgentLoop:
                     context.add_tool_result(tc.id, result.content, is_error=result.is_error)
 
             # Termination check — end_turn wins over max_steps if both hit on same step
+            # end_turn表示模型认为回复已经完成了，这段对话可以正常结束
             if response.stop_reason == "end_turn":
                 context.result = response.text or ""
                 context.mark_success()
             elif context.step >= context.max_steps:
                 context.mark_failed("exceeded_max_steps")
 
+            # 对话正常结束或者超过步数限制后，结束这次对话并发布事件
             await self._bus.publish(
                 StepFinishedEvent(run_id=context.run_id, step=context.step, ts=_now())
             )

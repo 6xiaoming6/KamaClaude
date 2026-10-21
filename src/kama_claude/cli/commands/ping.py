@@ -23,6 +23,7 @@ def cmd_ping(config: KamaConfig) -> None:
 # 向 core 守护进程发送 ping 请求，打印 pong 响应及延迟
 async def _ping(config: KamaConfig) -> None:
     t0 = time.monotonic()
+    # 和core守护进程建立TCP连接
     reader, writer = await asyncio.open_connection(config.host, config.port)
 
     req = {
@@ -31,21 +32,27 @@ async def _ping(config: KamaConfig) -> None:
         "method": "core.ping",
         "params": {"client": f"cli/{kama_claude.__version__}"},
     }
+    # 发送请求
     writer.write((json.dumps(req) + "\n").encode())
     await writer.drain()
 
+    # 使用reader接收服务端的响应
     line = await asyncio.wait_for(reader.readline(), timeout=10.0)
     latency_ms = int((time.monotonic() - t0) * 1000)
 
+    # 已经接收到了响应或者超时接收失败，关闭写段
     writer.close()
     await writer.wait_closed()
 
+    # 解析响应
     raw = json.loads(line)
     if "error" in raw:
         err = JsonRpcError.model_validate(raw)
         print(f"error: {err.error.code} {err.error.message}", file=sys.stderr)
         sys.exit(1)
 
+    # 验证相应格式
     resp = JsonRpcSuccess.model_validate(raw)
+    # 验证返回的数据格式
     result = PongResult.model_validate(resp.result)
     print(f"pong server={result.server_version} uptime={result.uptime_ms}ms latency={latency_ms}ms")
