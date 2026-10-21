@@ -35,6 +35,7 @@ class CoreApp:
         self._start_time = time.monotonic()
         self._bus = EventBus()
         self._broadcaster = IpcEventBroadcaster()
+        # 刚创建时就注册好广播器，之后每一个事件发布时都会经过广播器
         self._bus.subscribe(self._broadcaster.handle)
         self._current_run_task: asyncio.Task[None] | None = None
         self._config: KamaConfig | None = None
@@ -74,7 +75,7 @@ class CoreApp:
             replayed_count = await self._replay_events(
                 cmd.replay_from_run, writer, cmd.topics
             )
-
+        # 客户端发送订阅请求时，广播器会保存当前客户端的订阅内容，以后事件发布时广播给订阅了的客户端
         sub_id = self._broadcaster.subscribe(writer, cmd.topics, cmd.scope)
         return EventSubscribeResult(subscription_id=sub_id, replayed_count=replayed_count)
 
@@ -131,8 +132,11 @@ class CoreApp:
                 loop.add_signal_handler(signal.SIGINT, shutdown.set)
                 loop.add_signal_handler(signal.SIGTERM, shutdown.set)
             # Windows 由 asyncio.run() 将 Ctrl+C 转为主任务取消，再进入 finally 清理。
+            # 如果 shutdown 未设置，await 会挂起当前协程，事件循环继续运行，服务器正常处理客户端请求
+            # 直到某个信号触发 shutdown.set()，await 才返回，程序继续往下走
             await shutdown.wait()
         finally:
+            # Windows系统下，用户按 Ctrl+C 时，asyncio.run() 会取消主任务，无须额外注册信号处理器
             logger.info("shutting down")
             await server.stop()
 

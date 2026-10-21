@@ -33,7 +33,7 @@ class AgentRunner:
         runs_dir: Path | None = None,
     ) -> None:
         self._config = config
-        self._bus = bus
+        self._bus = bus # 现在事件总线放到了core里面，所有事件
         self._provider = provider
         self._extra_handlers: list[EventHandler] = extra_handlers or []
         self._runs_dir = runs_dir or RUNS_DIR
@@ -54,7 +54,7 @@ class AgentRunner:
             max_steps=self._config.agent.max_steps,
         )
 
-        # 把事件写入工具注册到bus
+        # AgentRunner启动后把事件写入工具注册到bus
         async with EventWriter(run_path / "events.jsonl") as writer:
             writer.subscribe(bus)
             await bus.publish(RunStartedEvent(run_id=run_id, goal=goal, ts=_now()))

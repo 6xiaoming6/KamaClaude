@@ -127,6 +127,291 @@ sequenceDiagram
 
 这是正常路径的逻辑示意。客户端应能处理响应与事件交错，不能把“下一行必定是这个请求的响应”作为实现前提；尤其历史回放事件会在订阅响应之前发送。
 
+## 事件系统完整拆解：从订阅到 CLI 显示
+
+可以先用下面这段话检查自己是否理解：
+
+> CLI 建立 TCP 连接，注册本地事件回调并启动接收循环，然后向 Core 发送订阅请求，声明关心的 topics 和 scope。订阅成功后，CLI 再发送 agent.run。任务在 Core 中执行，执行组件将事件发布到 Core 内部的 EventBus；总线调用广播器，广播器把符合订阅条件的事件通过该客户端已有的 TCP 连接推送回去。CLI 的唯一接收循环区分命令响应和事件，分别唤醒等待命令结果的协程，或调用事件回调更新进度。
+
+这就是当前 S2 的主要事件链路。这里的“实时监控”指 Core 主动推送事件，CLI 不需要反复发送“任务现在怎么样了”的查询请求；它不代表已经实现严格实时或可靠送达。
+
+### 1. 哪些东西在 Core，哪些东西在 CLI
+
+| 所在进程 | 组件 | 实际职责 |
+| --- | --- | --- |
+| Core | Runner、AgentLoop、Provider、工具执行包装层 | 在执行到对应位置时创建并发布运行、步骤、模型、工具事件 |
+| Core | `EventBus` | 把 Python 事件对象交给已注册的内部处理函数 |
+| Core | `EventWriter` | 把事件保存到本次运行的 `events.jsonl` |
+| Core | `IpcEventBroadcaster` | 保存客户端订阅，匹配事件类型与运行范围，写入对应 TCP 连接 |
+| CLI | `SocketClient` | 发送命令，持续读取响应和推送事件，完成本地分发 |
+| CLI | `on_event`、`StdoutPrinter` | 处理事件字典，打印文本、步骤和工具状态，判断运行是否结束 |
+
+因此，“总线和各种事件都在 Core 中”对于**正常 CLI → Core 执行路径的事件产生与发布**是正确的：CLI 没有再创建一套 Agent EventBus，也没有直接调用 Core 中的 Python 事件对象。
+
+事件类定义在 [core/bus/events.py](./src/kama_claude/core/bus/events.py)，属于源码中的数据结构定义；进程边界要看运行时谁创建、谁调用。Core 创建的是 Pydantic 事件对象，TCP 上传输的是序列化字节，CLI 解析后拿到的是新的 Python 字典。客户端与 Core 没有共享这一块对象内存。
+
+CLI 里的 `finished = asyncio.Event()` 也不要混在一起：它是本地协程等待/唤醒用的同步工具，不是 `RunFinishedEvent`，也不是另一条事件总线。
+
+### 2. 两种“订阅”必须分开理解
+
+**第一种：Core 进程内部的函数订阅。**
+
+Core 初始化时把广播器注册到总线：
+
+```python
+self._bus.subscribe(self._broadcaster.handle)
+```
+
+Runner 执行时，文件写入器也会注册到同一总线：
+
+```python
+writer.subscribe(bus)  # 内部调用 bus.subscribe(writer.handle)
+```
+
+这里保存的是 Python 函数引用。源码 [events/bus.py](./src/kama_claude/core/events/bus.py) 的核心实现很直接：
+
+```python
+# subscribe(handler) 的关键语句
+self._subscribers.append(handler)
+
+# publish(event) 的关键语句
+for handler in self._subscribers:
+    await handler(event)
+```
+
+所以，发布事件并不是启动某个独立的消息中间件，而是依次调用这些异步函数。**EventBus 当前不按 topic 筛选；它把事件交给所有已注册的内部处理函数。**内部发布路径本身也不缓存历史，文件记录由 EventWriter 负责。
+
+**第二种：客户端通过 RPC 注册网络事件订阅。**
+
+CLI 发送：
+
+```python
+await client.send_command("event.subscribe", {
+    "topics": ["run.*", "step.*", "tool.*", "llm.token", "llm.usage"],
+    "scope": "global",
+})
+```
+
+Core 的 `_subscribe_handler()` 取得当前连接 writer，再调用：
+
+```python
+sub_id = self._broadcaster.subscribe(writer, cmd.topics, cmd.scope)
+```
+
+广播器保存的是“哪个连接想接收什么事件”，大致包括：
+
+```text
+subscription_id：这条订阅的标识
+writer：向这个客户端发送数据的连接写入端
+topics：客户端关心的事件类型模式
+scope：客户端关心的运行范围
+```
+
+**CLI 的这次订阅保存在广播器中，不是把 CLI 的回调函数注册到了 Core 的 EventBus。**函数引用不会通过 TCP 传过去，传过去的只是 topics、scope 等 JSON 数据。
+
+同样，CLI 调用 `client.on_event(on_event)` 只是登记本地处理函数，不会自动向服务器发起订阅。要收到并处理事件，本地回调和服务端订阅两步都要准备好。
+
+### 3. 一条事件究竟怎样走到 CLI
+
+以任务开始时的 `run.started` 为例。Runner 发布事件的关键语句是：
+
+```python
+await bus.publish(RunStartedEvent(run_id=run_id, goal=goal, ts=_now()))
+```
+
+**第一步：Core 提前保存广播器的方法，发布事件时才调用它。**
+
+在 `CoreApp.__init__()` 中，先创建总线和广播器，再把两者关联起来：
+
+```python
+self._bus = EventBus()
+self._broadcaster = IpcEventBroadcaster()
+self._bus.subscribe(self._broadcaster.handle)
+```
+
+这里的 `self._broadcaster.handle` 没有括号，表示把这个实例的方法作为回调保存到总线中；此时没有执行广播，也没有发送网络数据。
+
+之后 `bus.publish(event)` 遍历内部订阅者：
+
+```python
+for handler in self._subscribers:
+    await handler(event)
+```
+
+当 `handler` 取到之前保存的广播器方法时，`await handler(event)` 就相当于 `await self._broadcaster.handle(event)`。因此，发布者不需要每次再手动调用广播器；所谓“总线通知广播器”，就是遍历保存的方法并调用它，并没有隐藏的消息转发机制。
+
+**第二步：广播器提前记住每个客户端的连接和筛选条件。**
+
+这由前面的 `event.subscribe` 请求完成，Core 的关键处理语句是：
+
+```python
+writer = get_connection_writer()
+sub_id = self._broadcaster.subscribe(writer, cmd.topics, cmd.scope)
+```
+
+广播器的 `subscribe()` 会把它们保存成一条 `_Subscription`：
+
+```python
+sub = _Subscription(sub_id=sub_id, writer=writer, topics=topics, scope=scope)
+self._subscriptions.append(sub)
+```
+
+这里的 writer 是**服务端向当前客户端发送数据的连接写入端**。CLI 和 TUI 分别连接 Core，各自对应自己的 writer。广播器保存 writer，才能在未来事件发生时找到应该向哪个连接写数据。
+
+注意两个列表不同：EventBus 的 `_subscribers` 存放内部处理函数；广播器的 `_subscriptions` 存放客户端连接及其筛选条件。前者决定事件交给哪些内部组件处理，后者决定哪些客户端能收到事件。
+
+**第三步：事件发布后，广播器逐条检查订阅并发送。**
+
+整个过程可以沿着下面这条路径追踪：
+
+```text
+Core 进程
+  AgentRunner 创建 RunStartedEvent 对象
+    → bus.publish(event)
+      → broadcaster.handle(event)
+          检查客户端的 topics 和 scope
+          匹配后包装为 EventPushEnvelope
+          将 JSON + 换行写入该客户端的 TCP 连接
+      → EventWriter.handle(event)
+          将事件写入 events.jsonl
+
+                         TCP 进程边界
+
+CLI 进程
+  run_event_loop() 持续读取一行数据
+    → _dispatch(line) 解析 JSON
+      → 发现 kind == "event"
+        → 取出 event 字典
+          → await on_event(event)
+            → await printer.handle(event)
+              → 终端显示 [run] 和 run_id
+```
+
+广播器在 Core 初始化时先注册，当前运行的 Writer 随后注册；总线按注册顺序执行。它们是同一条发布路径上的两个处理函数，并不是先落盘后才允许广播。
+
+网络上的这条消息形如：
+
+```json
+{"kind":"event","event":{"type":"run.started","run_id":"run-demo","goal":"读取 pyproject.toml","ts":"2026-10-19T09:00:00+00:00"}}
+```
+
+注意外层 `kind` 与内层 `type` 的区别：`kind="event"` 帮助 SocketClient 判断这是事件推送；`type="run.started"` 帮助广播器和界面判断具体发生了什么。
+
+把 [ipc_broadcaster.py](./src/kama_claude/core/transport/ipc_broadcaster.py) 的 `handle()` 展开看，核心实现如下，省略了类型标注、日志及连接异常清理：
+
+```python
+async def handle(self, event):
+    event_dict = event.model_dump()
+    event_type = event_dict.get("type", "")
+    run_id = event_dict.get("run_id")
+
+    for sub in list(self._subscriptions):
+        if not self._matches_topic(event_type, sub.topics):
+            continue
+        if not self._matches_scope(run_id, sub.scope):
+            continue
+
+        envelope = EventPushEnvelope(event=event_dict)
+        sub.writer.write(envelope.model_dump_json().encode() + b"\n")
+        await sub.writer.drain()
+```
+
+这段代码分为五个动作：
+
+1. `model_dump()` 将 Core 内部的 Pydantic 事件对象转换为字典，取出用于匹配的 type 和 run_id。
+2. 遍历订阅记录，同时检查 topic 和 scope；不匹配就跳过，不会向这个连接发包。
+3. 用 `EventPushEnvelope` 包装事件，添加 `kind="event"` 外壳，方便客户端区分事件与 RPC 响应。
+4. `model_dump_json().encode() + b"\n"` 将包转换为 JSON 字节并追加 NDJSON 分隔符，再交给该订阅对应的 writer。
+5. `await drain()` 在需要时等待发送缓冲压力缓解，再继续处理后面的订阅。它不是 CLI 已经收到或显示成功的确认。
+
+例如发布一条 `run_id="run-demo"` 的 `run.started` 事件，广播器保存了三条订阅：
+
+| 客户端 | topics | scope | 本次是否发送 |
+| --- | --- | --- | --- |
+| CLI A | `run.*` | `global` | 是，写入 CLI A 对应的 writer |
+| TUI B | `run.*`、`tool.*` | `run:run-demo` | 是，另写一份到 TUI B 对应的 writer |
+| 客户端 C | `tool.*` | `global` | 否，`run.started` 不匹配 `tool.*` |
+
+因此，这里的“广播”实际是**应用代码遍历匹配的订阅，通过各自已有的 TCP 连接分别发送一份事件**。TCP 没有替项目自动广播，客户端也不需要为每种事件新建连接。
+
+完整实现遇到连接写入失败时，会先记录失效 writer，再在遍历后移除该 writer 的全部订阅，避免遍历过程中直接修改原订阅列表。正常断连也会由 SocketServer 清理订阅。事件处理与连接发送都按当前协程顺序执行，并没有自动并行发送给所有客户端。
+
+最后，CLI 的 `run_event_loop()` 读到这一行，交给 `_dispatch()`；后者识别 `kind="event"`，取出 event 字典并调用本地 `on_event()`。此时事件才进入 CLI 的显示逻辑，而 Core 的原始事件对象始终没有跨进程共享。
+
+### 4. topic 决定事件种类，scope 决定运行范围
+
+topic 是对事件 `type` 的字符串匹配。它不是另外创建的一个 Python 事件对象，也不是一条单独的 TCP 连接。
+
+| 订阅条件 | 会匹配什么 |
+| --- | --- |
+| `run.*` | `run.started`、`run.finished` |
+| `step.*` | `step.started`、`step.finished` |
+| `tool.*` | `tool.call_started`、`tool.call_finished`、`tool.call_failed` |
+| `llm.token` | 文本增量事件；一段增量不一定只对应一个模型 token |
+| `llm.usage` | 模型用量事件 |
+
+当前 CLI 订阅上述模式，但它没有订阅 `llm.model_selected`。因此不能把 `on_event` 理解为“Core 发布的所有事件都会经过这里”；只有符合这个连接订阅条件、成功传到客户端的事件才会被交给它。
+
+广播器还检查 scope：`global` 接收所有运行中匹配 topic 的实时事件，`run:某个ID` 则再限制 run_id。**topic 和 scope 必须同时匹配**，不是满足其中一个就发送。
+
+CLI 当前使用 global，并没有在回调中按自己的 run_id 再过滤。理解现有流程时要记住这个边界；代码中存在 run_id，不代表客户端已经完整实现了运行隔离。
+
+### 5. 一条 TCP 连接，两类消息，两种等待
+
+接收循环不会为每个 topic 再开一个连接，也不会为命令响应另开一个连接。同一条连接上交错到达的消息统一交给 `_dispatch()`：
+
+```text
+收到一行 JSON
+  ├─ 有 jsonrpc 字段：命令响应
+  │    根据 id 找到 _pending 中的 Future
+  │    set_result 或 set_exception
+  │    唤醒正在 await send_command(...) 的协程
+  │
+  └─ kind 为 event：事件推送
+       调用本地 on_event 回调
+       打印执行进度
+       若 type 为 run.finished，再设置本地 finished 标志
+```
+
+对比下面两行，就能看出两种等待的差别：
+
+```python
+await client.send_command("agent.run", {"goal": goal})  # 等启动命令响应
+await finished.wait()                                 # 等运行结束事件
+```
+
+第一行由 RPC 响应完成对应 Future 后继续，第二行由事件回调调用 `finished.set()` 后继续。**拿到 run_id 和拿到最终运行状态，是两个不同结果。**
+
+`_pending` 保存等待响应的请求，不保存事件订阅；`_event_handlers` 保存客户端本地回调；Core 广播器的 `_subscriptions` 保存连接和筛选条件；Core EventBus 的 `_subscribers` 保存内部处理函数。这四个集合所在的位置和用途不同。
+
+接收循环中的 `await reader.readline()` 没有数据时会挂起让出执行权，不是一直占着 CPU 查询状态。`create_task()` 使它能与“发送命令并等待结果”的协程配合运行，也不意味着新建了线程或进程。
+
+### 6. 为什么必须是这个启动顺序
+
+正常 CLI 运行的顺序是：
+
+```text
+建立连接
+→ 注册本地 on_event
+→ 创建持续接收数据的协程任务
+→ 发送 event.subscribe 并等待响应
+→ 发送 agent.run 并等待响应
+→ 等待 run.finished
+→ 清理接收任务、关闭连接、退出 CLI
+```
+
+接收循环先于订阅请求启动，因为 `send_command()` 的响应也由它接收；订阅成功先于任务启动，因为任务开始后马上就可能发布事件。这里的接收循环不仅监听执行进度，也负责让 RPC 请求完成。
+
+历史回放会在订阅响应之前发送事件，客户端不能靠“消息到达顺序”判断消息身份。唯一读循环按消息外壳和请求 ID 分发，才能同时支持这些情况。
+
+### 7. 多客户端观察和连接关闭时会怎样
+
+CLI、TUI 分别建立自己的 TCP 连接，也分别注册自己的订阅。一个事件匹配两边订阅时，广播器向两个 writer 各写一份数据；这里的“广播”是应用层逐连接发送，不是 TCP 自带的广播，也不是把事件无条件发给所有连接。
+
+客户端断开后，服务端清理该连接的订阅，但不会因此取消 Core 中的 Agent 任务。没有 CLI 订阅时，执行组件仍然可以发布事件，EventWriter 仍然可以记录历史。观察端不是执行循环的所有者。
+
+当前广播与内部处理是串行等待的，慢连接可能拖慢执行；断线重连默认也不会补发遗漏历史。事件系统已经分开了执行与显示的职责，但还不能保证任何情况下都不丢、不重、互不阻塞。历史回放和相应改进见后文。
+
 ## 快速开始：用三个终端观察同一任务
 
 ### 1. 准备环境和配置

@@ -61,6 +61,7 @@ class SocketServer:
             pass
 
         # 端口没有被占用的话就启动服务
+        # 注册到事件循环，启动后台 accept 循环，循环注册成功启动server后就会接着往下走，不阻塞
         self._server = await asyncio.start_server(
             self._handle_connection, # 每次新连接到来时执行的回调函数
             host=self._host,
