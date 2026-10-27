@@ -147,6 +147,7 @@ class SocketServer:
 
         if self._trace is not None:
             client_id = str(writer.get_extra_info("peername", "<unknown>"))
+            # 这里用trace记录 cli->core的请求
             self._trace.emit(
                 TraceRecord(
                     ts=_now(),
@@ -193,6 +194,7 @@ class SocketServer:
         if self._trace is not None:
             kind = "error" if isinstance(msg, JsonRpcError) else "response"
             client_id = str(writer.get_extra_info("peername", "<unknown>"))
+            # 这里用trace记录core->client的请求响应
             self._trace.emit(
                 TraceRecord(
                     ts=_now(),

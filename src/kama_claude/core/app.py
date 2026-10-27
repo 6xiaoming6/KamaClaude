@@ -60,6 +60,7 @@ class CoreApp:
         )
 
     # 将 EventBus 事件写入 trace（作为 EventBus 订阅者）
+    # 这里用trace记录core内部的事件传递
     async def _trace_event_handler(self, event: BaseModel) -> None:
         assert self._trace is not None
         event_dict = event.model_dump()
