@@ -66,6 +66,7 @@ class SocketServer:
     # 启动 TCP 服务器；若端口已被占用则退出进程
     async def start(self) -> str:
         try:
+            # 巧妙的端口占用检测，如果能脸上目标端口，说明目标端口已经被占用了，抛出异常
             _r, w = await asyncio.open_connection(self._host, self._port)
             w.close()
             await w.wait_closed()
@@ -73,8 +74,10 @@ class SocketServer:
         except (ConnectionRefusedError, OSError):
             pass
 
+        # 端口没有被占用的话就启动服务
+        # 注册到事件循环，启动后台 accept 循环，循环注册成功启动server后就会接着往下走，不阻塞
         self._server = await asyncio.start_server(
-            self._handle_connection,
+            self._handle_connection, # 每次新连接到来时执行的回调函数
             host=self._host,
             port=self._port,
             limit=_MAX_LINE_BYTES,
@@ -88,7 +91,8 @@ class SocketServer:
         self._server.close()
         await asyncio.wait_for(self._server.wait_closed(), timeout=2.0)
 
-    # 处理单个客户端连接，完成后关闭写流
+    # 处理单个客户端连接
+    # reader可以读取客户端的数据，writer可以向客户端发送数据
     async def _handle_connection(
         self,
         reader: asyncio.StreamReader,
@@ -97,6 +101,7 @@ class SocketServer:
         peer = writer.get_extra_info("peername", "<unknown>")
         logger.debug("client connected: %s", peer)
         try:
+            # 持续读取对应连接的请求
             await self._read_loop(reader, writer)
         finally:
             if self._broadcaster is not None:
@@ -142,6 +147,7 @@ class SocketServer:
 
         if self._trace is not None:
             client_id = str(writer.get_extra_info("peername", "<unknown>"))
+            # 这里用trace记录 cli->core的请求
             self._trace.emit(
                 TraceRecord(
                     ts=_now(),
@@ -188,6 +194,7 @@ class SocketServer:
         if self._trace is not None:
             kind = "error" if isinstance(msg, JsonRpcError) else "response"
             client_id = str(writer.get_extra_info("peername", "<unknown>"))
+            # 这里用trace记录core->client的请求响应
             self._trace.emit(
                 TraceRecord(
                     ts=_now(),

@@ -51,6 +51,7 @@ class ExecutionContext:
         if is_error:
             block["is_error"] = True
 
+        # 将一次回复的多个工具调用结果放到一个数组里面，他们在一条message里面
         last = self.messages[-1] if self.messages else None
         if (
             last is not None

@@ -11,7 +11,7 @@ from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus, EventHandler
 from kama_claude.core.events.writer import EventWriter
 from kama_claude.core.llm.base import LLMProvider
-from kama_claude.core.llm.provider import AnthropicProvider
+from kama_claude.core.llm.provider import DeepseekProvider
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.runs import RUNS_DIR, new_run_id
 from kama_claude.core.session.model import Session
@@ -57,7 +57,7 @@ class AgentRunner:
         trace: TraceWriter | None = None,
     ) -> None:
         self._config = config
-        self._bus = bus
+        self._bus = bus # 现在事件总线放到了core里面，所有事件
         self._provider = provider
         self._extra_handlers: list[EventHandler] = extra_handlers or []
         self._runs_dir = runs_dir or RUNS_DIR
@@ -124,6 +124,7 @@ class AgentRunner:
         )
         prefill_len = len(history)
 
+        # AgentRunner启动后把事件写入工具注册到bus
         async with EventWriter(run_path / "events.jsonl") as writer:
             writer.subscribe(bus)
             await bus.publish(RunStartedEvent(run_id=run_id, goal=goal, ts=_now()))
@@ -137,7 +138,7 @@ class AgentRunner:
 
             cancelled = False
             try:
-                provider: LLMProvider = self._provider or AnthropicProvider(
+                provider: LLMProvider = self._provider or DeepseekProvider(
                     self._config.llm.default_model
                 )
                 if self._trace is not None:
