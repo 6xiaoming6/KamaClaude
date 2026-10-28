@@ -115,6 +115,7 @@ class AgentRunner:
         for h in self._extra_handlers:
             bus.subscribe(h)
 
+        # 使用 thread.jsonl 作为历史消息，将基础提示词与会话笔记组合成 system prompt
         context = ExecutionContext(
             run_id=run_id,
             goal=goal,
@@ -167,6 +168,7 @@ class AgentRunner:
                 )
             )
 
+        # 把这次运行的的中间历史对话保存到session对应的thread.jsonl文件中，只保存后面新增的内容即可
         if session is not None and store is not None:
             store.append_messages(session.id, context.messages[prefill_len:], run_id=run_id)
 

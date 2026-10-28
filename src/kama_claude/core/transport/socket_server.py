@@ -169,6 +169,7 @@ class SocketServer:
 
         _writer_var.set(writer)
         try:
+            # 拿到处理该请求的方法返回的结果返回
             result = await handler(req.params)
         except HandlerError as e:
             await self._send(writer, make_error(req.id, e.code, str(e), e.data))
