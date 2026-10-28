@@ -12,7 +12,7 @@ from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus, EventHandler
 from kama_claude.core.events.writer import EventWriter
 from kama_claude.core.llm.base import LLMProvider
-from kama_claude.core.llm.provider import AnthropicProvider
+from kama_claude.core.llm.provider import DeepseekProvider
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.runs import RUNS_DIR, new_run_id
@@ -60,7 +60,7 @@ class AgentRunner:
         permission_manager: PermissionManager | None = None,
     ) -> None:
         self._config = config
-        self._bus = bus
+        self._bus = bus # 现在事件总线放到了core里面，所有事件
         self._provider = provider
         self._extra_handlers: list[EventHandler] = extra_handlers or []
         self._runs_dir = runs_dir or RUNS_DIR
@@ -119,6 +119,7 @@ class AgentRunner:
         for h in self._extra_handlers:
             bus.subscribe(h)
 
+        # 使用 thread.jsonl 作为历史消息，将基础提示词与会话笔记组合成 system prompt
         context = ExecutionContext(
             run_id=run_id,
             goal=goal,
@@ -128,6 +129,7 @@ class AgentRunner:
         )
         prefill_len = len(history)
 
+        # AgentRunner启动后把事件写入工具注册到bus
         async with EventWriter(run_path / "events.jsonl") as writer:
             writer.subscribe(bus)
             await bus.publish(RunStartedEvent(run_id=run_id, goal=goal, ts=_now()))
@@ -141,7 +143,7 @@ class AgentRunner:
 
             cancelled = False
             try:
-                provider: LLMProvider = self._provider or AnthropicProvider(
+                provider: LLMProvider = self._provider or DeepseekProvider(
                     self._config.llm.default_model
                 )
                 if self._trace is not None:
@@ -177,6 +179,7 @@ class AgentRunner:
                 )
             )
 
+        # 把这次运行的的中间历史对话保存到session对应的thread.jsonl文件中，只保存后面新增的内容即可
         if session is not None and store is not None:
             store.append_messages(session.id, context.messages[prefill_len:], run_id=run_id)
 
