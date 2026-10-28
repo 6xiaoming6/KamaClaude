@@ -45,13 +45,18 @@ class AnthropicProvider:
         run_id: str,
         *,
         step: int = 0,
+        system: str | None = None,
     ) -> LlmResponse:
         await bus.publish(
             LlmModelSelectedEvent(run_id=run_id, model=self._model, strategy="static", ts=_now())
         )
 
-        system: list[dict[str, object]] = [
-            {"type": "text", "text": _SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}},
+        system_blocks: list[dict[str, object]] = [
+            {
+                "type": "text",
+                "text": system or _SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},
+            },
         ]
 
         tools: list[dict[str, object]] = list(tool_schemas)
@@ -63,7 +68,7 @@ class AnthropicProvider:
         kwargs: dict[str, object] = {
             "model": self._model,
             "max_tokens": 4096,
-            "system": system,
+            "system": system_blocks,
             "messages": messages,
         }
         if tools:
@@ -136,8 +141,12 @@ class OpenaiProvider:
         self._model = model
 
     # 将现有上下文中的文本、tool_use 和 tool_result 转换为 OpenAI 消息
-    def _convert_messages(self, messages: list[dict[str, object]]) -> list[dict[str, object]]:
-        converted: list[dict[str, object]] = [{"role": "system", "content": _SYSTEM_PROMPT}]
+    def _convert_messages(
+        self, messages: list[dict[str, object]], *, system: str | None = None
+    ) -> list[dict[str, object]]:
+        converted: list[dict[str, object]] = [
+            {"role": "system", "content": system or _SYSTEM_PROMPT}
+        ]
         for message in messages:
             role, content = message["role"], message["content"]
             if isinstance(content, str):
@@ -194,6 +203,7 @@ class OpenaiProvider:
         run_id: str,
         *,
         step: int = 0,
+        system: str | None = None,
     ) -> LlmResponse:
         await bus.publish(
             LlmModelSelectedEvent(run_id=run_id, model=self._model, strategy="static", ts=_now())
@@ -201,7 +211,7 @@ class OpenaiProvider:
         kwargs: dict[str, object] = {
             "model": self._model,
             "max_completion_tokens": 4096,
-            "messages": self._convert_messages(messages),
+            "messages": self._convert_messages(messages, system=system),
             "stream": True,
             "stream_options": {"include_usage": True},
         }
