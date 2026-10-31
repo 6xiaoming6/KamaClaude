@@ -56,6 +56,7 @@ class PermissionManager:
         self._timeout_s = timeout_s
 
     # 对工具名 + 参数执行 4 层静态评估，不挂起
+    # 只对允许工具执行进行静态评估，不需要等待用户审批
     def evaluate(self, tool_name: str, params: dict[str, Any]) -> PermissionDecision:
         from kama_claude.core.permissions.policy import evaluate
         policy = self._policies.get(tool_name)
@@ -74,6 +75,7 @@ class PermissionManager:
         policy = self._policies.get(tool_name)
 
         # Tier 1: deny_patterns（bash only，不可被缓存绕过）
+        # 先检查bash工具执行的命令是否是不允许的
         if command and policy:
             for pat in policy.deny_patterns:
                 if re.search(pat, command):
@@ -81,6 +83,7 @@ class PermissionManager:
                     return False, "auto_deny"
 
         # Tier 2: OUTSIDE_CWD_HEURISTICS（bash only，强制 ASK，不可被任何缓存绕过）
+        # 如果bash工具需要访问外层目录，一律询问用户
         outside_cwd = bool(command and matches_outside_cwd(command))
 
         if not outside_cwd:
@@ -119,7 +122,7 @@ class PermissionManager:
             session_id=session_id,
             tool_name=tool_name,
         )
-
+        # 发布PermissionRequestedEvent
         await event_emitter(
             {
                 "type": "permission.requested",
@@ -132,6 +135,7 @@ class PermissionManager:
             }
         )
 
+        # 等待用户的审批结果
         try:
             if self._timeout_s > 0:
                 raw = await asyncio.wait_for(future, timeout=self._timeout_s)
@@ -141,7 +145,7 @@ class PermissionManager:
             self._pending.pop(tool_use_id, None)
             logger.info("permission: timeout tool_use_id=%s tool=%s", tool_use_id, tool_name)
             return False, "timeout"
-
+        # 拿到审批结果后先根据审批结果更新工具权限缓存，然后再返回最终是否放行
         allowed = self._apply_response(raw, session_id, tool_name)
         return allowed, raw
 
@@ -151,10 +155,13 @@ class PermissionManager:
         if req is None:
             logger.warning("permission.respond: unknown tool_use_id=%s", tool_use_id)
             return
+        # 将用户决定填入 Future，让等待审批的协程恢复执行
         if not req.future.done():
             req.future.set_result(decision)
 
     # 应用审批决策，更新 session + persistent 缓存，返回是否放行
+    # 如果用户允许的话最终返回True，不允许就返回False
+    # 如果是always的决策还需要更新策略缓存
     def _apply_response(self, decision: str, session_id: str, tool_name: str) -> bool:
         allow = decision in ("allow_once", "always_allow")
         if decision == "always_allow":

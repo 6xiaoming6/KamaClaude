@@ -92,7 +92,7 @@ async def invoke_tool(
             bus, run_id, tool_call,
             "runtime_error", f"unknown tool: {tool_call.name}", elapsed(),
         )
-
+    # 先验证工具调用的具体参数是否正确
     if tool.params_model is not None:
         try:
             tool.params_model.model_validate(dict(tool_call.input))
@@ -101,11 +101,11 @@ async def invoke_tool(
                 bus, run_id, tool_call,
                 "schema_error", str(exc), elapsed(),
             )
-
+    # 参数验证通过后再检查权限：allow 放行，deny 拒绝，ask 等待用户决定
     if permission_manager is not None:
         async def _emit_permission(raw: dict[str, Any]) -> None:
             await bus.publish(PermissionRequestedEvent(**raw, run_id=run_id))
-
+        # 阻塞在这里等待用户审批
         allowed, decision = await permission_manager.check_and_wait(
             tool_use_id=tool_call.id,
             tool_name=tool_call.name,
@@ -141,6 +141,7 @@ async def invoke_tool(
                 elapsed(),
             )
 
+    # 用户同意后开始执行，如果工具出现允许重试的错误，允许重试_MAX_RETRIES次
     for attempt in range(1, _MAX_RETRIES + 2):
         error_class: str | None = None
         error_message: str | None = None
@@ -151,10 +152,12 @@ async def invoke_tool(
             )
             ms = elapsed()
 
+            # 工具执行失败后拿到错误类型，然后根据错误类型判断是否需要重试
             if result.is_error:
                 error_class = result.error_type or "runtime_error"
                 error_message = result.content
             else:
+                # 工具执行成功了就正常返回
                 await bus.publish(
                     ToolCallFinishedEvent(
                         run_id=run_id,
@@ -196,9 +199,11 @@ async def invoke_tool(
                     ts=_now(),
                 )
             )
+            # 按照2、4、8...设置重试时长
             await asyncio.sleep(_RETRY_BASE_S * (2 ** (attempt - 1)))
             continue
 
+        # 如果错误不允许重试或者重试次数超过了限制就返回失败
         return await _fail(
             bus, run_id, tool_call,
             error_class, error_message, ms,

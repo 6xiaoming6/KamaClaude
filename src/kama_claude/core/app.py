@@ -131,6 +131,7 @@ class CoreApp:
         if self._permission_manager is None:
             logger.error("permission.respond: PermissionManager not initialized")
             return PermissionRespondResult()
+        # 调用permission_manager.respond方法，将对应工具调用的feture设置为done
         self._permission_manager.respond(cmd.tool_use_id, cmd.decision)
         return PermissionRespondResult()
 

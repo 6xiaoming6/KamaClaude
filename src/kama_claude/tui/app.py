@@ -463,6 +463,7 @@ class KamaTuiApp(App[None]):
             self._append(Static(f"[red]send error: {e}[/red]", classes="log-line"))
 
     # 处理内联审批控件的用户决策：发送 IPC 响应并恢复输入框
+    # self.post_message(self.Decided(...))后，框架会自动调用on_permission_select_decided
     async def on_permission_select_decided(self, msg: PermissionSelect.Decided) -> None:
         tool_use_id = msg.tool_use_id
         decision = msg.decision
