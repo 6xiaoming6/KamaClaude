@@ -79,8 +79,9 @@ class AgentLoop:
                 break
 
             # [observe] append assistant content blocks to context
-            # 把模型回复的消息添加到上下文的历史消息中
-            blocks: list[dict[str, object]] = []
+            # 把模型回复加入历史，保留 S7 的 thinking 消息块及其顺序
+            # thinking blocks must come first and be preserved verbatim for extended thinking mode
+            blocks: list[dict[str, object]] = list(response.thinking_blocks)
             if response.text:
                 blocks.append({"type": "text", "text": response.text})
             for tc in response.tool_calls:

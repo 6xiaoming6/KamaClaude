@@ -15,8 +15,8 @@ from kama_claude.core.config import KamaConfig
     ("platform", "shutdown_mode"),
     [("win32", "cancel"), ("linux", "cancel"), ("linux", "signal")],
 )
-# 功能：验证 Windows 启动不注册 Unix 信号，取消或正常退出都会关闭服务器。
-# 设计：注入模拟服务器和信号注册器，覆盖 Windows 取消及 Unix 信号、取消三条路径。
+# 功能：验证 Windows 不注册 Unix 信号，取消或正常退出都会关闭服务器和 MCP 连接。
+# 设计：注入模拟服务器、MCP 管理器和信号注册器，覆盖 Windows 取消及 Unix 信号、取消路径。
 async def test_shutdown_closes_server(
     monkeypatch: pytest.MonkeyPatch, platform: str, shutdown_mode: str
 ) -> None:
@@ -24,6 +24,9 @@ async def test_shutdown_closes_server(
     server = Mock()
     server.start = AsyncMock(side_effect=lambda: started.set() or "127.0.0.1:7437")
     server.stop = AsyncMock()
+    mcp_manager = Mock()
+    mcp_manager.start_all = AsyncMock()
+    mcp_manager.stop_all = AsyncMock()
     register_signal = Mock()
     if platform == "win32":
         register_signal.side_effect = NotImplementedError
@@ -32,6 +35,7 @@ async def test_shutdown_closes_server(
     monkeypatch.setattr(core_app, "get_config", lambda: KamaConfig())
     monkeypatch.setattr(core_app, "setup_logging", Mock())
     monkeypatch.setattr(core_app, "SocketServer", Mock(return_value=server))
+    monkeypatch.setattr(core_app, "McpServerManager", Mock(return_value=mcp_manager))
     monkeypatch.setattr(asyncio.get_running_loop(), "add_signal_handler", register_signal)
 
     task = asyncio.create_task(core_app.CoreApp().run())
@@ -51,6 +55,7 @@ async def test_shutdown_closes_server(
         await asyncio.gather(task, return_exceptions=True)
 
     server.stop.assert_awaited_once()
+    mcp_manager.stop_all.assert_awaited_once()
     if platform == "win32":
         register_signal.assert_not_called()
     else:
