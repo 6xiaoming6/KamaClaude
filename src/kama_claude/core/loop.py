@@ -121,14 +121,18 @@ class AgentLoop:
 
             # 工具结果追加完毕（messages 末尾为 user）后检查压缩，仅在 run 继续时触发
             # 此时压缩结果 [user_summary, assistant_ack] 对下一次 LLM 调用是合法输入
+            # 在工具调用结果追加完毕后才执行自动压缩是为了保证消息的完整性
             if (
                 not context.is_done()
                 and response.stop_reason == "tool_use"
                 and self._compactor is not None
                 and self._compact_threshold > 0
                 and response.usage is not None
+                # 当前这一轮对话，消耗了模型上下文窗口用量的百分比
                 and response.usage.context_pct >= self._compact_threshold
             ):
+                # 消耗的上下文窗口占比大于阈值的话就自动压缩历史记录
+                # 只调整内存中的context，不修改文件内容
                 await self._compactor.compact(context, self._provider)
 
             # 对话正常结束或者超过步数限制后，结束这次对话并发布事件
