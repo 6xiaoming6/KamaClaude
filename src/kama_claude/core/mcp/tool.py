@@ -7,6 +7,7 @@ from kama_claude.core.tools.base import BaseTool, ToolResult
 
 
 # 将 MCP 工具包装为 BaseTool，使 ToolRegistry 可透明调用
+# 包装为模型可调用的 BaseTool，由包装工具转发 MCP 调用
 class McpTool(BaseTool):
     params_model = None  # input_schema 来自 MCP tool_def，不使用 pydantic model
 

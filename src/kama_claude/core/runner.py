@@ -50,7 +50,7 @@ class RunOutcome:
     result: str
     reason: str | None
 
-
+# 每次完整的[用户输入-结束]run都会创建一个新的runner
 class AgentRunner:
     # 组装所有运行时依赖，准备执行一次完整的 agent run
     def __init__(
@@ -77,6 +77,7 @@ class AgentRunner:
         self._task_registry = BackgroundTaskRegistry()
 
     # 构建工具注册表，注入 TaskManager（任务工具共享同一实例）；可选注入 SpawnAgentTool
+    # 根据白名单注册工具，按需注入其他额外的工具
     def _build_registry(
         self,
         task_manager: TaskManager,
@@ -92,6 +93,7 @@ class AgentRunner:
     ) -> ToolRegistry:
         allowed: set[str] | None = set(tool_whitelist) if tool_whitelist else None
 
+        # 没有设置白名单默认注册，设置了白名单就注册白名单里面的工具
         def _ok(name: str) -> bool:
             return allowed is None or name in allowed
 
@@ -111,6 +113,8 @@ class AgentRunner:
             note_tool = NoteSaveTool(store, session.id, run_id)
             if _ok(note_tool.name):
                 registry.register(note_tool)
+
+        # 创建子agent的工具是否注册
         if provider is not None and bus is not None and run_id is not None:
             runs_dir = child_runs_dir or self._runs_dir
             if _ok("spawn_agent"):
@@ -129,6 +133,7 @@ class AgentRunner:
                 )
             if _ok("agent_result"):
                 registry.register(AgentResultTool(self._task_registry))
+        # mcp内提供的工具是否注册
         if self._mcp_manager is not None:
             for mcp_tool in self._mcp_manager.get_tools():
                 if _ok(mcp_tool.name):

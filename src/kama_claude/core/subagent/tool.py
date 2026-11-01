@@ -135,7 +135,9 @@ class SpawnAgentTool(BaseTool):
 
         child_bus.subscribe(_bridge)
 
+        # 为子agent构建专门的tool_registry
         child_registry = self._build_child_registry(child_bus, child_run_id, profile)
+        # 创建子agent的loop
         child_loop = AgentLoop(
             self._provider,
             child_registry,
@@ -156,12 +158,14 @@ class SpawnAgentTool(BaseTool):
         child_run_path = self._runs_dir / child_run_id
         child_run_path.mkdir(parents=True, exist_ok=True)
 
+        # 子agent是后台类型的，就创建一个task在后台挂着跑
         if p.run_in_background:
             task: asyncio.Task[None] = asyncio.create_task(
                 self._run_background(
                     child_loop, child_context, child_bus, child_run_path, child_run_id
                 )
             )
+            # 注册这个后台task，方便查看答案
             self._task_registry.register(child_run_id, task, child_context)
             return ToolResult(
                 content=(
@@ -170,6 +174,7 @@ class SpawnAgentTool(BaseTool):
                 )
             )
 
+        # 前台agent的话就挂载在这里等待结果
         async with EventWriter(child_run_path / "events.jsonl") as writer:
             writer.subscribe(child_bus)
             await child_loop.run(child_context)

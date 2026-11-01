@@ -63,6 +63,7 @@ class McpClient:
         await self._initialize()
 
     # 通过 TCP 连接到 MCP server 并完成 initialize 握手
+    # 流程：建立连接 → initialize 请求与响应 → notifications/initialized 通知
     async def connect_tcp(self, host: str, port: int) -> None:
         self._reader, tcp_writer = await asyncio.open_connection(host, port, limit=self._STREAM_LIMIT)
         self._tcp_writer = tcp_writer
@@ -152,6 +153,7 @@ class McpClient:
         request = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
         async with self._lock:
             await self._write_line(json.dumps(request))
+            # 循环读取等待mcp服务器响应
             while True:
                 line = await self._read_line()
                 try:
@@ -170,6 +172,7 @@ class McpClient:
                         raise McpToolError(
                             f"{err.get('message', str(err))} (code={err.get('code')})"
                         )
+                    # 读取到合法回复之后就返回结果
                     result: dict[str, Any] = msg.get("result", {})
                     return result
 
@@ -186,6 +189,7 @@ class McpClient:
             if w is None:
                 raise McpServerUnavailableError("stdio writer unavailable")
             w.write(data)
+            # drain的作用是控制写，如果缓冲区太慢了就挂起等一会，缓冲区有空间了再接着写
             await w.drain()
         elif self._transport == "tcp":
             w = getattr(self, "_tcp_writer", None)
