@@ -76,10 +76,12 @@ class Compactor:
         provider: LLMProvider,
         focus: str = "",
     ) -> CompactionResult | None:
+        # 压缩messages
         result = await self.compact_messages(context.messages, provider, focus=focus)
         if result is None:
             return None
 
+        # 压缩后的contex替换为：压缩摘要+ Understood, I'll continue from this summary
         context.messages = [
             {"role": "user", "content": result.summary_text},
             {"role": "assistant", "content": "Understood, I'll continue from this summary."},

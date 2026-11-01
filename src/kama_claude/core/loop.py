@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -10,7 +11,6 @@ from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.base import LLMProvider
 from kama_claude.core.tools.invocation import invoke_tool
 from kama_claude.core.tools.registry import ToolRegistry
-import logging
 
 if TYPE_CHECKING:
     from kama_claude.core.compact.compactor import Compactor
@@ -54,6 +54,7 @@ class AgentLoop:
 
             # [plan] call LLM — API errors terminate the run
             try:
+                # 获取模型回复结果
                 response = await self._provider.chat(
                     messages=context.messages,
                     tool_schemas=self._registry.tool_schemas(),
@@ -78,6 +79,7 @@ class AgentLoop:
                 break
 
             # [observe] append assistant content blocks to context
+            # 把模型回复加入历史，保留 S7 的 thinking 消息块及其顺序
             # thinking blocks must come first and be preserved verbatim for extended thinking mode
             blocks: list[dict[str, object]] = list(response.thinking_blocks)
             if response.text:
@@ -89,6 +91,8 @@ class AgentLoop:
             context.add_assistant_message(blocks)
 
             # [act] execute each requested tool; errors become tool results so loop continues
+            # 如果模型的回复中有工具调用，就执行对应工具，然后把结果添加到上下文中
+            # 一次回复的多个调用应放在一起
             if response.stop_reason == "tool_use":
                 for tc in response.tool_calls:
                     result = await invoke_tool(
@@ -109,6 +113,7 @@ class AgentLoop:
                     )
 
             # Termination check — end_turn wins over max_steps if both hit on same step
+            # end_turn表示模型认为回复已经完成了，这段对话可以正常结束
             if response.stop_reason == "end_turn":
                 context.result = response.text or ""
                 context.mark_success()
@@ -117,16 +122,21 @@ class AgentLoop:
 
             # 工具结果追加完毕（messages 末尾为 user）后检查压缩，仅在 run 继续时触发
             # 此时压缩结果 [user_summary, assistant_ack] 对下一次 LLM 调用是合法输入
+            # 在工具调用结果追加完毕后才执行自动压缩是为了保证消息的完整性
             if (
                 not context.is_done()
                 and response.stop_reason == "tool_use"
                 and self._compactor is not None
                 and self._compact_threshold > 0
                 and response.usage is not None
+                # 当前这一轮对话，消耗了模型上下文窗口用量的百分比
                 and response.usage.context_pct >= self._compact_threshold
             ):
+                # 消耗的上下文窗口占比大于阈值的话就自动压缩历史记录
+                # 只调整内存中的context，不修改文件内容
                 await self._compactor.compact(context, self._provider)
 
+            # 对话正常结束或者超过步数限制后，结束这次对话并发布事件
             await self._bus.publish(
                 StepFinishedEvent(run_id=context.run_id, step=context.step, ts=_now())
             )

@@ -36,7 +36,7 @@ class ToolPolicy:
     allow_patterns: list[str] = field(default_factory=list)
     deny_patterns: list[str] = field(default_factory=list)
 
-
+# 为一些tool创建默认的策略
 DEFAULT_POLICIES: dict[str, ToolPolicy] = {
     "bash":       ToolPolicy(default=PermissionDecision.ASK),
     "write_file": ToolPolicy(default=PermissionDecision.ASK),
@@ -45,7 +45,7 @@ DEFAULT_POLICIES: dict[str, ToolPolicy] = {
     "note_save":  ToolPolicy(default=PermissionDecision.ALLOW),
 }
 
-# 未在 DEFAULT_POLICIES 中登记的工具的兜底策略
+# 未在 DEFAULT_POLICIES 中登记的工具的兜底策略，总是询问用户是否执行
 _UNKNOWN_TOOL_DEFAULT = PermissionDecision.ASK
 
 # bash 参数中展示用的关键字段映射
@@ -77,15 +77,19 @@ def evaluate(
     params: dict[str, Any],
     policy: ToolPolicy | None = None,
 ) -> PermissionDecision:
+    # 如果没有传入工具的权限就找他的默认权限
     if policy is None:
         policy = DEFAULT_POLICIES.get(tool_name)
-
+    # 如果这个工具没有配置默认权限，就给他兜底的未知工具权限，每次执行都要询问
     if policy is None:
         return _UNKNOWN_TOOL_DEFAULT
 
+    # 对bash工具提取需要的指令，只有bash才需要命令，其他的工具只需要传参数就行了
     command = str(params.get("command", "")) if tool_name == "bash" else ""
 
+    # 对bash工具执行的命令进行层层审查
     # Tier 1: deny_patterns (bash only)
+    # 如果命令
     if command:
         for pat in policy.deny_patterns:
             if re.search(pat, command):

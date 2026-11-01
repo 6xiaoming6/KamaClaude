@@ -64,6 +64,7 @@ class StdoutPrinter:
 
 # 异步核心：连接 daemon，订阅事件，触发 run，等待 run.finished
 async def _run_async(goal: str, config: KamaConfig) -> int:
+    # 和core建立 TCP 连接
     client = SocketClient(config.host, config.port)
     try:
         await client.connect()
@@ -75,18 +76,25 @@ async def _run_async(goal: str, config: KamaConfig) -> int:
     finished = asyncio.Event()
     exit_code = 0
 
+    # 事件回调函数，core的事件发布后都会经过这个函数
     async def on_event(event: dict[str, Any]) -> None:
         nonlocal exit_code
+        # 先打印这个事件
         await printer.handle(event)
+        # 如果事件是任务完成事件的话，就把finished等待设为完成，就会结束_run_async
         if event.get("type") == "run.finished":
             if event.get("status") != "success":
                 exit_code = 1
             finished.set()
-
+    # 注册事件回调函数，client收到事件后，交给这个函数处理
     client.on_event(on_event)
+    # 创建任务持续读取core发来的数据
+    # 一定要先创建循环监听服务器消息再send_command，不然前面的请求可能会接收不到响应
+
     loop_task = asyncio.create_task(client.run_event_loop())
 
     try:
+        # 先向core发送消息注册订阅
         await client.send_command(
             "event.subscribe",
             {
@@ -94,6 +102,7 @@ async def _run_async(goal: str, config: KamaConfig) -> int:
                 "scope": "global",
             },
         )
+        # 再启动运行，AgentRunner在后端启动，前端cli只负责发送命令和查看进度
         await client.send_command("agent.run", {"goal": goal})
     except IpcError as e:
         print(f"error: {e}", file=sys.stderr)
@@ -101,8 +110,9 @@ async def _run_async(goal: str, config: KamaConfig) -> int:
         await client.close()
         return 1
 
+    # 等待任务完成
     await finished.wait()
-
+    # 任务完成后就不需要循环监听后端的消息了
     loop_task.cancel()
     try:
         await loop_task

@@ -32,7 +32,7 @@ class SessionStore:
     def runs_dir(self, sid: str) -> Path:
         return self.session_dir(sid) / "runs"
 
-    # 将 session meta 写入 meta.json
+    # 将 session meta 写入 meta.json（覆盖写入）
     def write_meta(self, session: Session) -> None:
         path = self.session_dir(session.id)
         path.mkdir(parents=True, exist_ok=True)
@@ -93,6 +93,7 @@ class SessionStore:
                 logger.warning("skip broken thread row sid=%s line=%s", sid, line_no)
                 continue
             role = row.get("role")
+            # a÷的消息中role只有user和assistant
             if role not in ("user", "assistant"):
                 logger.warning(
                     "skip unknown thread role sid=%s line=%s role=%s",
