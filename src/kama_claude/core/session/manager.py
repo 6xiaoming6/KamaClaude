@@ -41,11 +41,13 @@ class SessionManager:
         runner_factory: Callable[[], AgentRunner],
         bus: EventBus,
         provider: LLMProvider | None = None,
+        provider_factory: Callable[[], LLMProvider] | None = None,
     ) -> None:
         self._store = store
         self._runner_factory = runner_factory
         self._bus = bus
         self._provider = provider
+        self._provider_factory = provider_factory
         self._sessions: dict[str, Session] = {}
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -90,11 +92,14 @@ class SessionManager:
             if not session.title:
                 session.title = content[:40]
 
+            # 如果指定了run_id就使用传进来的id，否则就创建新的run_id
             run_id = run_id or new_run_id()
             session.run_ids.append(run_id)
             session.updated_at = _now()
+            # 更新session的meta.json文件
             self._store.write_meta(session)
 
+            # 每次都创建一个新的runner来运行
             runner = self._runner_factory()
             await runner.run_and_capture(
                 content,
@@ -104,9 +109,11 @@ class SessionManager:
             )
 
             session.updated_at = _now()
+            # noe_shot模式只对话一次就关闭
             if session.mode == "one_shot":
                 session.status = "closed"
                 await self._bus.publish(SessionClosedEvent(session_id=sid, ts=session.updated_at))
+            # chat模式一次对话完成后不会关闭，会继续等待下一次用户对话输入
             else:
                 session.status = "waiting_for_input"
                 await self._bus.publish(
@@ -137,6 +144,8 @@ class SessionManager:
         lock = self._locks[sid]
         if lock.locked():
             raise HandlerError(SESSION_BUSY, "session busy")
+        if self._provider is None and self._provider_factory is not None:
+            self._provider = self._provider_factory()
         if self._provider is None:
             raise HandlerError(-32020, "provider not available for compaction")
         async with lock:

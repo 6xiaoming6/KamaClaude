@@ -43,19 +43,21 @@ def cmd_core_status(config: KamaConfig) -> None:
 
 # 在后台启动 daemon，若已在运行则提示并退出
 def cmd_core_start(config: KamaConfig) -> None:
+    # 已经运行了就直接退出，不会再重复创建进程运行
     try:
         asyncio.run(_ping_check(config))
         print(f"already running  ({config.host}:{config.port})")
         return
     except (ConnectionRefusedError, OSError):
         pass
-
+    # 没有启动就新开一个进程运行
     proc = subprocess.Popen(
         [sys.executable, "-m", "kama_claude.core"],
         start_new_session=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    # 进程启动后会向指定文件写入进程PID，方便检查进程是否还在运行
     _PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     _PID_FILE.write_text(str(proc.pid))
     print(f"started  pid={proc.pid}  ({config.host}:{config.port})")

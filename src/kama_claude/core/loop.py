@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -10,7 +11,6 @@ from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.base import LLMProvider
 from kama_claude.core.tools.invocation import invoke_tool
 from kama_claude.core.tools.registry import ToolRegistry
-import logging
 
 if TYPE_CHECKING:
     from kama_claude.core.compact.compactor import Compactor
@@ -54,6 +54,7 @@ class AgentLoop:
 
             # [plan] call LLM — API errors terminate the run
             try:
+                # 获取模型回复结果
                 response = await self._provider.chat(
                     messages=context.messages,
                     tool_schemas=self._registry.tool_schemas(),
@@ -78,6 +79,7 @@ class AgentLoop:
                 break
 
             # [observe] append assistant content blocks to context
+            # 把模型回复的消息添加到上下文的历史消息中
             blocks: list[dict[str, object]] = []
             if response.text:
                 blocks.append({"type": "text", "text": response.text})
@@ -88,6 +90,8 @@ class AgentLoop:
             context.add_assistant_message(blocks)
 
             # [act] execute each requested tool; errors become tool results so loop continues
+            # 如果模型的回复中有工具调用，就执行对应工具，然后把结果添加到上下文中
+            # 一次回复的多个调用应放在一起
             if response.stop_reason == "tool_use":
                 for tc in response.tool_calls:
                     result = await invoke_tool(
@@ -108,6 +112,7 @@ class AgentLoop:
                     )
 
             # Termination check — end_turn wins over max_steps if both hit on same step
+            # end_turn表示模型认为回复已经完成了，这段对话可以正常结束
             if response.stop_reason == "end_turn":
                 context.result = response.text or ""
                 context.mark_success()
@@ -126,6 +131,7 @@ class AgentLoop:
             ):
                 await self._compactor.compact(context, self._provider)
 
+            # 对话正常结束或者超过步数限制后，结束这次对话并发布事件
             await self._bus.publish(
                 StepFinishedEvent(run_id=context.run_id, step=context.step, ts=_now())
             )

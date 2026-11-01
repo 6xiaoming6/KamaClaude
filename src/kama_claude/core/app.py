@@ -6,6 +6,7 @@ import fnmatch
 import json
 import logging
 import signal
+import sys
 import time
 from datetime import UTC
 from pathlib import Path
@@ -36,7 +37,7 @@ from kama_claude.core.bus.commands import (
 from kama_claude.core.bus.envelope import EventPushEnvelope
 from kama_claude.core.config import KamaConfig, get_config
 from kama_claude.core.events.bus import EventBus
-from kama_claude.core.llm.provider import AnthropicProvider
+from kama_claude.core.llm.provider import DeepseekProvider
 from kama_claude.core.logging_setup import setup_logging
 from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.permissions.storage import load_policy_file
@@ -77,6 +78,7 @@ class CoreApp:
         )
 
     # 将 EventBus 事件写入 trace（作为 EventBus 订阅者）
+    # 这里用trace记录core内部的事件传递
     async def _trace_event_handler(self, event: BaseModel) -> None:
         assert self._trace is not None
         event_dict = event.model_dump()
@@ -132,6 +134,7 @@ class CoreApp:
         if self._permission_manager is None:
             logger.error("permission.respond: PermissionManager not initialized")
             return PermissionRespondResult()
+        # 调用permission_manager.respond方法，将对应工具调用的feture设置为done
         self._permission_manager.respond(cmd.tool_use_id, cmd.decision)
         return PermissionRespondResult()
 
@@ -159,8 +162,8 @@ class CoreApp:
             replayed_count = await self._replay_events(
                 cmd.replay_from_run, writer, cmd.topics
             )
-
         assert self._broadcaster is not None
+        # 客户端发送订阅请求时，广播器会保存当前客户端的订阅内容，以后事件发布时广播给订阅了的客户端
         sub_id = self._broadcaster.subscribe(writer, cmd.topics, cmd.scope)
         return EventSubscribeResult(subscription_id=sub_id, replayed_count=replayed_count)
 
@@ -224,21 +227,22 @@ class CoreApp:
         )
 
         self._broadcaster = IpcEventBroadcaster(trace=self._trace)
+        # Trace 初始化后注册广播器，之后发布的事件都会经过广播器。
         self._bus.subscribe(self._broadcaster.handle)
         sessions_root = Path("~/.kama/sessions").expanduser()
         store = SessionStore(sessions_root)
         assert self._config is not None
-        compact_provider = AnthropicProvider(self._config.llm.default_model)
+        config = self._config
         self._sessions = SessionManager(
             store,
             runner_factory=lambda: AgentRunner(
-                self._config,  # type: ignore[arg-type]
+                config,
                 bus=self._bus,
                 trace=self._trace,
                 permission_manager=self._permission_manager,
             ),
             bus=self._bus,
-            provider=compact_provider,
+            provider_factory=lambda: DeepseekProvider(config.llm.default_model),
         )
 
         server = SocketServer(
@@ -263,21 +267,30 @@ class CoreApp:
 
         loop = asyncio.get_running_loop()
         shutdown = asyncio.Event()
-        loop.add_signal_handler(signal.SIGINT, shutdown.set)
-        loop.add_signal_handler(signal.SIGTERM, shutdown.set)
-
-        await shutdown.wait()
-
-        logger.info("shutting down")
-        for run_task in list(self._running_runs):
-            run_task.cancel()
-        if self._running_runs:
-            await asyncio.gather(*self._running_runs, return_exceptions=True)
-        await server.stop()
-        if self._trace is not None:
-            await self._trace.stop()
+        try:
+            if sys.platform != "win32":
+                # 用户按 Ctrl+C，或进程收到终止信号，就调用shutdown.set()，通知主协程停止等待
+                loop.add_signal_handler(signal.SIGINT, shutdown.set)
+                loop.add_signal_handler(signal.SIGTERM, shutdown.set)
+            # Windows 由 asyncio.run() 将 Ctrl+C 转为主任务取消，再进入 finally 清理。
+            # 如果 shutdown 未设置，await 会挂起当前协程，事件循环继续运行，服务器正常处理客户端请求
+            # 直到某个信号触发 shutdown.set()，await 才返回，程序继续往下走
+            await shutdown.wait()
+        finally:
+            # Windows系统下，用户按 Ctrl+C 时，asyncio.run() 会取消主任务，无须额外注册信号处理器
+            logger.info("shutting down")
+            for run_task in list(self._running_runs):
+                run_task.cancel()
+            if self._running_runs:
+                await asyncio.gather(*self._running_runs, return_exceptions=True)
+            await server.stop()
+            if self._trace is not None:
+                await self._trace.stop()
 
 
 # 同步入口：启动 CoreApp 事件循环
 def run() -> None:
-    asyncio.run(CoreApp().run())
+    try:
+        asyncio.run(CoreApp().run())
+    except KeyboardInterrupt:
+        pass
