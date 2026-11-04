@@ -4,6 +4,45 @@
 
 S9 改进**运行保护、上下文组织、分层压缩与 Markdown 记忆**：增加可选运行预算和 Usage 锚点估算，先用程序缩减工具输出，再按需请求摘要；记忆按条目维护、按预算注入。沿用 S8 检查点恢复，不增加额外服务。
 
+## 代码定位与局部修改工具
+
+内置工具统一通过严格的 Pydantic 参数模型生成 Schema、执行前校验；错误参数不会先进入审批或被误判为未知副作用。
+
+```text
+find_files 找文件 → search_text 搜索符号 → read_file 按行阅读
+→ edit_file 精确局部替换 → bash 运行验证
+```
+
+- `find_files` 支持 glob；`search_text` 默认字面量搜索，也支持有超时保护的逐行正则，返回路径、行号与前后文。
+- `read_file` 默认从第 1 行读取 200 行，支持 `start_line`、`max_lines` 和下一页位置，输出最多 50 KiB。
+- `edit_file` 要求旧片段唯一匹配，提交前核对原文并返回 diff；它与 `write_file` 都使用原子替换，保留原文件权限。
+- 目录树与搜索默认过滤常见生成目录及各级 `.gitignore`，可用 `include_ignored=true` 显式查看；遍历不跟随链接。
+- 主、子 Agent 共用工作区规则；外部路径仍须单次审批。TUI 的编辑审批展示新旧片段，结果可展开查看 diff。
+- 参数、缺失资源、编辑冲突、权限和运行异常分开分类；修改结果不确定时仍中断并等待核实。
+
+工具定义已升级，旧中断 Run 若触发冻结 Schema 不匹配，会明确拒绝续跑；历史仍可查看，可终止旧 Run 后开始新任务。详见 [内置工具校验与代码工具链](./docs/S9-内置工具校验与代码工具链.md)。
+
+## 子 Agent 运行与保护
+
+- Core 共享子任务注册表，同一会话的新 Run 可以查询之前的任务；查询隔离会话，关闭会话和 Core 时清理对应任务。
+- 前后台共用运行、取消和异常收尾；查询会检查业务状态，步数耗尽等失败不再显示为空成功。完成后释放 Context，只保留最近 100 条结果。
+- 角色缺失、损坏直接报错；省略白名单表示继承父范围，`allowed_tools=[]` 表示没有工具。planner、reviewer 默认不提供写文件和 shell。
+- 子任务使用相同的运行保护、Usage 锚点估算和四层上下文整理。时间、Token 与重复失败限制继承父 Run 的冻结值；TUI 单独展示子任务用量和停止原因。
+- 内建角色默认继承父模型；自定义角色的 `model` 可切换当前供应商的模型。子任务消耗暂不汇总进父 Run Token 上限，仍不支持子任务树断点恢复。
+
+详见 [子 Agent 生命周期与运行保护](./docs/S9-子Agent生命周期与运行保护.md)。
+
+## 工作区路径与单次审批
+
+`read_file`、`write_file`、`list_dir`、`find_files`、`search_text`、`edit_file` 统一以当前 Run 冻结的 `workspace` 为根目录，主 Agent、子 Agent 和恢复运行使用同一根目录。相对路径先解析 `..`、符号链接和 Windows junction，再判断是否越界；遍历不递归跟随链接。
+
+- 工作区内沿用现有工具权限；工作区外强制单次审批，历史“始终允许”不能跳过。
+- TUI 展示原始路径、实际路径、工作区与操作，只提供“允许一次”“拒绝一次”。批准后路径若改变，拒绝执行。
+- 工作区外的 S9 输出归档也可审批后读取；没有审批管理器时直接拒绝外部访问。
+- 这是文件工具的应用层检查。Shell 只固定工作目录；远程 MCP 的文件访问、Core 内部保存不受此规则限制。
+
+详见 [工作区路径校验与单次审批](./docs/S9-工作区路径校验与单次审批.md)，包含执行链路、代码入口和安全边界。
+
 ## 运行保护与 Usage 锚点估算
 
 - 运行限制：原有 Step 上限，加上可选累计时间与 Token 上限；恢复不重置累计值。
@@ -86,6 +125,22 @@ TUI 空闲时输入 **`/memory`**，只读查看当前条目、正文和最近 R
 
 会话和项目写入默认允许；全局写入默认审批，并与项目许可分开缓存。记忆文件使用原子替换；删除记忆不删除完整对话。
 
+## MCP 标准远程连接
+
+本地 MCP 服务使用 `stdio`，远程服务改为标准 **Streamable HTTP**。原 MCP 裸 TCP 模式已移除；TUI/CLI 与 Core 之间的 TCP 通信继续使用。
+
+```toml
+[[mcp.servers]]
+name = "cloudflare_docs"
+transport = "streamable-http"
+url = "https://docs.mcp.cloudflare.com/mcp"
+# headers = { Authorization = "Bearer <token>" }  # 按服务要求设置
+```
+
+官方 MCP SDK 处理协议协商、JSON/SSE 响应和会话关闭，项目继续负责工具包装、权限与检查点。已使用 Cloudflare 公网 MCP 服务完成工具发现和文档搜索，并用独立 SDK 服务验证 JSON/SSE、stdio、鉴权、取消和清理。
+
+详见 [MCP 标准远程连接与真实服务验证](./docs/S9-MCP标准远程连接.md)。可运行 `uv run python -X utf8 scripts/check_mcp.py` 复现；本机代理链路不可用时，可显式加 `--direct` 对该检查进程直连。
+
 ## 启动与操作
 
 环境：Python 3.12、uv；从项目根目录启动。
@@ -158,13 +213,15 @@ tool_result_keep = 4000
 ## 验证
 
 ```text
-uv run python -X utf8 -m pytest tests/unit tests/integration/test_s9_run_budget.py tests/integration/test_s9_memory.py tests/integration/test_s9_compaction.py tests/integration/test_s8_recovery.py tests/integration/test_s5_permission_flow.py tests/integration/test_s4_session_ipc.py tests/integration/test_s2_dual_process.py tests/integration/test_ping_roundtrip.py -q
+uv run python -X utf8 -m pytest tests/unit tests/integration/test_s9_run_budget.py tests/integration/test_s9_memory.py tests/integration/test_s9_compaction.py tests/integration/test_s8_recovery.py tests/integration/test_s5_permission_flow.py tests/integration/test_s4_session_ipc.py tests/integration/test_s2_dual_process.py tests/integration/test_ping_roundtrip.py tests/integration/test_mcp_streamable_http.py -q
 uv run mypy src
 uv run python -X utf8 scripts/gen_protocol_doc.py --check
 ```
 
 在 26 份相同只读结果的假模型对比中，摘要调用由 1 次变为 0 次，程序层读取了 13 次归档全文。详细的前后输入量见学习文档。此结果不代表真实模型质量或账单收益：程序保留的历史可能更长，后续请求、缓存与重新读取的代价也需考虑。
 
-本轮相关单元测试与非付费集成测试共 **484 项通过**，覆盖 Usage 锚点、动态阈值、运行预算、命令清理、完整历史、TUI 和真实 TCP/Core 重启；改动文件 Ruff、mypy（98 个源码文件）、协议一致性检查通过。初始基线中一项 TUI 时序测试已改为明确等待刷新任务，不修改记忆业务逻辑。全仓 Ruff 的 6 条既有问题仍位于未修改的 MCP、Skill loader 和旧权限测试中。
+本轮相关单元测试与非付费集成测试共 **511 项通过**，覆盖 Usage 锚点、运行预算、完整历史、TUI、真实 TCP/Core 重启及独立 MCP 服务；改动文件 Ruff、mypy（98 个源码文件）、协议一致性检查通过。另已成功调用 Cloudflare 公网 MCP 文档搜索，复现方法见 MCP 学习文档。
+
+全仓 Ruff 仍有两条既有问题，位于未修改的 `core/skills/loader.py` 与 `tests/unit/test_permission_manager.py`。
 
 本轮不做旧完整对话删除、语义去重、向量检索或子 Agent 自动压缩。新增学习文档限于 `docs/S9-*.md`；本地练习、运行数据和密钥不上传。

@@ -43,7 +43,7 @@ from kama_claude.core.bus.commands import (
     SessionSendMessageCommand,
     SessionSendMessageResult,
 )
-from kama_claude.core.bus.envelope import EventPushEnvelope
+from kama_claude.core.bus.envelope import EventPushEnvelope, HandlerError
 from kama_claude.core.config import KamaConfig, get_config
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.provider import DeepseekProvider
@@ -54,6 +54,7 @@ from kama_claude.core.permissions.storage import load_policy_file
 from kama_claude.core.runner import AgentRunner
 from kama_claude.core.runs import events_file, new_run_id
 from kama_claude.core.session import SessionManager, SessionStore
+from kama_claude.core.subagent.registry import BackgroundTaskRegistry
 from kama_claude.core.trace.record import TraceRecord
 from kama_claude.core.trace.writer import TraceWriter
 from kama_claude.core.transport.ipc_broadcaster import IpcEventBroadcaster
@@ -76,6 +77,7 @@ class CoreApp:
         self._sessions: SessionManager | None = None
         self._permission_manager: PermissionManager | None = None
         self._mcp_manager: McpServerManager | None = None
+        self._task_registry = BackgroundTaskRegistry()
 
     # 处理 core.ping 请求，返回服务版本、运行时长和接收时间
     async def _ping_handler(self, params: dict[str, Any]) -> PongResult:
@@ -180,7 +182,10 @@ class CoreApp:
             logger.error("permission.respond: PermissionManager not initialized")
             return PermissionRespondResult()
         # 调用permission_manager.respond方法，将对应工具调用的feture设置为done
-        self._permission_manager.respond(cmd.tool_use_id, cmd.decision)
+        try:
+            self._permission_manager.respond(cmd.tool_use_id, cmd.decision)
+        except ValueError as exc:
+            raise HandlerError(-32602, str(exc)) from exc
         return PermissionRespondResult()
 
     # 手动压缩模型工作上下文并提交检查点，完整 thread 保持不变
@@ -303,10 +308,12 @@ class CoreApp:
                 trace=self._trace,
                 permission_manager=self._permission_manager,
                 mcp_manager=self._mcp_manager,
+                task_registry=self._task_registry,
             ),
             bus=self._bus,
             provider_factory=lambda: DeepseekProvider(config.llm.default_model),
             compaction=config.compaction,
+            task_registry=self._task_registry,
             permission_manager=self._permission_manager,
         )
 

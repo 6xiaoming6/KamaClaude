@@ -220,6 +220,10 @@ class PermissionRequestedEvent(BaseModel):
     tool_name: str
     params: dict[str, Any]
     param_preview: str
+    workspace: str | None = None  # 文件工具绑定的根目录
+    resolved_path: str | None = None  # 实际访问目标，包含链接解析结果
+    outside_workspace: bool = False  # 外部路径必须单次审批
+    allowed_decisions: list[str] | None = None  # 未提供时沿用普通审批四选项
     session_id: str
     ts: str
 
@@ -258,7 +262,13 @@ class SubagentFinishedEvent(BaseModel):
     type: Literal["subagent.finished"] = "subagent.finished"
     run_id: str
     parent_run_id: str
-    status: str          # "success" | "failed"
+    status: str          # "success" | "failed" | "interrupted"
+    reason: str | None = None
+    # 子任务独立统计，已知用量与未知请求的估算占用分开显示
+    actual_tokens: int = 0
+    estimated_tokens: int = 0
+    elapsed_seconds: float = 0.0
+    usage_complete: bool = True
     ts: str
 
 

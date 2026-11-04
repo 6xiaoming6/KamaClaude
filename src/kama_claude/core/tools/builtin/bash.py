@@ -1,16 +1,22 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+import os
+from pathlib import Path
 
-from kama_claude.core.tools.base import BaseTool, ToolResult
+from pydantic import Field
+
+from kama_claude.core.tools.base import BaseTool, ToolParams, ToolResult
 from kama_claude.core.tools.command import CommandExecutor
 
 _DEFAULT_TIMEOUT = 60
+_SHELL = (
+    f"Windows, using {os.environ.get('COMSPEC', 'cmd.exe')}"
+    if os.name == "nt" else "POSIX, using /bin/sh"
+)
 
 
-class BashParams(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    command: str
+class BashParams(ToolParams):
+    command: str = Field(min_length=1, max_length=16_000)
     timeout: int = Field(default=_DEFAULT_TIMEOUT, ge=1, le=120)
 
 
@@ -20,27 +26,20 @@ class BashTool(BaseTool):
     description = (
         "Execute a shell command and return its output (stdout + stderr combined). "
         "Non-interactive only — commands requiring user input will hang and time out. "
-        "Prefer short, focused commands. Output is truncated at 64 KB."
+        "Each call starts in the fixed workspace; cd does not persist to the next call. "
+        f"Current platform is {_SHELL}. "
+        "Prefer short, focused commands. Output is truncated at 64 KiB."
     )
-    input_schema: dict[str, object] = {
-        "type": "object",
-        "properties": {
-            "command": {
-                "type": "string",
-                "description": "Shell command to execute.",
-            },
-            "timeout": {
-                "type": "integer",
-                "description": f"Maximum seconds to wait (default {_DEFAULT_TIMEOUT}, max 120).",
-            },
-        },
-        "required": ["command"],
-    }
+    input_schema = BashParams.model_json_schema()
+
+    # 固定命令起始目录，这不是 shell 文件访问沙箱
+    def __init__(self, workspace: Path | None = None) -> None:
+        self._workspace = (workspace if workspace is not None else Path.cwd()).resolve()
 
     # 在子进程中执行 shell 命令，合并 stdout/stderr，超时或非零退出码时返回错误
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = BashParams.model_validate(params)
-        result = await CommandExecutor().execute(p.command, p.timeout)
+        result = await CommandExecutor(self._workspace).execute(p.command, p.timeout)
         if result.error:
             return ToolResult(
                 content=result.error, is_error=True,
@@ -50,6 +49,6 @@ class BashTool(BaseTool):
         if result.returncode:
             return ToolResult(
                 content=f"[exit {result.returncode}]\n{result.output}",
-                is_error=True, error_type="runtime_error",
+                is_error=True, error_type="command_failed",
             )
         return ToolResult(content=result.output)

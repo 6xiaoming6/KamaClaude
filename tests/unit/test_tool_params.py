@@ -39,11 +39,11 @@ def test_bash_params_wrong_type() -> None:
         BashParams.model_validate({"command": 123})
 
 
-# 功能：验证 BashParams 忽略额外字段（extra="ignore"）
-# 设计：LLM 有时会多传字段，extra="ignore" 防止 ValidationError，保证鲁棒性
-def test_bash_params_extra_ignored() -> None:
-    p = BashParams.model_validate({"command": "ls", "unknown_field": "x"})
-    assert p.command == "ls"
+# 功能：验证 BashParams 明确拒绝未声明字段
+# 设计：统一严格参数契约，让模型修正多余字段，不能误以为参数已生效
+def test_bash_params_extra_rejected() -> None:
+    with pytest.raises(ValidationError):
+        BashParams.model_validate({"command": "ls", "unknown_field": "x"})
 
 
 # 功能：验证 ReadFileParams 接受合法路径字符串

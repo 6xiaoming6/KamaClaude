@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from kama_claude.core.mcp.client import McpClient, McpServerUnavailableError, McpToolDef, McpToolError
+from kama_claude.core.mcp.client import (
+    McpClient,
+    McpServerUnavailableError,
+    McpToolDef,
+    McpToolError,
+)
 from kama_claude.core.tools.base import BaseTool, ToolResult
 
 
@@ -32,6 +37,7 @@ class McpTool(BaseTool):
                 content=f"mcp server '{self._server_name}' unavailable: {exc}",
                 is_error=True,
                 error_type="runtime_error",
+                outcome_unknown=True,
             )
         except McpToolError as exc:
             return ToolResult(
@@ -44,4 +50,5 @@ class McpTool(BaseTool):
                 content=f"mcp tool '{self.name}' unexpected error: {exc}",
                 is_error=True,
                 error_type="runtime_error",
+                outcome_unknown=True,
             )

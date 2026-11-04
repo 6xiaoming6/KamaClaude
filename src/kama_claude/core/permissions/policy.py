@@ -42,6 +42,9 @@ DEFAULT_POLICIES: dict[str, ToolPolicy] = {
     "write_file": ToolPolicy(default=PermissionDecision.ASK),
     "read_file":  ToolPolicy(default=PermissionDecision.ALLOW),
     "list_dir":   ToolPolicy(default=PermissionDecision.ALLOW),
+    "find_files": ToolPolicy(default=PermissionDecision.ALLOW),
+    "search_text": ToolPolicy(default=PermissionDecision.ALLOW),
+    "edit_file": ToolPolicy(default=PermissionDecision.ASK),
     "memory_read": ToolPolicy(default=PermissionDecision.ALLOW),
     "memory_write": ToolPolicy(default=PermissionDecision.ALLOW),
 }
@@ -55,6 +58,9 @@ _PREVIEW_KEY: dict[str, str] = {
     "read_file":  "path",
     "write_file": "path",
     "list_dir":   "path",
+    "find_files": "pattern",
+    "search_text": "pattern",
+    "edit_file": "path",
     "memory_read": "key",
     "memory_write": "key",
 }

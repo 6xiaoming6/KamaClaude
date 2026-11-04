@@ -58,11 +58,12 @@ class _EchoTool(BaseTool):
 
 class _FailTool(BaseTool):
     name = "fail"
-    description = "Always raises"
+    description = "Returns a definite failure"
     input_schema: dict[str, object] = {"type": "object", "properties": {}, "required": []}
 
+    # 明确失败没有未知副作用，允许模型根据错误调整方案
     async def invoke(self, params: dict[str, object]) -> ToolResult:
-        raise RuntimeError("tool error")
+        return ToolResult(content="tool error", is_error=True, error_type="runtime_error")
 
 
 # --- helpers -----------------------------------------------------------------
@@ -163,7 +164,7 @@ async def test_tool_result_appended_to_context() -> None:
 
 
 # 功能：验证工具失败时 loop 不终止，而是将错误追加上下文让 LLM 重新决策
-# 设计：工具始终 raise + provider 第二步返回 end_turn，确认 loop 最终到达 success；这是 agent 区别于普通脚本的核心特性
+# 设计：工具返回明确失败，第二步模型结束；未知副作用另行验证，不能混作普通错误
 async def test_tool_failure_loop_continues_to_success() -> None:
     provider = _MockProvider([
         LlmResponse(stop_reason="tool_use", tool_calls=[_tc("fail", {})]),

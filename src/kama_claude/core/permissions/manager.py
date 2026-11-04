@@ -18,8 +18,12 @@ from kama_claude.core.permissions.policy import (
     param_preview,
 )
 from kama_claude.core.permissions.storage import load_policy_file, save_policy_file
+from kama_claude.core.workspace import PathAccess
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_DECISIONS = ("allow_once", "always_allow", "deny_once", "always_deny")
+_EXTERNAL_DECISIONS = ("allow_once", "deny_once")
 
 
 def _now() -> str:
@@ -31,6 +35,7 @@ class _PendingRequest:
     future: asyncio.Future[str]
     session_id: str
     tool_name: str
+    allowed_decisions: tuple[str, ...] = _DEFAULT_DECISIONS
     payload: dict[str, Any] = field(default_factory=dict)
 
 
@@ -71,9 +76,14 @@ class PermissionManager:
         params: dict[str, Any],
         session_id: str,
         event_emitter: Callable[[dict[str, Any]], Awaitable[None]],
+        path_access: PathAccess | None = None,
     ) -> tuple[bool, str]:
         command = str(params.get("command", "")) if tool_name == "bash" else ""
         policy = self._policies.get(tool_name)
+        external_path = path_access is not None and path_access.outside_workspace
+        # 文件工具的明确禁止优先于历史缓存，外部批准不能提升静态策略
+        if path_access is not None and policy and policy.default == PermissionDecision.DENY:
+            return False, "auto_deny"
 
         # Tier 1: deny_patterns（bash only，不可被缓存绕过）
         # 先检查bash工具执行的命令是否是不允许的
@@ -92,7 +102,7 @@ class PermissionManager:
 
         # 全局授权单独缓存，项目记忆的 always_allow 不能顺便授权全局写入
         cache_name = "memory_write_global" if global_memory else tool_name
-        if not outside_cwd:
+        if not outside_cwd and not external_path:
             # Tier 3: session always 缓存
             session_key = (session_id, cache_name)
             if session_key in self._session_always:
@@ -130,13 +140,22 @@ class PermissionManager:
             future=future,
             session_id=session_id,
             tool_name=tool_name,
+            allowed_decisions=_EXTERNAL_DECISIONS if external_path else _DEFAULT_DECISIONS,
         )
-        payload = {
+        payload: dict[str, Any] = {
             "type": "permission.requested", "tool_use_id": tool_use_id,
             "tool_name": tool_name, "params": params,
             "param_preview": param_preview(tool_name, params),
             "session_id": session_id, "ts": _now(),
         }
+        if path_access is not None:
+            payload.update(
+                workspace=str(path_access.workspace), resolved_path=str(path_access.target),
+                outside_workspace=external_path,
+                allowed_decisions=list(
+                    _EXTERNAL_DECISIONS if external_path else _DEFAULT_DECISIONS,
+                ),
+            )
         self._pending[tool_use_id].payload = payload
         try:
             await event_emitter(payload)
@@ -144,6 +163,9 @@ class PermissionManager:
                 raw = await asyncio.wait_for(future, timeout=self._timeout_s)
             else:
                 raw = await future
+            # 外部授权只消费一次，不进入工具级 always 缓存或持久文件
+            if external_path:
+                return raw == "allow_once", raw
             return self._apply_response(raw, session_id, cache_name), raw
         except TimeoutError:
             return False, "timeout"
@@ -161,10 +183,13 @@ class PermissionManager:
 
     # 处理客户端返回的审批决策，resolve 对应 Future
     def respond(self, tool_use_id: str, decision: str) -> None:
-        req = self._pending.pop(tool_use_id, None)
+        req = self._pending.get(tool_use_id)
         if req is None:
             logger.warning("permission.respond: unknown tool_use_id=%s", tool_use_id)
             return
+        if decision not in req.allowed_decisions:
+            raise ValueError(f"decision is not allowed for this request: {decision}")
+        self._pending.pop(tool_use_id)
         # 将用户决定填入 Future，让等待审批的协程恢复执行
         if not req.future.done():
             req.future.set_result(decision)

@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -41,10 +41,13 @@ from kama_claude.core.subagent.tool import AgentResultTool, SpawnAgentTool
 from kama_claude.core.task.manager import TaskManager
 from kama_claude.core.tools.builtin import (
     BashTool,
+    EditFileTool,
+    FindFilesTool,
     ListDirTool,
     MemoryReadTool,
     MemoryWriteTool,
     ReadFileTool,
+    SearchTextTool,
     TaskCreateTool,
     TaskGetTool,
     TaskListTool,
@@ -82,6 +85,7 @@ class AgentRunner:
         trace: TraceWriter | None = None,
         permission_manager: PermissionManager | None = None,
         mcp_manager: McpServerManager | None = None,
+        task_registry: BackgroundTaskRegistry | None = None,
     ) -> None:
         self._config = config
         self._bus = bus  # 现在事件总线放到了core里面，所有事件
@@ -91,8 +95,10 @@ class AgentRunner:
         self._trace = trace
         self._permission_manager = permission_manager
         self._mcp_manager = mcp_manager
-        # 跨 run 共享的后台 subagent 任务注册表
-        self._task_registry = BackgroundTaskRegistry()
+        # Core 注入跨 Run 注册表；独立 Runner 使用自己的注册表
+        self._task_registry = (
+            task_registry if task_registry is not None else BackgroundTaskRegistry()
+        )
 
     # 构建工具注册表，注入 TaskManager（任务工具共享同一实例）；可选注入 SpawnAgentTool
     # 根据白名单注册工具，按需注入其他额外的工具
@@ -108,15 +114,22 @@ class AgentRunner:
         child_runs_dir: Path | None = None,
         session_id: str = "",
         tool_whitelist: list[str] | None = None,
+        workspace: Path | None = None,
+        run: RunCheckpoint | None = None,
     ) -> ToolRegistry:
-        allowed: set[str] | None = set(tool_whitelist) if tool_whitelist else None
+        allowed: set[str] | None = set(tool_whitelist) if tool_whitelist is not None else None
 
         # 没有设置白名单默认注册，设置了白名单就注册白名单里面的工具
         def _ok(name: str) -> bool:
             return allowed is None or name in allowed
 
         registry = ToolRegistry()
-        for t in [ReadFileTool(), BashTool(), WriteFileTool(), ListDirTool()]:
+        workspace = workspace if workspace is not None else Path.cwd()
+        for t in [
+            ReadFileTool(workspace), BashTool(workspace),
+            WriteFileTool(workspace), ListDirTool(workspace),
+            FindFilesTool(workspace), SearchTextTool(workspace), EditFileTool(workspace),
+        ]:
             if _ok(t.name):
                 registry.register(t)
         for t in [
@@ -128,7 +141,7 @@ class AgentRunner:
             if _ok(t.name):
                 registry.register(t)
         memory = MemoryStore(
-            Path.cwd(), store.session_dir(session.id) if session and store else None,
+            workspace, store.session_dir(session.id) if session and store else None,
         )
         for memory_tool in (
             MemoryReadTool(memory), MemoryWriteTool(memory, session_id, run_id or ""),
@@ -139,6 +152,17 @@ class AgentRunner:
         # 创建子agent的工具是否注册
         if provider is not None and bus is not None and run_id is not None:
             runs_dir = child_runs_dir or self._runs_dir
+            # 恢复后派生的子任务也沿用父 Run 冻结的限制，而非重启时的新配置
+            limits = replace(
+                self._config.agent, max_steps=run.max_steps,
+                max_run_seconds=run.max_run_seconds, max_total_tokens=run.max_total_tokens,
+                repeat_failure_limit=run.repeat_failure_limit,
+            ) if run is not None else self._config.agent
+            provider_name, model = (run.provider, run.model) if run else self._provider_identity()
+            child_tools = (
+                [str(schema["name"]) for schema in run.tool_schemas]
+                if run is not None and run.schemas_frozen else tool_whitelist
+            )
             if _ok("spawn_agent"):
                 registry.register(
                     SpawnAgentTool(
@@ -146,15 +170,19 @@ class AgentRunner:
                         parent_bus=bus,
                         parent_run_id=run_id,
                         permission_manager=self._permission_manager,
-                        max_steps=self._config.agent.max_steps,
+                        max_steps=limits.max_steps,
                         task_registry=self._task_registry,
                         runs_dir=runs_dir,
                         session_id=session_id,
                         depth=0,
+                        workspace=workspace,
+                        agent_config=limits, compaction=self._config.compaction,
+                        provider_name=provider_name, model=model,
+                        provider_factory=self._provider_for_model, tool_whitelist=child_tools,
                     )
                 )
             if _ok("agent_result"):
-                registry.register(AgentResultTool(self._task_registry))
+                registry.register(AgentResultTool(self._task_registry, session_id))
         # mcp内提供的工具是否注册
         if self._mcp_manager is not None:
             for mcp_tool in self._mcp_manager.get_tools():
@@ -423,6 +451,8 @@ class AgentRunner:
             child_runs_dir=store.runs_dir(session.id) if session and store else self._runs_dir,
             session_id=session.id if session else "",
             tool_whitelist=context.run.tool_whitelist,
+            workspace=Path(context.run.workspace),
+            run=context.run,
         )
         if resuming and context.run.schemas_frozen:
             # 恢复只暴露原清单，新工具不能悄悄改变旧 Run 的工具范围
@@ -438,7 +468,7 @@ class AgentRunner:
             persistence.checkpoint.token_estimation if persistence else None,
         )
         budget = RunBudget(context.run)
-        # 子 Agent 保留原 Provider，不进入主 Run 的累计预算
+        # 主任务与子任务分别记账，子任务也组装自己的 ManagedProvider
         provider = ManagedProvider(
             provider, estimator, self._config.compaction,
             budget=budget, persistence=persistence, event_bus=bus,
@@ -464,8 +494,23 @@ class AgentRunner:
         ):
             run.reason = "provider or model changed; restore the original backend"
             raise RuntimeError(run.reason)
+        return self._provider_for_model(run.model)
+
+    # 角色模型只切换当前后端的模型，复用客户端，不按模型名字猜测供应商
+    def _provider_for_model(self, model: str) -> LLMProvider:
+        provider = self._provider
         try:
-            provider: LLMProvider = self._provider or DeepseekProvider(run.model)
+            if provider is None:
+                provider = DeepseekProvider(model)
+            elif model != self._provider_identity()[1]:
+                if isinstance(provider, DeepseekProvider):
+                    provider = DeepseekProvider(model, client=provider._client)
+                elif isinstance(provider, AnthropicProvider):
+                    provider = AnthropicProvider(model, client=provider._client)
+                elif isinstance(provider, OpenaiProvider):
+                    provider = OpenaiProvider(model, client=provider._client)
+                else:
+                    raise ValueError("custom provider does not support a model override")
         except SystemExit as exc:
             raise RuntimeError(str(exc)) from exc
         if self._trace is not None:

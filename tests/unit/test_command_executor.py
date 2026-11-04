@@ -12,6 +12,27 @@ import pytest
 from kama_claude.core.tools.command import CommandExecutor
 
 
+# 功能：验证命令输出优先使用 UTF-8，Windows 可回退本地编码且截断不破坏有效前缀
+# 设计：直接喂管道字节，固定编码与截断边界，不依赖系统终端的 chcp 设置
+@pytest.mark.parametrize("kind", ["utf8", "local", "truncated_utf8"])
+async def test_output_decoding(monkeypatch, tmp_path, kind):
+    data = "你好".encode() if kind != "local" else "你好".encode("gbk")
+    monkeypatch.setattr("kama_claude.core.tools.command.locale.getencoding", lambda: "gbk")
+    if kind == "truncated_utf8":
+        data = "中中".encode()
+        monkeypatch.setattr("kama_claude.core.tools.command._OUTPUT_LIMIT", 5)
+    stream = asyncio.StreamReader()
+    stream.feed_data(data)
+    stream.feed_eof()
+    output = await CommandExecutor(tmp_path)._read_output(stream)
+    if kind == "truncated_utf8":
+        assert output.startswith("中�") and output.endswith("[truncated]")
+    elif kind == "utf8" or os.name == "nt":
+        assert output == "你好"
+    else:
+        assert "�" in output
+
+
 # 功能：将测试 Python 代码转换成当前平台可执行的命令
 # 设计：使用当前解释器与平台转义，不依赖 bash 或用户 PATH
 def python_command(code: str) -> str:

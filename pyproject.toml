@@ -17,6 +17,10 @@ dependencies = [
     "textual>=0.75",       # 终端 UI 框架（kama-tui）
     "httpx[socks]>=0.28.1",
     "psutil>=6.0,<8",
+    "pathspec>=1.1,<2",    # 目录遍历的 .gitignore 规则
+    "regex>=2024.11",     # 内容正则搜索使用有界超时
+    "mcp>=2.3,<3",        # 官方 MCP 会话与 stdio / Streamable HTTP 传输
+    "httpx2>=2.13,<3",    # 官方 MCP SDK 的 HTTP 客户端，请求头与超时由本项目配置
 ]
 
 # 安装后可在 PATH 中执行的入口：`kama` / `kama-core` / `kama-tui`
@@ -34,6 +38,7 @@ packages = ["src/kama_claude"] # 源码在 src/kama_claude
 dev = [
     "ruff>=0.4",            # 快速 linter + import 排序等
     "types-psutil>=6.0",
+    "types-regex>=2024.11",
     "mypy>=1.10",           # 静态类型检查
     "pytest>=8.0",          # 单元测试
     "pytest-asyncio>=0.23", # 异步测试支持

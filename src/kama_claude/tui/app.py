@@ -7,10 +7,11 @@ import time
 from typing import Any
 
 from rich.markdown import Markdown
+from rich.markup import escape
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.message import Message
 from textual.widget import Widget
@@ -41,6 +42,9 @@ def _param_summary(tool_name: str, params: dict[str, Any], max_len: int = 72) ->
         "read_file": ("path",),
         "write_file": ("path",),
         "list_dir": ("path", "max_depth"),
+        "find_files": ("pattern", "path"),
+        "search_text": ("pattern", "path"),
+        "edit_file": ("path",),
         "bash": ("command",),
         "memory_read": ("scope", "key", "query"),
         "memory_write": ("scope", "key", "action"),
@@ -142,7 +146,7 @@ class ToolCallBlock(Widget):
             self.add_class("expanded")
 
 
-class PermissionSelect(Static):
+class PermissionSelect(Vertical):
     """内联权限选择控件：挂载在日志流中，键盘焦点无需 ModalScreen。"""
 
     can_focus = True
@@ -153,6 +157,8 @@ class PermissionSelect(Static):
         padding: 0 2;
         margin-bottom: 1;
     }
+    PermissionSelect Horizontal { height: 3; }
+    PermissionSelect Button { min-width: 12; margin-right: 1; }
     """
 
     _CHOICES: tuple[tuple[str, str, str], ...] = (
@@ -178,11 +184,39 @@ class PermissionSelect(Static):
             super().__init__()
 
     # 初始化控件，存储工具 ID（用于 IPC 回复）
-    def __init__(self, tool_use_id: str) -> None:
-        super().__init__("")
+    def __init__(self, tool_use_id: str, allowed_decisions: list[str] | None = None) -> None:
+        super().__init__()
         self._tool_use_id = tool_use_id
         self._cursor = 0
+        self._choices = tuple(
+            choice for choice in self._CHOICES
+            if allowed_decisions is None or choice[0] in allowed_decisions
+        )
+        if not self._choices:
+            raise ValueError("permission request has no valid choices")
+        allowed = {choice[0] for choice in self._choices}
+        self._key_map = {key: value for key, value in self._KEY_MAP.items() if value in allowed}
+        if allowed == {"allow_once", "deny_once"}:
+            labels = {"allow_once": "允许一次", "deny_once": "拒绝一次"}
+            self._choices = tuple((value, labels[value], hint) for value, _, hint in self._choices)
 
+    # 按后端允许的决策生成按钮，按钮和键盘共用同一组选项
+    def compose(self) -> ComposeResult:
+        yield Static(self._render_ui(), classes="permission-options")
+        with Horizontal():
+            for decision, label, _ in self._choices:
+                yield Button(label, id=f"permission-{decision}")
+
+    # 更新方向键高亮，不重新创建按钮
+    def update(self, content: str) -> None:
+        self.query_one(".permission-options", Static).update(content)
+
+    # 点击按钮与快捷键进入相同的决策校验入口
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        self._pick((event.button.id or "").removeprefix("permission-"))
+
+    # 挂载后将焦点交给审批控件
     def on_mount(self) -> None:
         self.update(self._render_ui())
         self.focus()
@@ -216,7 +250,7 @@ class PermissionSelect(Static):
     # 生成带光标高亮的选项列表文本
     def _render_ui(self) -> str:
         lines: list[str] = []
-        for i, (_, label, key_hint) in enumerate(self._CHOICES):
+        for i, (_, label, key_hint) in enumerate(self._choices):
             if i == self._cursor:
                 lines.append(f"  [bold cyan]❯ {label}[/bold cyan]  [dim]{key_hint}[/dim]")
             else:
@@ -230,23 +264,25 @@ class PermissionSelect(Static):
         key = event.key
         if key in ("up", "k"):
             event.stop()
-            self._cursor = (self._cursor - 1) % len(self._CHOICES)
+            self._cursor = (self._cursor - 1) % len(self._choices)
             self.update(self._render_ui())
         elif key in ("down", "j"):
             event.stop()
-            self._cursor = (self._cursor + 1) % len(self._CHOICES)
+            self._cursor = (self._cursor + 1) % len(self._choices)
             self.update(self._render_ui())
         elif key == "enter":
             event.stop()
-            self._pick(self._CHOICES[self._cursor][0])
+            self._pick(self._choices[self._cursor][0])
         else:
-            decision = self._KEY_MAP.get(key)
+            decision = self._key_map.get(key)
             if decision is not None:
                 event.stop()
                 self._pick(decision)
 
     # 发布决策消息，由宿主 App 负责 IPC 回复和控件清理
     def _pick(self, decision: str) -> None:
+        if decision not in {choice[0] for choice in self._choices}:
+            return
         log.debug("PermissionSelect._pick  decision=%s", decision)
         self.post_message(self.Decided(self, self._tool_use_id, decision))
 
@@ -271,16 +307,23 @@ class PermissionBlock(Static):
             super().__init__()
 
     # 初始化审批块，记录工具 ID、名称和参数预览
-    def __init__(self, tool_use_id: str, tool_name: str, param_preview: str) -> None:
+    def __init__(
+        self, tool_use_id: str, tool_name: str, param_preview: str, path_details: str = "",
+    ) -> None:
         self._tool_use_id = tool_use_id
         self._tool_name = tool_name
         self._param_preview = param_preview
         self._resolved = False
+        self._path_details = path_details
         super().__init__(self._pending_text(), classes="log-line")
 
+    # 审批时完整展示实际目标，路径中的方括号不作为 Rich 标记解释
     def _pending_text(self) -> str:
-        preview = f"  [dim]{self._param_preview}[/dim]" if self._param_preview else ""
-        return f"[bold red]? permission[/bold red]  [bold]{self._tool_name}[/bold]{preview}"
+        preview = f"  [dim]{escape(self._param_preview)}[/dim]" if self._param_preview else ""
+        details = f"\n{escape(self._path_details)}" if self._path_details else ""
+        return (
+            f"[bold red]? permission[/bold red]  [bold]{self._tool_name}[/bold]{preview}{details}"
+        )
 
     # 将块收缩为单行摘要并发布 Resolved 消息
     def _resolve(self, decision: str) -> None:
@@ -290,7 +333,7 @@ class PermissionBlock(Static):
         allowed = decision in ("allow_once", "always_allow")
         icon = "[bold green]✓[/bold green]" if allowed else "[bold red]✗[/bold red]"
         label = self._LABEL_MAP.get(decision, decision)
-        preview = f"  [dim]{self._param_preview}[/dim]" if self._param_preview else ""
+        preview = f"  [dim]{escape(self._param_preview)}[/dim]" if self._param_preview else ""
         self.update(
             f"{icon} permission  [bold]{self._tool_name}[/bold]{preview}  [dim]{label}[/dim]"
         )
@@ -610,21 +653,21 @@ class KamaTuiApp(App[None]):
             if select.has_focus:
                 return  # PermissionSelect 有焦点时自行处理，事件不会冒泡到这里
             key = event.key
-            decision = PermissionSelect._KEY_MAP.get(key)
+            decision = select._key_map.get(key)
             if decision:
                 event.stop()
                 select._pick(decision)
             elif key in ("up", "k"):
                 event.stop()
-                select._cursor = (select._cursor - 1) % len(PermissionSelect._CHOICES)
+                select._cursor = (select._cursor - 1) % len(select._choices)
                 select.update(select._render_ui())
             elif key in ("down", "j"):
                 event.stop()
-                select._cursor = (select._cursor + 1) % len(PermissionSelect._CHOICES)
+                select._cursor = (select._cursor + 1) % len(select._choices)
                 select.update(select._render_ui())
             elif key == "enter":
                 event.stop()
-                select._pick(PermissionSelect._CHOICES[select._cursor][0])
+                select._pick(select._choices[select._cursor][0])
         except Exception:
             pass
 
@@ -1155,6 +1198,13 @@ class KamaTuiApp(App[None]):
             start = self._subagent_start_times.pop(run_id, None)
             elapsed = f"  [dim]{time.monotonic() - start:.1f}s[/dim]" if start is not None else ""
             desc_part = f"[cyan]{_preview(description, 72)}[/cyan]{elapsed}"
+            if "actual_tokens" in event:
+                desc_part += (
+                    f"  [dim]已知 {event.get('actual_tokens', 0)}"
+                    f" + 估算 {event.get('estimated_tokens', 0)} tokens[/dim]"
+                )
+            if event.get("reason"):
+                desc_part += f"  [dim]{escape(str(event['reason']))}[/dim]"
             if status == "success":
                 self._append(Static(
                     f"[dim]└─[/dim] [bold green]✓[/bold green] {desc_part}",
@@ -1339,14 +1389,32 @@ class KamaTuiApp(App[None]):
                 "permission.requested tool=%s id=%s  app.focused=%s",
                 tool_name, tool_use_id, _focused_repr,
             )
-            perm_block = PermissionBlock(tool_use_id, tool_name, param_preview)
+            path_details = ""
+            if event.get("outside_workspace"):
+                params = event.get("params") or {}
+                operation = {
+                    "read_file": "读取", "write_file": "写入", "list_dir": "列举目录",
+                    "find_files": "查找文件", "search_text": "搜索内容", "edit_file": "局部编辑",
+                }
+                path_details = (
+                    f"工作区外访问 · {operation.get(tool_name, tool_name)}（仅本次授权）\n"
+                    f"原始路径：{params.get('path', '.')}\n"
+                    f"实际路径：{event.get('resolved_path', '')}\n"
+                    f"工作区：{event.get('workspace', '')}"
+                )
+            if tool_name == "edit_file":
+                params = event.get("params") or {}
+                old = _preview("\n".join(str(params.get("old_text", "")).splitlines()[:4]), 240)
+                new = _preview("\n".join(str(params.get("new_text", "")).splitlines()[:4]), 240)
+                path_details += f"\n编辑片段预览（最多四行）：\n旧：\n{old}\n新：\n{new}"
+            perm_block = PermissionBlock(tool_use_id, tool_name, param_preview, path_details)
             self._pending_permission_blocks[tool_use_id] = perm_block
             prompt = self._prompt()
             if prompt is not None:
                 prompt.disabled = True
                 prompt.border_title = "permission required"
             self._append(perm_block)
-            select = PermissionSelect(tool_use_id)
+            select = PermissionSelect(tool_use_id, event.get("allowed_decisions"))
             self._mount_permission_select(select)
             log.debug(
                 "PermissionSelect mounted before #prompt  pending=%d",

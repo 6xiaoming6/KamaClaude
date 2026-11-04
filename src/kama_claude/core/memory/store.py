@@ -71,7 +71,12 @@ class MemoryStore:
                 updated_at=updated_at, source=source, content=content.strip(),
             )
         except (OSError, UnicodeError, ValueError) as exc:
-            raise MemoryError(f"cannot read memory {scope}/{key}: {exc}") from exc
+            kind = (
+                "not_found" if isinstance(exc, FileNotFoundError)
+                else "permission_denied" if isinstance(exc, PermissionError)
+                else "invalid_operation"
+            )
+            raise MemoryError(f"cannot read memory {scope}/{key}: {exc}", kind) from exc
 
     # 扫描有效条目并收集坏文件信息；一个坏文件不会隐藏其余有效记忆
     def scan(self, scope: MemoryScope) -> tuple[list[MemoryEntry], list[str]]:
