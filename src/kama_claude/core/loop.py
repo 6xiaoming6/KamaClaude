@@ -308,7 +308,7 @@ class AgentLoop:
 
             repeated = self._budget.record_tool_result(tool.name, tool.input, result)
             tool.result = asdict(result)
-            if result.outcome_unknown and self._persistence is not None:
+            if result.outcome_unknown:
                 # 结果未知时保留当前位置，等待用户核实后决定
                 tool.status = "unknown"
                 context.mark_interrupted("unknown_tool_result")
@@ -322,7 +322,8 @@ class AgentLoop:
                 # 主 Agent 已取回子任务结果，不再视为未完成子任务
                 if (
                     tool.name == "agent_result"
-                    and not result.is_error
+                    and (not result.is_error or result.error_type == "subagent_failed")
+                    and not result.outcome_unknown
                     and result.content != "still running"
                 ):
                     child_id = str(tool.input.get("run_id", ""))

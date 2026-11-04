@@ -83,7 +83,7 @@ class PermissionRespondCommand(BaseModel):
     type: Literal["permission.respond"] = "permission.respond"
     tool_use_id: str
     # "allow_once" | "always_allow" | "deny_once" | "always_deny"
-    decision: str
+    decision: Literal["allow_once", "always_allow", "deny_once", "always_deny"]
 
 
 class PermissionRespondResult(BaseModel):

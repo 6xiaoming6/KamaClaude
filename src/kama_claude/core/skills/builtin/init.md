@@ -4,14 +4,17 @@ description: 分析当前项目，生成 .kama/context.md 初始内容
 allowed_tools:
   - read_file
   - list_dir
+  - find_files
+  - search_text
   - write_file
+  - edit_file
   - bash
 ---
 你是一位项目分析专家。请分析当前项目目录，生成一份 `.kama/context.md` 文件，供 AI agent 在后续对话中快速了解项目背景。
 
 分析步骤：
 1. 用 list_dir 探索根目录和主要子目录
-2. 读取 README、package.json、pyproject.toml、Cargo.toml 等配置文件（如存在）
+2. 用 find_files 定位配置文件，用 search_text 搜索关键入口，再按行读取相关代码
 3. 了解项目的语言、框架、主要模块和目录结构
 
 context.md 内容要求：

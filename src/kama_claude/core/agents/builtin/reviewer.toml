@@ -24,5 +24,5 @@ system_prompt = """
 ## 建议
 （后续行动，如有）
 """
-allowed_tools = ["read_file", "list_dir", "bash"]
-model = "claude-sonnet-4-6"
+allowed_tools = ["read_file", "list_dir", "find_files", "search_text", "task_get", "task_list"]
+model = ""

@@ -9,7 +9,10 @@ SCOPES: tuple[MemoryScope, ...] = ("global", "project", "session")
 
 
 class MemoryError(ValueError):
-    pass
+    # 记忆业务错误携带明确分类，工具不需要按报错文字猜测
+    def __init__(self, message: str, error_type: str = "invalid_operation") -> None:
+        super().__init__(message)
+        self.error_type = error_type
 
 
 class MemoryEntry(BaseModel):

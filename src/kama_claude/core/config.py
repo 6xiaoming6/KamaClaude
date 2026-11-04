@@ -5,6 +5,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
@@ -79,12 +80,12 @@ class MemoryConfig:
 @dataclass
 class McpServerConfig:
     name: str
-    transport: str = "stdio"       # "stdio" | "tcp"
+    transport: str = "stdio"       # "stdio" | "streamable-http"
     command: str = ""              # stdio 专用：可执行文件路径
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
-    host: str = "localhost"        # tcp 专用
-    port: int = 3000               # tcp 专用
+    url: str = ""                 # Streamable HTTP 完整端点
+    headers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -309,17 +310,23 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
         servers_raw = mcp.get("servers", [])
         if not isinstance(servers_raw, list):
             raise SystemExit("Config error: mcp.servers must be an array of tables")
+        names = {server.name for server in config.mcp.servers}
         for i, srv in enumerate(servers_raw):
             if not isinstance(srv, dict):
                 raise SystemExit(f"Config error: mcp.servers[{i}] must be a table")
             name = srv.get("name")
-            if not isinstance(name, str) or not name:
-                raise SystemExit(f"Config error: mcp.servers[{i}].name must be a non-empty string")
+            if not isinstance(name, str) or not name.strip() or name in names:
+                raise SystemExit(f"Config error: mcp.servers[{i}] requires a unique non-empty name")
             transport = srv.get("transport", "stdio")
-            if transport not in ("stdio", "tcp"):
+            if transport not in ("stdio", "streamable-http"):
                 raise SystemExit(
-                    f"Config error: mcp.servers[{i}].transport must be 'stdio' or 'tcp'"
+                    "Config error: MCP transport must be 'stdio' or 'streamable-http'; "
+                    "replace old TCP host/port with a Streamable HTTP url"
                 )
+            allowed = {"name", "transport"}
+            allowed |= {"command", "args", "env"} if transport == "stdio" else {"url", "headers"}
+            if set(srv) - allowed:
+                raise SystemExit(f"Config error: unsupported fields for MCP {transport}")
             s = McpServerConfig(name=name, transport=transport)
             if "command" in srv:
                 val = srv["command"]
@@ -328,24 +335,42 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
                 s.command = val
             if "args" in srv:
                 val = srv["args"]
-                if not isinstance(val, list):
+                if not isinstance(val, list) or any(not isinstance(arg, str) for arg in val):
                     raise SystemExit(f"Config error: mcp.servers[{i}].args must be an array")
                 s.args = [str(a) for a in val]
             if "env" in srv:
                 val = srv["env"]
-                if not isinstance(val, dict):
+                if not isinstance(val, dict) or any(
+                    not isinstance(k, str) or not isinstance(v, str) for k, v in val.items()
+                ):
                     raise SystemExit(f"Config error: mcp.servers[{i}].env must be a table")
                 s.env = {str(k): str(v) for k, v in val.items()}
-            if "host" in srv:
-                val = srv["host"]
-                if not isinstance(val, str):
-                    raise SystemExit(f"Config error: mcp.servers[{i}].host must be a string")
-                s.host = val
-            if "port" in srv:
-                val = srv["port"]
-                if not isinstance(val, int):
-                    raise SystemExit(f"Config error: mcp.servers[{i}].port must be an integer")
-                s.port = val
+            if transport == "stdio" and not s.command.strip():
+                raise SystemExit(f"Config error: MCP '{name}' requires command")
+            if transport == "streamable-http":
+                url = srv.get("url")
+                if not isinstance(url, str):
+                    raise SystemExit(f"Config error: MCP '{name}' requires a Streamable HTTP url")
+                try:
+                    parsed = urlsplit(url)
+                    valid = (
+                        parsed.scheme in ("http", "https") and bool(parsed.hostname)
+                        and parsed.username is None and not parsed.fragment
+                    )
+                    parsed.port
+                except ValueError:
+                    valid = False
+                if not valid:
+                    raise SystemExit(f"Config error: MCP '{name}' requires a valid http(s) url")
+                headers = srv.get("headers", {})
+                if not isinstance(headers, dict) or any(
+                    not isinstance(k, str) or not isinstance(v, str) for k, v in headers.items()
+                ):
+                    raise SystemExit(
+                        f"Config error: MCP '{name}' headers must contain string values"
+                    )
+                s.url, s.headers = url, headers
+            names.add(name)
             config.mcp.servers.append(s)
 
 

@@ -3,8 +3,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
+
+import httpx2
+from mcp import Client, StdioServerParameters
+from mcp.client import Transport
+from mcp.client.streamable_http import streamable_http_client
+from mcp.shared.exceptions import MCPError
+from mcp.types import CONNECTION_CLOSED, REQUEST_TIMEOUT, Implementation, TextContent
 
 log = logging.getLogger(__name__)
 
@@ -14,7 +24,6 @@ class McpServerUnavailableError(Exception):
 
 
 class McpToolError(Exception):
-    """MCP server 返回的应用层错误（连接正常，但工具调用失败）"""
     pass
 
 
@@ -25,194 +34,165 @@ class McpToolDef:
     input_schema: dict[str, Any] = field(default_factory=dict)
 
 
-# 通过 stdio 或 TCP 与 MCP server 通信的 JSON-RPC 2.0 客户端
+# 展开 SDK 任务组异常，保留真正的连接失败原因
+def _error_message(exc: BaseException) -> str:
+    if isinstance(exc, BaseExceptionGroup):
+        return "; ".join(_error_message(item) for item in exc.exceptions)
+    message = str(exc) or type(exc).__name__
+    if exc.__cause__ is not None:
+        message += ": " + _error_message(exc.__cause__)
+    return message
+
+
+# 两种传输共用官方 MCP 会话，工具包装层不需要知道底层协议
 class McpClient:
+    # SDK 的进入与退出固定在同一后台任务，避免跨任务关闭 AnyIO 取消域
     def __init__(self) -> None:
-        self._id = 0
-        self._proc: asyncio.subprocess.Process | None = None
-        self._reader: asyncio.StreamReader | None = None
-        self._writer: asyncio.StreamWriter | None = None
-        self._transport = ""
-        self._lock = asyncio.Lock()
-        self._stderr_task: asyncio.Task[None] | None = None
+        self._client: Client | None = None
+        self._task: asyncio.Task[None] | None = None
+        self._stop = asyncio.Event()
+        self._failure = "MCP client is not connected"
 
-    _STREAM_LIMIT = 64 * 1024 * 1024  # 64 MB，防止大响应触发 LimitOverrunError
-
-    # 启动 stdio 子进程并完成 MCP initialize 握手
+    # 启动本地 stdio 服务，由 SDK 完成初始化与消息分发
     async def connect_stdio(
-        self,
-        command: str,
-        args: list[str],
-        env: dict[str, str] | None = None,
+        self, command: str, args: list[str], env: dict[str, str] | None = None,
     ) -> None:
-        import os
-        merged_env = {**os.environ, **(env or {})}
-        self._proc = await asyncio.create_subprocess_exec(
-            command, *args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=merged_env,
-            limit=self._STREAM_LIMIT,
-        )
-        self._reader = self._proc.stdout
-        self._writer_proc = self._proc.stdin
-        self._transport = "stdio"
-        # 后台持续读取 stderr，防止管道缓冲区满导致子进程阻塞
-        self._stderr_task = asyncio.create_task(self._drain_stderr())
-        await self._initialize()
+        await self._connect(StdioServerParameters(
+            command=command, args=args, env={**os.environ, **(env or {})},
+        ))
 
-    # 通过 TCP 连接到 MCP server 并完成 initialize 握手
-    # 流程：建立连接 → initialize 请求与响应 → notifications/initialized 通知
-    async def connect_tcp(self, host: str, port: int) -> None:
-        self._reader, tcp_writer = await asyncio.open_connection(host, port, limit=self._STREAM_LIMIT)
-        self._tcp_writer = tcp_writer
-        self._transport = "tcp"
-        await self._initialize()
+    # 连接标准 Streamable HTTP 端点，SDK 同时处理 JSON 和 SSE 响应
+    async def connect_http(self, url: str, headers: dict[str, str] | None = None) -> None:
+        parsed = urlsplit(url)
+        if (
+            parsed.scheme not in ("http", "https") or not parsed.hostname
+            or parsed.username is not None or parsed.fragment
+        ):
+            raise ValueError(
+                "MCP Streamable HTTP requires an http(s) URL without userinfo or fragment"
+            )
+        await self._connect(url, headers)
 
-    # 发送 initialize 请求完成 MCP 握手
-    async def _initialize(self) -> None:
-        await self._call("initialize", {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "kama-claude", "version": "0.1"},
-        })
-        await self._notify("notifications/initialized", {})
+    # 连接建立后立即返回，后台任务继续持有会话直到 close
+    async def _connect(
+        self, endpoint: str | StdioServerParameters, headers: dict[str, str] | None = None,
+    ) -> None:
+        if self._task is not None:
+            raise RuntimeError("MCP client already started; close it before reconnecting")
+        self._stop = asyncio.Event()
+        ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._task = asyncio.create_task(self._run(endpoint, headers, ready))
+        try:
+            await asyncio.wait_for(ready, timeout=30)
+        except BaseException:
+            await self.close()
+            raise
 
-    # 列出 MCP server 提供的工具定义
+    # 在一个任务内管理 HTTP 客户端、MCP 会话与关闭，业务请求可由其他任务发起
+    async def _run(
+        self, endpoint: str | StdioServerParameters, headers: dict[str, str] | None,
+        ready: asyncio.Future[None],
+    ) -> None:
+        try:
+            async with AsyncExitStack() as stack:
+                transport: Transport | StdioServerParameters
+                if isinstance(endpoint, str):
+                    http = await stack.enter_async_context(httpx2.AsyncClient(
+                        headers=headers, timeout=httpx2.Timeout(30, read=300),
+                    ))
+                    transport = streamable_http_client(endpoint, http_client=http)
+                else:
+                    transport = endpoint
+                client = await stack.enter_async_context(Client(
+                    transport, client_info=Implementation(name="kama-claude", version="0.1"),
+                    read_timeout_seconds=30, cache=None,
+                ))
+                self._client = client
+                self._failure = ""
+                if not ready.done():
+                    ready.set_result(None)
+                await self._stop.wait()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._failure = _error_message(exc)
+            if not ready.done():
+                ready.set_exception(McpServerUnavailableError(self._failure))
+            else:
+                log.warning("mcp connection stopped: %s", self._failure)
+        finally:
+            self._client = None
+
+    # 只返回已完成初始化且仍由后台任务持有的会话
+    def _connected(self) -> Client:
+        if self._client is None or self._stop.is_set():
+            raise McpServerUnavailableError(self._failure or "MCP client closed")
+        return self._client
+
+    @property
+    # 暴露协商结果，便于真实服务验证与排障
+    def protocol_version(self) -> str:
+        return self._connected().protocol_version
+
+    # 获取全部工具页，防止远程服务分页时只注册第一批工具
     async def list_tools(self) -> list[McpToolDef]:
-        response = await self._call("tools/list", {})
-        tools = []
-        for t in response.get("tools", []):
-            tools.append(McpToolDef(
-                name=t.get("name", ""),
-                description=t.get("description", ""),
-                input_schema=t.get("inputSchema", {}),
-            ))
-        return tools
-
-    # 调用 MCP server 上的工具，返回所有 text 内容拼接；连接异常抛 McpServerUnavailableError，工具错误抛 McpToolError
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
-        response = await self._call("tools/call", {"name": name, "arguments": arguments})
-        parts: list[str] = []
-        for item in response.get("content", []):
-            if item.get("type") == "text":
-                parts.append(str(item["text"]))
-        return "\n".join(parts)
-
-    # 后台任务：持续读取 stderr 并记录日志，防止管道缓冲区满
-    async def _drain_stderr(self) -> None:
-        if self._proc is None or self._proc.stderr is None:
-            return
+        client = self._connected()
+        tools: list[McpToolDef] = []
+        cursor: str | None = None
+        seen: set[str] = set()
         try:
             while True:
-                line = await self._proc.stderr.readline()
-                if not line:
-                    break
-                stderr_line = line.decode(errors="replace").rstrip()
-                if stderr_line:
-                    log.debug("mcp stderr: %s", stderr_line)
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            log.debug("mcp stderr drain stopped", exc_info=True)
+                page = await client.list_tools(cursor=cursor)
+                tools.extend(McpToolDef(
+                    name=tool.name, description=tool.description or "",
+                    input_schema=tool.input_schema,
+                ) for tool in page.tools)
+                cursor = page.next_cursor # 还有下一页就继续读取下一页的工具列表
+                if not cursor:
+                    return tools
+                if cursor in seen:
+                    raise McpServerUnavailableError("MCP tools/list returned a repeated cursor")
+                seen.add(cursor)
+        except MCPError as exc:
+            if exc.code in (CONNECTION_CLOSED, REQUEST_TIMEOUT):
+                raise McpServerUnavailableError(str(exc)) from exc
+            raise McpToolError(str(exc)) from exc
+        except McpServerUnavailableError:
+            raise
+        except Exception as exc:
+            raise McpServerUnavailableError(_error_message(exc)) from exc
 
-    # 关闭连接并终止 stdio 子进程
+    # 保留工具错误语义；纯结构化结果转换成 JSON 文本供原工具链使用
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
+        client = self._connected()
+        try:
+            result = await client.call_tool(name, arguments)
+        except MCPError as exc:
+            if exc.code in (CONNECTION_CLOSED, REQUEST_TIMEOUT):
+                raise McpServerUnavailableError(str(exc)) from exc
+            raise McpToolError(str(exc)) from exc
+        except Exception as exc:
+            raise McpServerUnavailableError(_error_message(exc)) from exc
+        text = "\n".join(item.text for item in result.content if isinstance(item, TextContent))
+        if not text and result.structured_content is not None:
+            text = json.dumps(result.structured_content, ensure_ascii=False)
+        if result.is_error:
+            raise McpToolError(text or f"MCP tool '{name}' returned isError=true")
+        return text
+
+    # 通知所有者任务退出，使 SDK 有机会结束 HTTP 会话或清理 stdio 子进程
     async def close(self) -> None:
-        # 先取消 stderr 读取任务
-        if self._stderr_task is not None:
-            self._stderr_task.cancel()
-            try:
-                await self._stderr_task
-            except asyncio.CancelledError:
-                pass
-            self._stderr_task = None
-        if self._transport == "stdio" and self._proc is not None:
-            try:
-                self._proc.terminate()
-                await asyncio.wait_for(self._proc.wait(), timeout=5.0)
-            except Exception:
-                try:
-                    self._proc.kill()
-                except Exception:
-                    pass
-        elif self._transport == "tcp":
-            writer = getattr(self, "_tcp_writer", None)
-            if writer is not None:
-                writer.close()
-                try:
-                    await writer.wait_closed()
-                except Exception:
-                    pass
-
-    # 发送 JSON-RPC 请求并等待响应；id 比较用字符串兼容服务端返回字符串 id 的情况
-    async def _call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        self._id += 1
-        req_id = self._id
-        req_id_str = str(req_id)
-        request = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
-        async with self._lock:
-            await self._write_line(json.dumps(request))
-            # 循环读取等待mcp服务器响应
-            while True:
-                line = await self._read_line()
-                try:
-                    msg = json.loads(line)
-                except json.JSONDecodeError:
-                    log.debug("mcp: ignoring non-JSON line: %r", line[:200])
-                    continue
-                msg_id = msg.get("id")
-                if msg_id is None:
-                    # server-initiated notification，忽略
-                    log.debug("mcp: received server notification: %s", msg.get("method"))
-                    continue
-                if str(msg_id) == req_id_str:
-                    if "error" in msg:
-                        err = msg["error"]
-                        raise McpToolError(
-                            f"{err.get('message', str(err))} (code={err.get('code')})"
-                        )
-                    # 读取到合法回复之后就返回结果
-                    result: dict[str, Any] = msg.get("result", {})
-                    return result
-
-    # 发送 JSON-RPC 通知（无响应）
-    async def _notify(self, method: str, params: dict[str, Any]) -> None:
-        notification = {"jsonrpc": "2.0", "method": method, "params": params}
-        await self._write_line(json.dumps(notification))
-
-    # 向 MCP server 写入一行 JSON
-    async def _write_line(self, line: str) -> None:
-        data = (line + "\n").encode()
-        if self._transport == "stdio":
-            w = self._proc.stdin if self._proc else None
-            if w is None:
-                raise McpServerUnavailableError("stdio writer unavailable")
-            w.write(data)
-            # drain的作用是控制写，如果缓冲区太慢了就挂起等一会，缓冲区有空间了再接着写
-            await w.drain()
-        elif self._transport == "tcp":
-            w = getattr(self, "_tcp_writer", None)
-            if w is None:
-                raise McpServerUnavailableError("tcp writer unavailable")
-            w.write(data)
-            await w.drain()
-
-    # 从 MCP server 读取一行 JSON；跳过空行，仅 EOF（b""）才视为连接断开
-    async def _read_line(self) -> str:
-        if self._reader is None:
-            raise McpServerUnavailableError("reader unavailable")
-        while True:
-            try:
-                data = await asyncio.wait_for(self._reader.readline(), timeout=30.0)
-            except TimeoutError:
-                raise McpServerUnavailableError("MCP server read timeout")
-            except asyncio.LimitOverrunError as exc:
-                raise McpServerUnavailableError(
-                    f"MCP response too large (>{self._STREAM_LIMIT // 1024 // 1024}MB): {exc}"
-                ) from exc
-            if data == b"":
-                raise McpServerUnavailableError("MCP server closed connection")
-            line = data.decode(errors="replace").strip()
-            if line:
-                return line
+        task = self._task
+        if task is None:
+            return
+        self._stop.set()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=5)
+        except TimeoutError:
+            task.cancel()
+            with suppress(asyncio.CancelledError, TimeoutError):
+                await asyncio.wait_for(task, timeout=5)
+        finally:
+            self._client = None
+            self._task = None
+            self._failure = "MCP client closed"

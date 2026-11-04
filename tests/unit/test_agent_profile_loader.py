@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from kama_claude.core.agents.loader import AgentProfileLoader
+from kama_claude.core.agents.loader import AgentProfileError, AgentProfileLoader
 
 
 # 功能：内建 planner 角色配置应能被 AgentProfileLoader 加载
@@ -28,12 +28,12 @@ def test_all_builtin_roles_found(role: str) -> None:
     assert profile.allowed_tools  # 每个内建角色都有 allowed_tools
 
 
-# 功能：未知角色名应返回 None
-# 设计：查找不存在的角色，断言返回 None 而非抛异常
-def test_unknown_role_returns_none() -> None:
+# 功能：未知角色名必须明确拒绝
+# 设计：防止指定受限角色失败后退回默认工具集合
+def test_unknown_role_raises() -> None:
     loader = AgentProfileLoader()
-    result = loader.load("nonexistent_role_xyz")
-    assert result is None
+    with pytest.raises(AgentProfileError, match="unknown subagent"):
+        loader.load("nonexistent_role_xyz")
 
 
 # 功能：TOML 角色配置文件应被正确解析

@@ -12,6 +12,7 @@ log = logging.getLogger(__name__)
 
 # 管理所有 MCP server 连接的生命周期：启动、工具发现、注册、关闭
 class McpServerManager:
+    # 只缓存成功连接及其工具，不保留启动失败的半成品
     def __init__(self) -> None:
         self._clients: dict[str, McpClient] = {}
         self._tools: list[McpTool] = []
@@ -19,6 +20,7 @@ class McpServerManager:
     # 依次连接每个 MCP server，发现工具后缓存供后续 registry 使用；失败时记录日志并跳过
     async def start_all(self, servers: list[McpServerConfig]) -> None:
         for cfg in servers:
+            client: McpClient | None = None
             try:
                 client = await self._connect(cfg)
                 tool_defs = await client.list_tools()
@@ -29,7 +31,11 @@ class McpServerManager:
                     "mcp: server '%s' connected, %d tool(s) discovered",
                     cfg.name, len(tool_defs),
                 )
-            except Exception:
+            except BaseException as exc:
+                if client is not None:
+                    await client.close()
+                if not isinstance(exc, Exception):
+                    raise
                 log.exception("mcp: server '%s' failed to start, skipping", cfg.name)
 
     # 将所有已发现的 MCP 工具注册到指定 registry
@@ -50,6 +56,7 @@ class McpServerManager:
             except Exception:
                 log.warning("mcp: error closing server '%s'", name)
         self._clients.clear()
+        self._tools.clear()
 
     # 根据 transport 类型建立连接
     async def _connect(self, cfg: McpServerConfig) -> McpClient:
@@ -58,8 +65,8 @@ class McpServerManager:
             if not cfg.command:
                 raise ValueError(f"mcp server '{cfg.name}': stdio transport requires 'command'")
             await client.connect_stdio(cfg.command, cfg.args, cfg.env or None)
-        elif cfg.transport == "tcp":
-            await client.connect_tcp(cfg.host, cfg.port)
+        elif cfg.transport == "streamable-http":
+            await client.connect_http(cfg.url, cfg.headers or None)
         else:
             raise ValueError(f"mcp server '{cfg.name}': unknown transport '{cfg.transport}'")
         return client

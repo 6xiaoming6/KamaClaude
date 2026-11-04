@@ -18,9 +18,10 @@ from kama_claude.core.bus.events import (
 )
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import ToolCallBlock
-from kama_claude.core.tools.base import ToolResult
-from kama_claude.core.tools.errors import RateLimitedError
+from kama_claude.core.tools.base import FileTool, ToolResult
+from kama_claude.core.tools.errors import RateLimitedError, ToolError
 from kama_claude.core.tools.registry import ToolRegistry
+from kama_claude.core.workspace import WorkspacePathError
 
 if TYPE_CHECKING:
     from kama_claude.core.permissions.manager import PermissionManager
@@ -126,6 +127,21 @@ async def invoke_tool(
                     error_type="schema_error",
                 )
             )
+    params = dict(tool_call.input)
+    # 路径预检查在审批和执行意图之前完成，拒绝不代表未知副作用
+    try:
+        path_access = (
+            tool.path_access(params) if isinstance(tool, FileTool) else None
+        )
+    except WorkspacePathError as exc:
+        return await finish(ToolResult(
+            content=str(exc), is_error=True, error_type="permission_denied",
+        ))
+    if path_access is not None and path_access.outside_workspace and permission_manager is None:
+        return await finish(ToolResult(
+            content=f"outside workspace; approval unavailable: {path_access.target}",
+            is_error=True, error_type="permission_denied",
+        ))
     if permission_manager is not None:
         if checkpoint_hook:
             checkpoint_hook("awaiting_approval")
@@ -134,12 +150,14 @@ async def invoke_tool(
         async def emit_permission(raw: dict[str, Any]) -> None:
             await bus.publish_safe(PermissionRequestedEvent(**raw, run_id=run_id))
 
+        path_options = {"path_access": path_access} if path_access is not None else {}
         allowed, decision = await permission_manager.check_and_wait(
             tool_use_id=tool_call.id,
             tool_name=tool_call.name,
-            params=dict(tool_call.input),
+            params=params,
             session_id=session_id,
             event_emitter=emit_permission,
+            **path_options,
         )
         if not allowed:
             if decision != "auto_deny":
@@ -169,13 +187,45 @@ async def invoke_tool(
             )
 
     for attempt in range(1, _MAX_RETRIES + 2):
+        if isinstance(tool, FileTool) and path_access is not None:
+            try:
+                tool.paths.resolve(path_access.requested_path, approved_path=path_access.target)
+            except WorkspacePathError as exc:
+                return await finish(ToolResult(
+                    content=str(exc), is_error=True, error_type="permission_denied",
+                ))
         # 执行意图提交成功后，才允许进入可能产生副作用的工具函数
         if checkpoint_hook:
             checkpoint_hook("executing")
         try:
+            # 可信批准路径作为 Python 关键字传入，不读取模型提供的同名参数
+            operation = (
+                tool.invoke(params, approved_path=path_access.target)
+                if isinstance(tool, FileTool) and path_access is not None
+                else tool.invoke(params)
+            )
             result = await asyncio.wait_for(
-                tool.invoke(dict(tool_call.input)),
+                operation,
                 timeout=timeout,
+            )
+        except WorkspacePathError as exc:
+            result = ToolResult(content=str(exc), is_error=True, error_type="permission_denied")
+        except ToolError as exc:
+            result = ToolResult(content=str(exc), is_error=True, error_type=exc.error_type)
+        except PermissionError as exc:
+            result = ToolResult(
+                content=str(exc), is_error=True,
+                error_type="permission_denied" if tool.retry_safe else "runtime_error",
+                outcome_unknown=not tool.retry_safe,
+            )
+        except (FileNotFoundError, NotADirectoryError, IsADirectoryError, UnicodeError) as exc:
+            # 读取失败是明确错误；修改类工具未经明确分类的异常仍按未知副作用处理
+            known = tool.retry_safe
+            result = ToolResult(
+                content=str(exc), is_error=True,
+                error_type=("not_found" if isinstance(exc, FileNotFoundError)
+                            else "invalid_operation") if known else "runtime_error",
+                outcome_unknown=not known,
             )
         except RateLimitedError as exc:
             result = ToolResult(content=str(exc), is_error=True, error_type="rate_limited")

@@ -1,37 +1,29 @@
 from __future__ import annotations
 
 import json
+from typing import Annotated
 
-from kama_claude.core.task.manager import TaskManager
-from kama_claude.core.tools.base import BaseTool, ToolResult
+from pydantic import Field
+
+from kama_claude.core.task.manager import TaskManager, TaskNotFoundError
+from kama_claude.core.tools.base import BaseTool, ToolParams, ToolResult
+
+
+class TaskCreateParams(ToolParams):
+    subject: str = Field(min_length=1, max_length=200, description="Short task title.")
+    description: str = Field(default="", max_length=4000)
+    blocked_by: list[Annotated[int, Field(gt=0)]] = Field(default_factory=list, max_length=100)
 
 
 class TaskCreateTool(BaseTool):
     name = "task_create"
     description = (
-        "Create a new task to track a unit of work. "
+        "Create a task in this Run's task list, separate from other Runs and subagents. "
         "Use this to break down a complex goal into smaller, trackable steps. "
         "Returns the created task as JSON."
     )
-    input_schema: dict[str, object] = {
-        "type": "object",
-        "properties": {
-            "subject": {
-                "type": "string",
-                "description": "Short title for the task.",
-            },
-            "description": {
-                "type": "string",
-                "description": "Optional longer description of what needs to be done.",
-            },
-            "blocked_by": {
-                "type": "array",
-                "items": {"type": "integer"},
-                "description": "IDs of tasks that must be completed before this one.",
-            },
-        },
-        "required": ["subject"],
-    }
+    params_model = TaskCreateParams
+    input_schema = TaskCreateParams.model_json_schema()
 
     # 持有 TaskManager 实例，供 invoke 调用
     def __init__(self, task_manager: TaskManager) -> None:
@@ -39,12 +31,9 @@ class TaskCreateTool(BaseTool):
 
     # 创建任务并返回 JSON 字符串
     async def invoke(self, params: dict[str, object]) -> ToolResult:
-        subject = str(params["subject"])
-        description = str(params.get("description") or "")
-        raw_blocked: list[object] = list(params.get("blocked_by") or [])  # type: ignore[call-overload]
-        blocked_by = [int(str(x)) for x in raw_blocked]
+        parsed = TaskCreateParams.model_validate(params)
         try:
-            task = self._manager.create(subject, description, blocked_by)
+            task = self._manager.create(parsed.subject, parsed.description, parsed.blocked_by)
             return ToolResult(content=json.dumps(task.to_dict(), ensure_ascii=False))
-        except ValueError as exc:
-            return ToolResult(content=str(exc), is_error=True, error_type="runtime_error")
+        except TaskNotFoundError as exc:
+            return ToolResult(content=str(exc), is_error=True, error_type="not_found")

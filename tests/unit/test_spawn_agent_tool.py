@@ -9,7 +9,7 @@ import pytest
 
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse, UsageStats
-from kama_claude.core.subagent.registry import BackgroundTaskRegistry
+from kama_claude.core.subagent.registry import ActiveSubagent, BackgroundTaskRegistry
 from kama_claude.core.subagent.tool import AgentResultTool, SpawnAgentTool
 
 
@@ -80,7 +80,7 @@ async def test_background_returns_run_id(tmp_path: Path) -> None:
     assert "run_id=" in result.content
     # extract run_id from message
     run_id = result.content.split("run_id=")[1].split(".")[0]
-    assert registry.get(run_id) is not None
+    assert registry.get(run_id, "sess-test") is not None
 
 
 # 功能：后台任务未完成时 agent_result 应返回 "still running"
@@ -109,7 +109,7 @@ async def test_agent_result_pending(tmp_path: Path) -> None:
     })
     run_id = spawn_result.content.split("run_id=")[1].split(".")[0]
 
-    result_tool = AgentResultTool(registry)
+    result_tool = AgentResultTool(registry, "sess-test")
     result = await result_tool.invoke({"run_id": run_id})
     assert result.content == "still running"
     assert not result.is_error
@@ -130,12 +130,12 @@ async def test_agent_result_done(tmp_path: Path) -> None:
     })
     run_id = spawn_result.content.split("run_id=")[1].split(".")[0]
 
-    entry = registry.get(run_id)
-    assert entry is not None
-    task, _ = entry
+    entry = registry.get(run_id, "sess-test")
+    assert isinstance(entry, ActiveSubagent)
+    task = entry.task
     await asyncio.wait_for(task, timeout=5.0)
 
-    result_tool = AgentResultTool(registry)
+    result_tool = AgentResultTool(registry, "sess-test")
     result = await result_tool.invoke({"run_id": run_id})
     assert not result.is_error
     assert "final answer" in result.content
@@ -161,7 +161,7 @@ async def test_nesting_limit(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_agent_result_unknown_run_id(tmp_path: Path) -> None:
     registry = BackgroundTaskRegistry()
-    tool = AgentResultTool(registry)
+    tool = AgentResultTool(registry, "sess-test")
     result = await tool.invoke({"run_id": "nonexistent-id"})
     assert result.is_error
     assert "Unknown" in result.content

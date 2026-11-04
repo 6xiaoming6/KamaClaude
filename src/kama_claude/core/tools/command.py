@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import locale
 import logging
 import os
 import signal
@@ -36,7 +37,12 @@ class CommandExecutor:
             room = _OUTPUT_LIMIT - len(kept)
             kept.extend(chunk[:room])
             truncated = truncated or len(chunk) > room
-        output = kept.decode("utf-8", errors="replace")
+        try:
+            output = kept.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            partial_utf8 = truncated and exc.reason == "unexpected end of data"
+            encoding = locale.getencoding() if os.name == "nt" and not partial_utf8 else "utf-8"
+            output = kept.decode(encoding, errors="replace")
         return output + ("\n[truncated]" if truncated else "")
 
     # 运行中采集子进程身份，根 shell 先退出时仍能清理已经发现的后代

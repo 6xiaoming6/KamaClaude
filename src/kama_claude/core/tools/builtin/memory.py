@@ -3,15 +3,14 @@ from __future__ import annotations
 import json
 from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import Field, model_validator
 
 from kama_claude.core.memory.model import MemoryError, MemoryScope
 from kama_claude.core.memory.store import MemoryStore
-from kama_claude.core.tools.base import BaseTool, ToolResult
+from kama_claude.core.tools.base import BaseTool, ToolParams, ToolResult
 
 
-class MemoryReadParams(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class MemoryReadParams(ToolParams):
     scope: MemoryScope = "project"
     key: str | None = None
     query: str = ""
@@ -21,8 +20,7 @@ class MemoryReadParams(BaseModel):
     )
 
 
-class MemoryWriteParams(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class MemoryWriteParams(ToolParams):
     scope: MemoryScope = "project"
     key: str
     action: Literal["upsert", "delete"] = "upsert"
@@ -64,7 +62,7 @@ class MemoryReadTool(BaseTool):
                 )
             )
         except MemoryError as exc:
-            return ToolResult(content=str(exc), is_error=True, error_type="runtime_error")
+            return ToolResult(content=str(exc), is_error=True, error_type=exc.error_type)
         return ToolResult(content=json.dumps(result, ensure_ascii=False))
 
 
@@ -98,5 +96,5 @@ class MemoryWriteTool(BaseTool):
                     pinned=parsed.pinned, source=self._source,
                 )
         except MemoryError as exc:
-            return ToolResult(content=str(exc), is_error=True, error_type="runtime_error")
+            return ToolResult(content=str(exc), is_error=True, error_type=exc.error_type)
         return ToolResult(content=json.dumps(result, ensure_ascii=False))

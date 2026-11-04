@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from kama_claude.core.llm.base import LLMProvider
     from kama_claude.core.permissions.manager import PermissionManager
     from kama_claude.core.runner import AgentRunner
+    from kama_claude.core.subagent.registry import BackgroundTaskRegistry
 
 SESSION_NOT_FOUND = -32010
 SESSION_CLOSED = -32011
@@ -63,6 +64,7 @@ class SessionManager:
         provider_factory: Callable[[], LLMProvider] | None = None,
         permission_manager: PermissionManager | None = None,
         compaction: CompactionConfig | None = None,
+        task_registry: BackgroundTaskRegistry | None = None,
     ) -> None:
         self._store = store
         self._recovery = SessionRecovery(store)
@@ -72,6 +74,7 @@ class SessionManager:
         self._provider_factory = provider_factory
         self._permissions = permission_manager
         self._compaction = compaction or CompactionConfig()
+        self._task_registry = task_registry
         self._sessions: dict[str, Session] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._tasks: dict[str, asyncio.Task[str]] = {}
@@ -217,6 +220,8 @@ class SessionManager:
             if session.status == "interrupted":
                 return run_id
             if session.mode == "one_shot":
+                if self._task_registry is not None:
+                    await self._task_registry.cancel(session_id=sid)
                 await self._bus.publish_safe(
                     SessionClosedEvent(session_id=sid, ts=session.updated_at)
                 )
@@ -370,6 +375,8 @@ class SessionManager:
                 cp.run.status = "failed"
                 cp.run.phase = "finished"
                 cp.run.reason = "session_closed"
+            if self._task_registry is not None:
+                await self._task_registry.cancel(session_id=sid)
             session.status = "closed"
             session.updated_at = _now()
             cp.session = session.to_dict()
@@ -466,6 +473,8 @@ class SessionManager:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        if self._task_registry is not None:
+            await self._task_registry.cancel()
 
     # 后台任务异常结束后重新同步权威状态，避免客户端永久等待未到达的终态
     async def _notify_failed_task(self, sid: str, run_id: str) -> None:
