@@ -20,11 +20,11 @@ def test_preview_truncates() -> None:
 
 
 # 功能：验证工具参数摘要优先展示工具最关键字段
-# 设计：覆盖 read_file/bash/note_save 三类常见工具，避免工具块摘要退化成整段 JSON
+# 设计：覆盖 read_file/bash/memory_write 三类常见工具，避免工具块摘要退化成整段 JSON
 def test_param_summary_prefers_key_fields() -> None:
     assert _param_summary("read_file", {"path": "README.md"}) == "path='README.md'"
     assert _param_summary("bash", {"command": "echo hi", "timeout": 1}) == "command='echo hi'"
-    assert _param_summary("note_save", {"content": "Python 3.12"}) == "content='Python 3.12'"
+    assert _param_summary("memory_write", {"key": "python"}) == "key='python'"
 
 
 # 功能：验证 llm.token 事件累积到 LLMStreamBlock，不连续 token 各自新开一块
@@ -149,12 +149,12 @@ def test_tool_call_started_and_finished() -> None:
     assert block._output == "hi"  # type: ignore[attr-defined]
 
 
-# 功能：验证 note_save 成功完成时工具块摘要显示 remembered
-# 设计：直接操作 ToolCallBlock，覆盖 note_save 的特殊低噪声展示策略
-def test_note_save_tool_block_shows_remembered() -> None:
-    block = ToolCallBlock("note_save", {"content": "Python 3.12"})
+# 功能：验证 memory_write 工具块显示作用域和 key
+# 设计：直接操作通用 ToolCallBlock，确认不需要专门的记忆显示分支
+def test_memory_write_tool_block_shows_key() -> None:
+    block = ToolCallBlock("memory_write", {"scope": "session", "key": "python"})
     block.set_result("saved", 3)
-    assert "remembered" in block._summary()  # type: ignore[attr-defined]
+    assert "python" in block._summary()  # type: ignore[attr-defined]
 
 
 # 功能：验证提交用户输入时会追加 user turn，并进入 busy 状态

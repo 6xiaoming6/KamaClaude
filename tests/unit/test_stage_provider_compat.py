@@ -7,11 +7,14 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from kama_claude.core.bus.events import LlmUsageEvent
+from kama_claude.core.compact.compactor import SUMMARY_MARKER
+from kama_claude.core.config import CompactionConfig
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.provider import OpenaiProvider
 from kama_claude.core.llm.types import LlmResponse, UsageStats
 from kama_claude.core.session.manager import SessionManager
 from kama_claude.core.session.store import SessionStore
+from tests.unit.test_compactor import history
 
 
 # 功能：验证手动压缩按需创建后端、写回摘要，并复用已创建的后端。
@@ -28,21 +31,33 @@ async def test_manual_compaction_creates_provider_on_demand(tmp_path: Path) -> N
     )
     factory = Mock(return_value=provider)
     store = SessionStore(tmp_path)
-    manager = SessionManager(store, Mock(), EventBus(), provider_factory=factory)
+    manager = SessionManager(
+        store, Mock(), EventBus(), provider_factory=factory,
+        compaction=CompactionConfig(
+            context_window_tokens=8_192, output_reserve_tokens=512,
+            auto_threshold=0.1, prune_target_ratio=0.05, summary_max_tokens=256,
+        ),
+    )
     session = await manager.create("chat")
-    store.append_message(session.id, "user", "原始对话内容。" * 100)
+    for message in history():
+        store.append_message(session.id, message["role"], message["content"])
     factory.assert_not_called()
 
+    original_thread = (store.session_dir(session.id) / "thread.jsonl").read_bytes()
     result = await manager.compact(session.id, focus="项目约定")
 
     factory.assert_called_once_with()
-    assert result.summary_tokens == 10
-    assert store.read_messages(session.id)[0]["content"] == "保留项目约定和剩余任务。"
-    assert list(store.session_dir(session.id).glob("thread_*.jsonl.bak"))
+    assert result.compacted and result.summary_tokens > 0
+    assert store.read_messages(session.id)[0]["content"].startswith(SUMMARY_MARKER)
+    assert "保留项目约定和剩余任务。" in store.read_messages(session.id)[0]["content"]
+    assert (store.session_dir(session.id) / "thread.jsonl").read_bytes() == original_thread
+    assert (await manager.open(session.id))["messages"] == history()
+    assert not list(store.session_dir(session.id).glob("thread_*.jsonl.bak"))
     assert "项目约定" in provider.chat.call_args.kwargs["messages"][0]["content"]
 
     second_session = await manager.create("chat")
-    store.append_message(second_session.id, "user", "另一段对话。" * 100)
+    for message in history():
+        store.append_message(second_session.id, message["role"], message["content"])
     await manager.compact(second_session.id)
     factory.assert_called_once_with()
 

@@ -36,6 +36,7 @@ class _MockProvider:
         *,
         step: int = 0,
         system: str | None = None,
+        max_output_tokens: int = 8_192,
     ) -> LlmResponse:
         if self._exc is not None:
             raise self._exc

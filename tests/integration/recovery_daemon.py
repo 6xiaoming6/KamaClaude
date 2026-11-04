@@ -47,8 +47,20 @@ class FileProbe(BaseTool):
 
 
 class Provider:
+    # 保存测试控制目录，不读取真实模型配置或密钥
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
     # 根据实际保存的上下文返回固定工具请求或最终结果
     async def chat(self, **kwargs: Any) -> LlmResponse:
+        if kwargs.get("run_id") == "compact":
+            with (self.root / "summary-calls.txt").open("a", encoding="utf-8") as file:
+                file.write("summary\n")
+            return LlmResponse("end_turn", text="S9 handoff: old work completed; continue the task.")
+        if (self.root / "s9-mode").exists() or (self.root / "s9-program-mode").exists():
+            (self.root / "s9-model-waiting").touch()
+            while not (self.root / "s9-release-model").exists():
+                await asyncio.sleep(0.02)
         messages = kwargs["messages"]
         last = messages[-1]["content"]
         if isinstance(last, list) and any(b.get("type") == "tool_result" for b in last):
@@ -76,9 +88,17 @@ async def main(root: Path, port: int) -> None:
             registry.register(FileProbe(root))
             return registry
 
+    config = KamaConfig()
+    if (root / "s9-mode").exists():
+        config.compaction.auto_threshold = 0.05
+        config.compaction.prune_target_ratio = 0.02
+    if (root / "s9-program-mode").exists():
+        config.compaction.context_window_tokens = 8_192
+        config.compaction.output_reserve_tokens = 512
+        config.compaction.summary_max_tokens = 256
     app._sessions = SessionManager(
         SessionStore(root / "sessions"),
-        lambda: Runner(KamaConfig(), provider=Provider(), bus=app._bus),
+        lambda: Runner(config, provider=Provider(root), bus=app._bus),
         app._bus,
     )
     server = SocketServer("127.0.0.1", port, app._broadcaster)
@@ -89,6 +109,7 @@ async def main(root: Path, port: int) -> None:
         "session.open": app._session_open_handler,
         "session.resume": app._session_resume_handler,
         "session.close": app._session_close_handler,
+        "memory.inspect": app._memory_inspect_handler,
     }.items():
         server.register(method, handler)
     await server.start()

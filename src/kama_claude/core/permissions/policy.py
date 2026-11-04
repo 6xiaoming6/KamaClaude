@@ -42,7 +42,8 @@ DEFAULT_POLICIES: dict[str, ToolPolicy] = {
     "write_file": ToolPolicy(default=PermissionDecision.ASK),
     "read_file":  ToolPolicy(default=PermissionDecision.ALLOW),
     "list_dir":   ToolPolicy(default=PermissionDecision.ALLOW),
-    "note_save":  ToolPolicy(default=PermissionDecision.ALLOW),
+    "memory_read": ToolPolicy(default=PermissionDecision.ALLOW),
+    "memory_write": ToolPolicy(default=PermissionDecision.ALLOW),
 }
 
 # 未在 DEFAULT_POLICIES 中登记的工具的兜底策略，总是询问用户是否执行
@@ -54,7 +55,8 @@ _PREVIEW_KEY: dict[str, str] = {
     "read_file":  "path",
     "write_file": "path",
     "list_dir":   "path",
-    "note_save":  "content",
+    "memory_read": "key",
+    "memory_write": "key",
 }
 _PREVIEW_MAX = 60
 
@@ -83,6 +85,10 @@ def evaluate(
     # 如果这个工具没有配置默认权限，就给他兜底的未知工具权限，每次执行都要询问
     if policy is None:
         return _UNKNOWN_TOOL_DEFAULT
+    if tool_name == "memory_write" and params.get("scope", "project") == "global":
+        return PermissionDecision.DENY if policy.default == PermissionDecision.DENY else (
+            PermissionDecision.ASK
+        )
 
     # 对bash工具提取需要的指令，只有bash才需要命令，其他的工具只需要传参数就行了
     command = str(params.get("command", "")) if tool_name == "bash" else ""

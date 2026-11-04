@@ -51,9 +51,26 @@ class PermissionConfig:
 
 @dataclass
 class CompactionConfig:
-    auto_threshold: float = 0.0    # context_pct 触发自动压缩的阈值（0 表示禁用，推荐用手动 /compact）
+    auto_threshold: float = 0.8  # 请求前按估算输入触发，0 表示关闭压力层
+    prune_target_ratio: float = 0.65  # 程序层尽量降到软阈值以下，减少反复整理
     tool_result_limit: int = 8_000  # tool_result 截断触发字符数
-    tool_result_keep: int = 4_000   # 截断后保留的前缀字符数
+    tool_result_keep: int = 4_000  # 头尾保留的总字符数
+    context_window_tokens: int = 65_536  # 按实际模型配置，并非模型能力声明
+    output_reserve_tokens: int = 8_192
+    keep_recent_groups: int = 2
+    summary_max_tokens: int = 2_048
+
+    @property
+    # 输入预算始终预留输出空间和安全余量
+    def input_limit(self) -> int:
+        return self.context_window_tokens - self.output_reserve_tokens - 1_024
+
+
+@dataclass
+class MemoryConfig:
+    global_tokens: int = 512
+    project_tokens: int = 1_024
+    session_tokens: int = 512
 
 
 @dataclass
@@ -82,6 +99,7 @@ class KamaConfig:
     trace: TraceConfig = field(default_factory=TraceConfig)
     permission: PermissionConfig = field(default_factory=PermissionConfig)
     compaction: CompactionConfig = field(default_factory=CompactionConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
 
 
@@ -112,12 +130,21 @@ def get_config() -> KamaConfig:
             _apply_toml(config, data)
 
     _apply_env(config)
+    comp = config.compaction
+    if not 0 < comp.prune_target_ratio < (comp.auto_threshold or 0.8):
+        raise SystemExit("Config error: prune_target_ratio must be below the active threshold")
+    if comp.tool_result_keep > comp.tool_result_limit:
+        raise SystemExit("Config error: tool_result_keep must not exceed tool_result_limit")
+    if comp.input_limit <= 0 or comp.context_window_tokens <= comp.summary_max_tokens + 1_024:
+        raise SystemExit("Config error: context window must allow input, output and safety margin")
     return config
 
 
 # 将已解析的 TOML 根表写入 config；未知小节或类型错误时退出进程
 def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
-    unknown = set(data.keys()) - {"core", "logging", "agent", "llm", "trace", "permission", "compaction", "mcp"}
+    unknown = set(data.keys()) - {
+        "core", "logging", "agent", "llm", "trace", "permission", "compaction", "memory", "mcp",
+    }
     if unknown:
         raise SystemExit(f"Unknown top-level config keys: {', '.join(sorted(unknown))}")
 
@@ -224,7 +251,11 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
         comp = data["compaction"]
         if not isinstance(comp, dict):
             raise SystemExit("Config error: [compaction] must be a table")
-        unknown_comp: set[str] = set(comp.keys()) - {"auto_threshold", "tool_result_limit", "tool_result_keep"}
+        positive_keys = {
+            "tool_result_limit", "tool_result_keep", "context_window_tokens",
+            "output_reserve_tokens", "keep_recent_groups", "summary_max_tokens",
+        }
+        unknown_comp = set(comp) - {"auto_threshold", "prune_target_ratio", *positive_keys}
         if unknown_comp:
             raise SystemExit(f"Unknown [compaction] keys: {', '.join(sorted(unknown_comp))}")
         if "auto_threshold" in comp:
@@ -232,16 +263,29 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
             if not isinstance(val, (int, float)) or not (0.0 <= val <= 1.0):
                 raise SystemExit("Config error: compaction.auto_threshold must be between 0 and 1")
             config.compaction.auto_threshold = float(val)
-        if "tool_result_limit" in comp:
-            val = comp["tool_result_limit"]
-            if not isinstance(val, int) or val <= 0:
-                raise SystemExit("Config error: compaction.tool_result_limit must be a positive integer")
-            config.compaction.tool_result_limit = val
-        if "tool_result_keep" in comp:
-            val = comp["tool_result_keep"]
-            if not isinstance(val, int) or val <= 0:
-                raise SystemExit("Config error: compaction.tool_result_keep must be a positive integer")
-            config.compaction.tool_result_keep = val
+        if "prune_target_ratio" in comp:
+            val = comp["prune_target_ratio"]
+            if type(val) not in (int, float) or not 0 < val < 1:
+                raise SystemExit("Config error: prune_target_ratio must be between 0 and 1")
+            config.compaction.prune_target_ratio = float(val)
+        for key in positive_keys:
+            if key in comp:
+                val = comp[key]
+                if type(val) is not int or val <= 0:
+                    raise SystemExit(f"Config error: compaction.{key} must be a positive integer")
+                setattr(config.compaction, key, val)
+
+    if "memory" in data:
+        memory = data["memory"]
+        keys = {"global_tokens", "project_tokens", "session_tokens"}
+        if not isinstance(memory, dict):
+            raise SystemExit("Config error: [memory] must be a table")
+        if set(memory) - keys:
+            raise SystemExit("Config error: unknown [memory] keys")
+        for key, val in memory.items():
+            if type(val) is not int or val < 0:
+                raise SystemExit(f"Config error: memory.{key} must be a nonnegative integer")
+            setattr(config.memory, key, val)
 
     if "mcp" in data:
         mcp = data["mcp"]
@@ -261,7 +305,9 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
                 raise SystemExit(f"Config error: mcp.servers[{i}].name must be a non-empty string")
             transport = srv.get("transport", "stdio")
             if transport not in ("stdio", "tcp"):
-                raise SystemExit(f"Config error: mcp.servers[{i}].transport must be 'stdio' or 'tcp'")
+                raise SystemExit(
+                    f"Config error: mcp.servers[{i}].transport must be 'stdio' or 'tcp'"
+                )
             s = McpServerConfig(name=name, transport=transport)
             if "command" in srv:
                 val = srv["command"]
@@ -367,7 +413,8 @@ def _apply_env(config: KamaConfig) -> None:
             compact_threshold_val = float(compact_threshold)
             if not (0.0 <= compact_threshold_val <= 1.0):
                 raise SystemExit(
-                    f"Config error: KAMA_COMPACT_THRESHOLD must be between 0 and 1, got: {compact_threshold!r}"
+                    "Config error: KAMA_COMPACT_THRESHOLD must be between 0 and 1, "
+                    f"got: {compact_threshold!r}"
                 )
             config.compaction.auto_threshold = compact_threshold_val
         except ValueError:
@@ -381,12 +428,14 @@ def _apply_env(config: KamaConfig) -> None:
             compact_tool_limit_val = int(compact_tool_limit)
             if compact_tool_limit_val <= 0:
                 raise SystemExit(
-                    f"Config error: KAMA_COMPACT_TOOL_LIMIT must be a positive integer, got: {compact_tool_limit!r}"
+                    "Config error: KAMA_COMPACT_TOOL_LIMIT must be a positive integer, "
+                    f"got: {compact_tool_limit!r}"
                 )
             config.compaction.tool_result_limit = compact_tool_limit_val
         except ValueError:
             raise SystemExit(
-                f"Config error: KAMA_COMPACT_TOOL_LIMIT must be an integer, got: {compact_tool_limit!r}"
+                "Config error: KAMA_COMPACT_TOOL_LIMIT must be an integer, "
+                f"got: {compact_tool_limit!r}"
             )
 
     compact_tool_keep = os.environ.get("KAMA_COMPACT_TOOL_KEEP")
@@ -395,10 +444,53 @@ def _apply_env(config: KamaConfig) -> None:
             compact_tool_keep_val = int(compact_tool_keep)
             if compact_tool_keep_val <= 0:
                 raise SystemExit(
-                    f"Config error: KAMA_COMPACT_TOOL_KEEP must be a positive integer, got: {compact_tool_keep!r}"
+                    "Config error: KAMA_COMPACT_TOOL_KEEP must be a positive integer, "
+                    f"got: {compact_tool_keep!r}"
                 )
             config.compaction.tool_result_keep = compact_tool_keep_val
         except ValueError:
             raise SystemExit(
-                f"Config error: KAMA_COMPACT_TOOL_KEEP must be an integer, got: {compact_tool_keep!r}"
+                "Config error: KAMA_COMPACT_TOOL_KEEP must be an integer, "
+                f"got: {compact_tool_keep!r}"
             )
+
+
+    # 新预算参数沿用环境变量覆盖 TOML 的规则
+    for suffix, key in {
+        "WINDOW_TOKENS": "context_window_tokens",
+        "OUTPUT_TOKENS": "output_reserve_tokens",
+        "KEEP_GROUPS": "keep_recent_groups",
+        "SUMMARY_TOKENS": "summary_max_tokens",
+    }.items():
+        name = "KAMA_COMPACT_" + suffix
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        try:
+            parsed = int(value)
+        except ValueError as exc:
+            raise SystemExit(f"Config error: {name} must be a positive integer") from exc
+        if parsed <= 0:
+            raise SystemExit(f"Config error: {name} must be a positive integer")
+        setattr(config.compaction, key, parsed)
+
+    # 三层记忆的 0 预算表示不自动注入，但仍可通过工具读取
+    for scope in ("global", "project", "session"):
+        name = f"KAMA_MEMORY_{scope.upper()}_TOKENS"
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        try:
+            memory_amount = int(raw)
+        except ValueError as exc:
+            raise SystemExit(f"Config error: {name} must be a nonnegative integer") from exc
+        if memory_amount < 0:
+            raise SystemExit(f"Config error: {name} must be a nonnegative integer")
+        setattr(config.memory, scope + "_tokens", memory_amount)
+
+    prune_target = os.environ.get("KAMA_COMPACT_PRUNE_TARGET")
+    if prune_target is not None:
+        try:
+            config.compaction.prune_target_ratio = float(prune_target)
+        except ValueError as exc:
+            raise SystemExit("Config error: KAMA_COMPACT_PRUNE_TARGET must be a number") from exc

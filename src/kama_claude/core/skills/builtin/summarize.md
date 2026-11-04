@@ -2,7 +2,8 @@
 name: summarize
 description: 将当前 session 对话压缩为人类可读摘要
 allowed_tools:
-  - note_save
+  - memory_read
+  - memory_write
 ---
 你是一位技术写作专家。请将当前对话内容整理成一份简洁的人类可读摘要，方便日后回顾。
 
@@ -17,6 +18,6 @@ allowed_tools:
 - 简洁克制，总长不超过 500 字
 - 用第三人称描述（"Agent 分析了..."）
 
-完成摘要后，用 note_save 工具将摘要保存到 session notes，key 为 "session_summary"。
+完成摘要后，用 memory_write 工具将摘要保存到 session 作用域，key 为 "session_summary"，同时提供简短 summary 和正文 content。
 
 $ARGUMENTS

@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from kama_claude.core.checkpoint.checkpoint import RunCheckpoint
+from kama_claude.core.memory.context import MEMORY_GUIDANCE
 
 
 @dataclass
@@ -11,9 +12,7 @@ class ExecutionContext:
     # 所有运行字段共用这一份 run，messages 只保存模型工作历史
     run: RunCheckpoint
     messages: list[dict[str, Any]] = field(default_factory=list)
-    session_notes: str = ""
-    global_context: str = ""
-    project_context: str = ""
+    memory_context: str = ""
     # skill 或 subagent 角色可覆盖默认 system prompt
     system_prompt_override: str | None = None
 
@@ -25,18 +24,10 @@ class ExecutionContext:
 
     # 返回当前 run 的 system prompt；有 override 时跳过 base，直接注入记忆层
     def system_prompt(self, base: str) -> str:
-        parts = [self.system_prompt_override if self.system_prompt_override else base]
-        if self.global_context.strip():
-            parts.append("\n\n## Global Context\n" + self.global_context.strip())
-        if self.project_context.strip():
-            parts.append("\n\n## Project Context\n" + self.project_context.strip())
-        if self.session_notes.strip():
-            parts.append(
-                "\n\n## Session Notes\n"
-                + self.session_notes.strip()
-                + "\n\nRemember important durable facts by calling note_save."
-            )
-        return "".join(parts)
+        if self.run.system_prompt:
+            return self.run.system_prompt
+        prompt = self.system_prompt_override if self.system_prompt_override else base
+        return prompt + MEMORY_GUIDANCE + self.memory_context
 
     # 将 LLM 响应的 content blocks 追加为 assistant 消息
     def add_assistant_message(self, content: list[Any]) -> None:

@@ -5,10 +5,20 @@ import logging
 import time
 from dataclasses import asdict
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Literal
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal
 
-from kama_claude.core.bus.events import StepFinishedEvent, StepStartedEvent
+from kama_claude.core.bus.events import (
+    ContextCompactedEvent,
+    ContextCompactionFailedEvent,
+    ContextCompactionStartedEvent,
+    StepFinishedEvent,
+    StepStartedEvent,
+)
 from kama_claude.core.checkpoint.checkpoint import ToolCheckpoint
+from kama_claude.core.compact.budget import estimate_request, estimate_tokens
+from kama_claude.core.compact.compactor import write_summary
+from kama_claude.core.config import CompactionConfig
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.base import LLMProvider
@@ -40,7 +50,8 @@ class AgentLoop:
         context: ExecutionContext,
         permission_manager: PermissionManager | None = None,
         compactor: Compactor | None = None,
-        compact_threshold: float = 0.80,
+        compaction: CompactionConfig | None = None,
+        run_path: Path | None = None,
         session_id: str = "",
         persistence: RunPersistence | None = None,
     ) -> None:
@@ -50,7 +61,8 @@ class AgentLoop:
         self._context = context
         self._permission_manager = permission_manager
         self._compactor = compactor
-        self._compact_threshold = compact_threshold
+        self._compaction = compaction or CompactionConfig()
+        self._run_path = run_path
         self._session_id = session_id
         self._persistence = persistence
 
@@ -93,20 +105,25 @@ class AgentLoop:
         await self._bus.publish_safe(
             StepStartedEvent(run_id=run.run_id, step=run.step, ts=_now())
         )
+        system = run.system_prompt or context.system_prompt(
+            "You are a helpful AI assistant. "
+            "Use the available tools to complete the user's goal. "
+            "When the goal is fully achieved, respond with a final answer "
+            "and do not call any more tools."
+        )
+        schemas = self._registry.tool_schemas()
+        # 请求前准备
+        if not await self._prepare_model_context(system, schemas):
+            return False
         try:
             response = await self._provider.chat(
                 messages=context.messages,
-                tool_schemas=self._registry.tool_schemas(),
+                tool_schemas=schemas,
                 bus=self._bus,
                 run_id=run.run_id,
                 step=run.step,
-                system=run.system_prompt
-                or context.system_prompt(
-                    "You are a helpful AI assistant. "
-                    "Use the available tools to complete the user's goal. "
-                    "When the goal is fully achieved, respond with a final answer "
-                    "and do not call any more tools."
-                ),
+                system=system,
+                max_output_tokens=self._compaction.output_reserve_tokens,
             )
         except asyncio.CancelledError:
             if self._persistence is None:
@@ -124,6 +141,54 @@ class AgentLoop:
         self._record_response(response)
         return True
 
+    # 请求前执行同一条分层管线，程序层不足才调用摘要，提交后再通知
+    async def _prepare_model_context(
+        self, system: str, schemas: list[dict[str, Any]],
+    ) -> bool:
+        context = self._context
+        run = context.run
+        config = self._compaction
+        if self._compactor is not None:
+            pressure = (
+                config.auto_threshold > 0
+                and estimate_request(system, context.messages, schemas)
+                >= config.input_limit * config.auto_threshold
+            )
+            if pressure:
+                await self._bus.publish_safe(ContextCompactionStartedEvent(
+                    session_id=self._session_id, run_id=run.run_id,
+                    original_tokens=estimate_tokens(context.messages), ts=_now(),
+                ))
+            result = await self._compactor.prepare_context(
+                context.messages, self._provider, system=system, tool_schemas=schemas,
+                outputs_dir=self._run_path / "outputs" if self._run_path else None,
+            )
+            if result.compacted:
+                context.messages = result.messages
+                # 一次提交候选工作历史，不修改 Run 身份、Step 或工具游标
+                self._save_checkpoint()
+            if result.summary_text and self._run_path is not None:
+                write_summary(self._run_path, result.summary_text)
+            if result.compacted and result.reason in ("", "below_threshold", "auto_disabled"):
+                await self._bus.publish_safe(ContextCompactedEvent(
+                    session_id=self._session_id, run_id=run.run_id,
+                    original_tokens=result.original_token_estimate,
+                    summary_tokens=result.summary_tokens,
+                    remaining_tokens=result.remaining_token_estimate,
+                    applied_stages=result.applied_stages, llm_used=result.llm_used, ts=_now(),
+                ))
+            elif pressure or result.reason not in ("below_threshold", "auto_disabled"):
+                await self._bus.publish_safe(ContextCompactionFailedEvent(
+                    session_id=self._session_id, run_id=run.run_id,
+                    reason=result.reason, applied_stages=result.applied_stages,
+                    llm_used=result.llm_used, ts=_now(),
+                ))
+        if estimate_request(system, context.messages, schemas) > config.input_limit:
+            context.mark_interrupted("context_budget_exceeded")
+            self._save_checkpoint()
+            return False
+        return True
+
     # 保存完整模型消息与工具批次，并根据停止原因设置下一阶段
     def _record_response(self, response: LlmResponse) -> None:
         context = self._context
@@ -134,6 +199,8 @@ class AgentLoop:
         for tc in response.tool_calls:
             blocks.append({"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.input})
         context.add_assistant_message(blocks)
+        if self._persistence is not None:
+            self._persistence.record_message("assistant", blocks)
         run.context_pct = response.usage.context_pct if response.usage else 0.0
         # 先登记完整工具批次并保存，之后才真正执行工具
         run.tools = [
@@ -152,6 +219,8 @@ class AgentLoop:
                     "Output limit or unsupported stop reason; tool not executed.",
                     is_error=True,
                 )
+                if self._persistence is not None:
+                    self._persistence.record_message("user", [context.messages[-1]["content"][-1]])
             run.tools = []
             run.phase = "ready"
             if run.step >= run.max_steps:
@@ -194,6 +263,9 @@ class AgentLoop:
             else:
                 tool.status = "completed"
                 context.add_tool_result(tool.id, result.content, is_error=result.is_error)
+                if self._persistence is not None:
+                    # 逐工具记录完整结果，之后的裁剪或摘要只改变工作历史
+                    self._persistence.record_message("user", [context.messages[-1]["content"][-1]])
                 run.tool_index += 1
                 # 主 Agent 已取回子任务结果，不再视为未完成子任务
                 if (
@@ -226,19 +298,12 @@ class AgentLoop:
             tool.attempts += 1
         self._save_checkpoint()
 
-    # 工具批次结束后检查预算、按需压缩，并提交下一阶段
+    # 工具批次结束后检查步数，压缩统一留到下次模型请求前
     async def _finish_tool_batch(self) -> None:
         context = self._context
         run = context.run
         if run.step >= run.max_steps:
             context.mark_failed("exceeded_max_steps")
-        elif (
-            self._compactor
-            and self._compact_threshold > 0
-            and run.context_pct >= self._compact_threshold
-        ):
-            # 工具结果已配对后再压缩，下一次请求才能使用完整历史
-            await self._compactor.compact(context, self._provider)
         # 如果这一个循环没有完成任务，就继续设置为ready阶段，准备下一次循环
         run.phase = "ready" if not context.is_done() else "finished"
         self._save_checkpoint()

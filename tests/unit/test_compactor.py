@@ -1,128 +1,191 @@
 from __future__ import annotations
 
-from pathlib import Path
+import asyncio
+import copy
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, Mock
 
-from kama_claude.core.checkpoint.checkpoint import RunCheckpoint
-from kama_claude.core.compact.compactor import Compactor
-from kama_claude.core.context import ExecutionContext
-from kama_claude.core.events.bus import EventBus
+import pytest
+
+from kama_claude.core.checkpoint.checkpoint import CheckpointError
+from kama_claude.core.compact.budget import estimate_tokens
+from kama_claude.core.compact.compactor import SUMMARY_ACK, SUMMARY_MARKER, Compactor
+from kama_claude.core.config import CompactionConfig
 from kama_claude.core.llm.types import LlmResponse, UsageStats
 
 
-def _stub_provider(summary: str = "## 1. Original Goal\nTest\n## 2. Completed Steps\n- done") -> Any:
-    provider = MagicMock()
-    provider.chat = AsyncMock(return_value=LlmResponse(
-        stop_reason="end_turn",
-        text=summary,
-        usage=UsageStats(input_tokens=100, output_tokens=30),
-    ))
-    return provider
+# 构造足够长的旧历史，使摘要收益和近期原文都可以独立检查
+def history(count: int = 5) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    for index in range(count):
+        messages.extend([
+            {"role": "user", "content": f"request {index}"},
+            {"role": "assistant", "content": f"answer {index}: " + "x" * 2_400},
+        ])
+    return messages
 
 
-def _make_messages(n: int = 5) -> list[dict[str, Any]]:
-    msgs = []
-    for i in range(n):
-        msgs.append({"role": "user", "content": "user message " + "x" * 200})
-        msgs.append({"role": "assistant", "content": "assistant reply " + "y" * 200})
-    return msgs
+# 注入不联网的摘要模型，保留调用参数供预算与输出上限断言
+def provider(text: str = "Goal: continue. Completed: old work. TODO: finish.") -> Any:
+    return Mock(chat=AsyncMock(return_value=LlmResponse(
+        "end_turn", text=text, usage=UsageStats(100, 20),
+    )))
 
 
-# 功能：验证 compact_messages 成功时 provider.chat 被调用一次且不传工具 schema
-# 设计：stub provider 返回非空摘要，断言 chat 调用一次，tool_schemas=[]
-async def test_compact_messages_calls_provider(tmp_path: Path) -> None:
-    provider = _stub_provider()
-    bus = EventBus()
-    compactor = Compactor(bus, tmp_path, "sess-1")
-    messages = _make_messages()
-
-    result = await compactor.compact_messages(messages, provider)
-
-    assert result is not None
-    provider.chat.assert_called_once()
-    call_kwargs = provider.chat.call_args
-    assert call_kwargs.kwargs.get("tool_schemas") == [] or call_kwargs.args[1] == []
-
-
-# 功能：验证 compact_messages 返回的摘要文本来自 provider 响应
-# 设计：stub provider 返回固定摘要字符串，断言 result.summary_text 等于该字符串
-async def test_compact_messages_returns_summary(tmp_path: Path) -> None:
-    expected = "## 1. Original Goal\nDo X\n## 2. Completed\n- step one"
-    provider = _stub_provider(summary=expected)
-    bus = EventBus()
-    compactor = Compactor(bus, tmp_path, "sess-1")
-
-    result = await compactor.compact_messages(_make_messages(), provider)
-
-    assert result is not None
-    assert result.summary_text == expected
+# 功能：验证候选压缩保留近期原文、限制摘要输出且不修改输入历史
+# 设计：用不同编号的长回复区分新旧内容，深拷贝检查纯候选生成的边界
+async def test_candidate_preserves_recent_and_input() -> None:
+    messages = history()
+    original = copy.deepcopy(messages)
+    model = provider()
+    result = await Compactor().compact_messages(messages, model, focus="only edit tests")
+    assert result.compacted
+    assert result.messages[0]["content"].startswith(SUMMARY_MARKER)
+    assert result.messages[-3:] == original[-3:]
+    assert result.remaining_token_estimate < result.original_token_estimate * 0.9
+    assert messages == original
+    args = model.chat.call_args.kwargs
+    assert args["tool_schemas"] == []
+    assert args["max_output_tokens"] == 2_048
+    assert "only edit tests" in args["messages"][0]["content"]
 
 
-# 功能：验证 compact() 将 context.messages 替换为两条摘要消息对
-# 设计：调用 compact() 后断言 messages 长度为 2，role 分别为 user/assistant
-async def test_compact_replaces_context_messages(tmp_path: Path) -> None:
-    provider = _stub_provider()
-    bus = EventBus()
-    compactor = Compactor(bus, tmp_path, "sess-1")
-    ctx = ExecutionContext(run=RunCheckpoint(run_id="r1", goal="test", max_steps=5, model="", workspace=""))
-    ctx.messages = _make_messages()
-
-    await compactor.compact(ctx, provider)
-
-    assert len(ctx.messages) == 2
-    assert ctx.messages[0]["role"] == "user"
-    assert ctx.messages[1]["role"] == "assistant"
+# 功能：验证当前用户请求在很早的位置时仍保留原文，且不会重复插入
+# 设计：一个用户目标后连续多个模型步骤，覆盖长任务中目标已离开近期窗口的情况
+async def test_original_current_request_is_pinned_once() -> None:
+    goal = {"role": "user", "content": "Only edit loop.py; do not commit."}
+    messages = [goal, *[m for m in history() if m["role"] == "assistant"]]
+    result = await Compactor().compact_messages(messages, provider())
+    assert result.compacted
+    assert result.messages.count(goal) == 1
+    assert result.messages[2] == goal
+    assert result.messages[-2:] == messages[-2:]
 
 
-# 功能：验证 compact() 在 session 目录写入 summary_*.md 文件
-# 设计：使用 tmp_path，调用 compact() 后检查目录内是否存在 summary_ 开头的文件
-async def test_compact_writes_summary_file(tmp_path: Path) -> None:
-    provider = _stub_provider()
-    bus = EventBus()
-    compactor = Compactor(bus, tmp_path, "sess-1")
-    ctx = ExecutionContext(run=RunCheckpoint(run_id="r1", goal="test", max_steps=5, model="", workspace=""))
-    ctx.messages = _make_messages()
-
-    await compactor.compact(ctx, provider)
-
-    summary_files = list(tmp_path.glob("summary_*.md"))
-    assert len(summary_files) == 1
-
-
-# 功能：验证 compact() 成功后发布 ContextCompactedEvent 事件
-# 设计：订阅 EventBus，收集事件，断言收到类型为 context.compacted 的事件
-async def test_compact_publishes_event(tmp_path: Path) -> None:
-    provider = _stub_provider()
-    bus = EventBus()
-    received: list[Any] = []
-
-    async def handler(event: Any) -> None:
-        received.append(event)
-
-    bus.subscribe(handler)
-    compactor = Compactor(bus, tmp_path, "sess-1")
-    ctx = ExecutionContext(run=RunCheckpoint(run_id="r1", goal="test", max_steps=5, model="", workspace=""))
-    ctx.messages = _make_messages()
-
-    await compactor.compact(ctx, provider)
-
-    types = [getattr(e, "type", None) for e in received]
-    assert "context.compacted" in types
+# 功能：验证多工具调用、thinking 和配对结果在近期原文中完整保留
+# 设计：同一回复两个工具结果分两条消息返回，避免只按消息数量切割而拆开批次
+async def test_recent_multi_tool_batch_stays_whole() -> None:
+    call = {"role": "assistant", "content": [
+        {"type": "thinking", "thinking": "opaque", "signature": "sig"},
+        {"type": "tool_use", "id": "a", "name": "read_file", "input": {}},
+        {"type": "tool_use", "id": "b", "name": "read_file", "input": {}},
+    ]}
+    results = [{"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": identifier, "content": "done", "is_error": True},
+    ]} for identifier in ("a", "b")]
+    messages = [*history(), call, *results]
+    result = await Compactor().compact_messages(messages, provider())
+    assert result.compacted
+    assert result.messages[-3:] == [call, *results]
 
 
-# 功能：验证 provider 抛异常时 context.messages 保持不变
-# 设计：stub provider.chat 抛 RuntimeError，断言 compact() 返回 None 且 messages 未被修改
-async def test_compact_failure_preserves_context(tmp_path: Path) -> None:
-    provider = MagicMock()
-    provider.chat = AsyncMock(side_effect=RuntimeError("LLM error"))
-    bus = EventBus()
-    compactor = Compactor(bus, tmp_path, "sess-1")
-    ctx = ExecutionContext(run=RunCheckpoint(run_id="r1", goal="test", max_steps=5, model="", workspace=""))
-    original_messages = _make_messages()
-    ctx.messages = list(original_messages)
+# 功能：验证再次压缩更新同一份摘要，而不是堆叠摘要消息对
+# 设计：第一次压缩后追加新旧交互，检查第二次请求包含前代摘要且结果只有一个摘要标记
+async def test_repeated_compaction_replaces_previous_summary() -> None:
+    first = await Compactor().compact_messages(history(), provider("first summary"))
+    model = provider("updated summary")
+    second = await Compactor().compact_messages([*first.messages, *history(4)], model)
+    assert second.compacted
+    assert sum(m.get("content") == SUMMARY_ACK for m in second.messages) == 1
+    assert sum(str(m["content"]).startswith(SUMMARY_MARKER) for m in second.messages) == 1
+    assert "first summary" in model.chat.call_args.kwargs["messages"][0]["content"]
 
-    result = await compactor.compact(ctx, provider)
 
-    assert result is None
-    assert ctx.messages == original_messages
+@pytest.mark.parametrize(("response", "reason"), [
+    (LlmResponse("end_turn", text=""), "empty_summary"),
+    (LlmResponse("max_tokens", text="partial"), "summary_incomplete"),
+    (LlmResponse("end_turn", text="中" * 2_100), "summary_too_large"),
+    (LlmResponse("end_turn", text="x" * 12_000), "summary_too_large"),
+])
+# 功能：验证空摘要、未完成回复和超长摘要均不会替换原历史
+# 设计：使用不同停止原因及中英文长度，排除仅看非空文本就接受摘要的问题
+async def test_invalid_summary_preserves_history(response: LlmResponse, reason: str) -> None:
+    messages = history()
+    original = copy.deepcopy(messages)
+    model = Mock(chat=AsyncMock(return_value=response))
+    result = await Compactor().compact_messages(messages, model)
+    assert not result.compacted and result.reason == reason
+    assert result.messages == original and messages == original
+
+
+# 功能：验证没有节省至少百分之十时，不接受更长或收益很小的摘要
+# 设计：放宽摘要输出上限，让验证确实进入整体缩减判断而不是先被长度限制挡住
+async def test_insufficient_reduction_preserves_history() -> None:
+    config = CompactionConfig(summary_max_tokens=8_192)
+    result = await Compactor(config).compact_messages(history(), provider("x" * 10_000))
+    assert not result.compacted and result.reason == "insufficient_reduction"
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("offline"), CheckpointError("disk")])
+# 功能：验证普通摘要异常保留原历史，存储异常仍直接传播
+# 设计：对相同入口注入两类异常，避免宽泛捕获掩盖必须停止的检查点错误
+async def test_summary_failure_boundaries(failure: Exception) -> None:
+    messages = history()
+    model = Mock(chat=AsyncMock(side_effect=failure))
+    if isinstance(failure, CheckpointError):
+        with pytest.raises(CheckpointError):
+            await Compactor().compact_messages(messages, model)
+    else:
+        result = await Compactor().compact_messages(messages, model)
+        assert not result.compacted and result.reason == "summary_request_failed"
+        assert result.messages == messages
+
+
+# 功能：验证取消摘要会继续向上传播，不能当作普通压缩失败
+# 设计：假模型抛出 CancelledError，检查当前任务的取消语义未被吞掉
+async def test_compaction_cancellation_propagates() -> None:
+    with pytest.raises(asyncio.CancelledError):
+        await Compactor().compact_messages(
+            history(), Mock(chat=AsyncMock(side_effect=asyncio.CancelledError())),
+        )
+
+
+# 功能：验证未完成工具批次禁止压缩，而且不会发起摘要请求
+# 设计：同一批两个工具只返回一个结果，覆盖部分配对窗口
+async def test_unfinished_tool_batch_is_rejected() -> None:
+    messages = [*history(), {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "a", "name": "read", "input": {}},
+        {"type": "tool_use", "id": "b", "name": "read", "input": {}},
+    ]}, {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "a", "content": "ok"},
+    ]}]
+    model = provider()
+    result = await Compactor().compact_messages(messages, model)
+    assert result.reason == "incomplete_tool_batch"
+    model.chat.assert_not_called()
+
+
+# 功能：验证最近两组过大时减少为一组，同时仍完整保留最新一组
+# 设计：近期两组各含大量中文，让按字符除四的错误估算无法掩盖额度超限
+async def test_recent_groups_shrink_without_splitting() -> None:
+    messages = [*history(), {"role": "assistant", "content": "甲" * 5_000},
+                {"role": "assistant", "content": "乙" * 5_000}]
+    result = await Compactor().compact_messages(messages, provider())
+    assert result.compacted and result.messages[-1] == messages[-1]
+    assert messages[-2] not in result.messages
+
+
+# 功能：验证必留原文和摘要请求也有预算，不会无限调用模型尝试压缩
+# 设计：分别让近期单组及旧历史超限，断言两个分支都不调用模型
+async def test_uncompressible_inputs_do_not_call_model() -> None:
+    model = provider()
+    result = await Compactor().compact_messages(
+        [*history(), {"role": "assistant", "content": "中" * 9_000}], model,
+    )
+    assert result.reason == "recent_context_too_large"
+    config = CompactionConfig(context_window_tokens=4_096, output_reserve_tokens=512)
+    result = await Compactor(config).compact_messages(history(12), model)
+    assert result.reason == "summary_input_too_large"
+    model.chat.assert_not_called()
+
+
+# 功能：验证系统提示和工具定义过大时，不提交仅消息历史缩小的假成功结果
+# 设计：摘要本身可生成，但加入工具 Schema 后候选仍超过硬预算
+async def test_candidate_budget_includes_system_and_tools() -> None:
+    result = await Compactor().compact_messages(
+        history(), provider(), system="s" * 100,
+        tool_schemas=[{"description": "中" * 60_000}],
+    )
+    assert not result.compacted and result.reason == "required_context_too_large"
+    assert not result.llm_used
+    assert result.original_token_estimate == estimate_tokens(history())

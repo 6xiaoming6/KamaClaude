@@ -28,7 +28,8 @@ def test_long_tool_result_truncated() -> None:
     truncated = result[0]["content"][0]["content"]
     assert len(truncated) < len(text)
     assert "chars omitted" in truncated
-    assert truncated.startswith("y" * 4000)
+    assert truncated.startswith("y" * 2000)
+    assert truncated.endswith("y" * 2000)
 
 
 # 功能：验证 tool_result 内容恰好等于阈值时不截断
@@ -74,3 +75,76 @@ def test_assistant_message_untouched() -> None:
     msgs = [{"role": "assistant", "content": text}]
     result = truncate_tool_results(msgs, limit=8000, keep=4000)
     assert result[0]["content"] == text
+
+
+# 功能：验证中文保守估算，以及系统提示和工具定义都会增加请求预算
+# 设计：比较相同字符数量的中英文，并分别增加两类固定输入
+def test_estimate_counts_unicode_system_and_schemas() -> None:
+    from kama_claude.core.compact.budget import estimate_request, estimate_tokens
+    assert estimate_tokens("中" * 400) > estimate_tokens("x" * 400) * 3
+    base = estimate_request("", [], [])
+    assert estimate_request("约定" * 400, [], []) > base + 700
+    assert estimate_request("", [], [{"description": "工具" * 400}]) > base + 700
+
+
+# 功能：验证全文归档、头尾预览及重复整理不覆盖原文
+# 设计：使用含回车换行和结尾错误信息的输出，并让预览本身超过小阈值
+def test_archive_is_lossless_and_idempotent(tmp_path) -> None:
+    text = "HEAD\r\n" + "中" * 1_000 + "\r\nERROR AT END"
+    original = [_make_tool_result_msg(text)]
+    first = truncate_tool_results(original, limit=200, keep=100, outputs_dir=tmp_path)
+    preview = first[0]["content"][0]["content"]
+    assert preview.startswith("HEAD") and preview.endswith("ERROR AT END")
+    archived = list(tmp_path.glob("*.txt"))
+    assert len(archived) == 1 and archived[0].read_bytes() == text.encode("utf-8")
+    assert str(archived[0]) in preview
+    assert truncate_tool_results(first, limit=200, keep=100, outputs_dir=tmp_path) == first
+    assert archived[0].read_bytes() == text.encode("utf-8")
+    assert original[0]["content"][0]["content"] == text
+
+
+# 功能：验证归档原子替换失败时不返回裁剪历史，且临时文件得到清理
+# 设计：只阻断最终替换操作，覆盖全文已写入但尚未成为可引用文件的窗口
+def test_archive_replace_failure_keeps_original(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    from kama_claude.core.compact import budget
+
+    # 模拟磁盘或文件系统替换失败
+    def fail_replace(*args) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(budget.os, "replace", fail_replace)
+    messages = [_make_tool_result_msg("x" * 10_000)]
+    with pytest.raises(OSError):
+        truncate_tool_results(messages, outputs_dir=tmp_path)
+    assert messages[0]["content"][0]["content"] == "x" * 10_000
+    assert not list(tmp_path.iterdir())
+
+
+# 功能：验证工具读取带真实预览的文档时，不能把整份新输出误判成旧预览
+# 设计：先产生一个归档预览，再用另一个调用 ID 返回同样文字，核对新全文仍被归档
+def test_preview_marker_cannot_hide_a_different_tool_output(tmp_path) -> None:
+    first = truncate_tool_results(
+        [_make_tool_result_msg("x" * 1_000)], limit=200, keep=100, outputs_dir=tmp_path / "outputs",
+    )
+    preview = first[0]["content"][0]["content"]
+    copied = [_make_tool_result_msg(preview)]
+    copied[0]["content"][0]["tool_use_id"] = "different-call"
+    second = truncate_tool_results(copied, limit=200, keep=100, outputs_dir=tmp_path / "outputs")
+    assert len(list((tmp_path / "outputs").glob("*.txt"))) == 2
+    assert second[0]["content"][0]["content"] != preview
+
+
+# 功能：验证归档全文丢失时明确停止，不把预览再次冒充完整输出
+# 设计：删除只属于测试的归档文件后重复整理，检查没有生成替代的伪全文
+def test_missing_archive_is_reported(tmp_path) -> None:
+    import pytest
+    first = truncate_tool_results(
+        [_make_tool_result_msg("x" * 1_000)], limit=200, keep=100, outputs_dir=tmp_path / "outputs",
+    )
+    archive = next((tmp_path / "outputs").glob("*.txt"))
+    archive.unlink()
+    with pytest.raises(FileNotFoundError):
+        truncate_tool_results(first, limit=200, keep=100, outputs_dir=tmp_path / "outputs")
+    assert not list((tmp_path / "outputs").iterdir())

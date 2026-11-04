@@ -17,4 +17,5 @@ class LLMProvider(Protocol):
         *,
         step: int = 0,
         system: str | None = None,
+        max_output_tokens: int = 8_192,
     ) -> LlmResponse: ...

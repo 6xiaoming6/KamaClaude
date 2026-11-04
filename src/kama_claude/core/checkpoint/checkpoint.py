@@ -9,6 +9,8 @@ from typing import Any, Literal, Self
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
+from kama_claude.core.memory.model import MemorySnapshot
+
 
 class CheckpointError(RuntimeError):
     pass
@@ -33,6 +35,8 @@ class RunCheckpoint(BaseModel):
     provider: str = "deepseek"
     workspace: str
     system_prompt: str = ""
+    # 仅记录本轮真正注入的内容，长期记忆仍以 Markdown 为准
+    memory_snapshot: MemorySnapshot | None = None
     tool_whitelist: list[str] | None = None
     tool_schemas: list[dict[str, Any]] = Field(default_factory=list)
     schemas_frozen: bool = False
@@ -48,7 +52,7 @@ class RunCheckpoint(BaseModel):
     subagents: dict[str, str] = Field(default_factory=dict)
     decisions: list[dict[str, Any]] = Field(default_factory=list)
 
-# 一个完整的检查点(当前session信息 + 历史messages + 当前的run_checkpoint)
+# 一个完整的检查点(当前 session 信息 + 模型工作 messages + 当前 Run)
 class Checkpoint(BaseModel):
     schema_version: Literal[1] = 1
     revision: int = Field(default=0, ge=0)
@@ -56,11 +60,14 @@ class Checkpoint(BaseModel):
     session: dict[str, Any]
     messages: list[dict[str, Any]] = Field(default_factory=list)
     run: RunCheckpoint | None = None
+    # 原始消息先随快照提交，再幂等追加到 thread；不是另一份模型工作历史
+    history_pending: list[dict[str, Any]] = Field(default_factory=list)
+    history_initialized: bool = False
 
     @model_validator(mode="after")
     # 校验消息形状，防止合法 JSON 中的损坏内容进入界面或模型请求
     def validate_messages(self) -> Self:
-        for message in self.messages:
+        for message in [*self.messages, *self.history_pending]:
             if message.get("role") not in ("user", "assistant"):
                 raise ValueError("invalid message role")
             content = message.get("content")

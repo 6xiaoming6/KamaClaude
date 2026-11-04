@@ -1,54 +1,53 @@
 from __future__ import annotations
 
+import pytest
+
 from kama_claude.core.checkpoint.checkpoint import RunCheckpoint
 from kama_claude.core.context import ExecutionContext
 
 
-# 构造带唯一 Run 状态的提示词测试上下文
-def _make_ctx(**kwargs) -> ExecutionContext:
-    defaults = dict(run=RunCheckpoint(run_id="r1", goal="test goal", max_steps=5, model="", workspace=""))
-    defaults.update(kwargs)
-    return ExecutionContext(**defaults)
-
-
-# 功能：验证三层记忆全部存在时都出现在 system prompt 中且顺序正确
-# 设计：分别设置 global_context、project_context、session_notes，断言各 section 标题及内容依次出现
-def test_all_layers_present() -> None:
-    ctx = _make_ctx(
-        global_context="global line",
-        project_context="project line",
-        session_notes="session note",
+# 构造只有一份 Run 状态的提示词测试对象
+def _context(**kwargs) -> ExecutionContext:
+    return ExecutionContext(
+        run=RunCheckpoint(run_id="r", goal="g", model="fake", workspace="", max_steps=5),
+        **kwargs,
     )
-    prompt = ctx.system_prompt("BASE")
-    assert "BASE" in prompt
-    assert "## Global Context\nglobal line" in prompt
-    assert "## Project Context\nproject line" in prompt
-    assert "## Session Notes\nsession note" in prompt
-    # 顺序：global 在 project 之前，project 在 session 之前
-    assert prompt.index("Global") < prompt.index("Project") < prompt.index("Session")
 
 
-# 功能：验证三层均为空时 system prompt 只含 base
-# 设计：不设置任何记忆字段，断言输出等于 base
-def test_no_layers() -> None:
-    ctx = _make_ctx()
-    prompt = ctx.system_prompt("BASE_ONLY")
-    assert prompt == "BASE_ONLY"
+# 功能：验证统一记忆片段直接接到提示中，不再由 Context 分别读取三层文件
+# 设计：传入预先组织的片段，精确检查拼接顺序与工具指引
+def test_memory_context_is_injected() -> None:
+    prompt = _context(memory_context="\n\nMEMORY").system_prompt("BASE")
+    assert prompt.startswith("BASE")
+    assert "memory_read" in prompt and "memory_write" in prompt
+    assert prompt.endswith("\n\nMEMORY")
 
 
-# 功能：验证只有 global_context 时只出现 Global section，其他 section 不出现
-# 设计：只设置 global_context，断言 Project 和 Session 标题不在 prompt 中
-def test_only_global() -> None:
-    ctx = _make_ctx(global_context="global content")
-    prompt = ctx.system_prompt("BASE")
-    assert "## Global Context" in prompt
-    assert "## Project Context" not in prompt
-    assert "## Session Notes" not in prompt
+# 功能：验证没有任何记忆时仍指导模型使用新工具
+# 设计：空 Context 不依赖磁盘文件，覆盖首次使用不能主动记忆的问题
+def test_empty_memory_still_has_guidance() -> None:
+    prompt = _context().system_prompt("BASE")
+    assert "memory_write" in prompt and "global preferences" in prompt
 
 
-# 功能：验证 session_notes 非空时包含 note_save 提示语
-# 设计：只设置 session_notes，断言 prompt 含 note_save 相关提示
-def test_session_notes_hint() -> None:
-    ctx = _make_ctx(session_notes="some note")
-    prompt = ctx.system_prompt("BASE")
-    assert "note_save" in prompt
+# 功能：验证 Skill 覆盖基础提示时仍保留记忆指引和选定片段
+# 设计：显式区分 BASE、SKILL、MEMORY，避免只断言非空而漏掉覆盖顺序
+def test_skill_and_memory_are_composed() -> None:
+    prompt = _context(system_prompt_override="SKILL", memory_context=" MEMORY").system_prompt("BASE")
+    assert prompt.startswith("SKILL") and "BASE" not in prompt
+    assert prompt.endswith(" MEMORY")
+
+
+# 功能：验证冻结提示优先，修改内存记忆片段也不能改变恢复输入
+# 设计：冻结后给出不同 base 和 memory，要求返回完全相同的字符串
+def test_frozen_prompt_is_returned_verbatim() -> None:
+    context = _context(memory_context="changed")
+    context.run.system_prompt = "frozen"
+    assert context.system_prompt("different base") == "frozen"
+
+
+# 功能：验证旧的三层输入参数已删除，不提供兼容入口
+# 设计：让 Python 构造器拒绝旧字段，防止长期维护两套注入逻辑
+def test_old_context_fields_are_removed() -> None:
+    with pytest.raises(TypeError):
+        _context(session_notes="old")

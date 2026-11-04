@@ -5,7 +5,7 @@ from pydantic import ValidationError
 
 from kama_claude.core.tools.builtin.bash import BashParams
 from kama_claude.core.tools.builtin.list_dir import ListDirParams
-from kama_claude.core.tools.builtin.note_save import NoteSaveParams
+from kama_claude.core.tools.builtin.memory import MemoryWriteParams
 from kama_claude.core.tools.builtin.read_file import ReadFileParams
 from kama_claude.core.tools.builtin.write_file import WriteFileParams
 
@@ -92,15 +92,15 @@ def test_list_dir_params_max_depth_exceeded() -> None:
         ListDirParams.model_validate({"max_depth": 5})
 
 
-# 功能：验证 NoteSaveParams 接受合法 content 字符串
+# 功能：验证 MemoryWriteParams 接受合法 content 字符串
 # 设计：最小合法输入，断言 content 原样保留
-def test_note_save_params_valid() -> None:
-    p = NoteSaveParams.model_validate({"content": "Python 3.12"})
+def test_memory_write_params_valid() -> None:
+    p = MemoryWriteParams.model_validate({"key": "python", "summary": "Python", "content": "Python 3.12"})
     assert p.content == "Python 3.12"
 
 
-# 功能：验证 NoteSaveParams 缺少 content 时抛 ValidationError
+# 功能：验证 MemoryWriteParams 缺少 content 时抛 ValidationError
 # 设计：传空字典触发 required 字段缺失，覆盖空调用场景
-def test_note_save_params_missing_content() -> None:
+def test_memory_write_params_missing_content() -> None:
     with pytest.raises(ValidationError):
-        NoteSaveParams.model_validate({})
+        MemoryWriteParams.model_validate({})

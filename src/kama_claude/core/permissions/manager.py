@@ -86,18 +86,23 @@ class PermissionManager:
         # Tier 2: OUTSIDE_CWD_HEURISTICS（bash only，强制 ASK，不可被任何缓存绕过）
         # 如果bash工具需要访问外层目录，一律询问用户
         outside_cwd = bool(command and matches_outside_cwd(command))
+        global_memory = tool_name == "memory_write" and params.get("scope", "project") == "global"
+        if global_memory and policy and policy.default == PermissionDecision.DENY:
+            return False, "auto_deny"
 
+        # 全局授权单独缓存，项目记忆的 always_allow 不能顺便授权全局写入
+        cache_name = "memory_write_global" if global_memory else tool_name
         if not outside_cwd:
             # Tier 3: session always 缓存
-            session_key = (session_id, tool_name)
+            session_key = (session_id, cache_name)
             if session_key in self._session_always:
                 cached = self._session_always[session_key]
                 logger.debug("permission: session cache hit tool=%s decision=%s", tool_name, cached)
                 return cached == "allow", f"auto_{cached}"
 
             # Tier 4: persistent always（跨 session）
-            if tool_name in self._persistent_always:
-                cached = self._persistent_always[tool_name]
+            if cache_name in self._persistent_always:
+                cached = self._persistent_always[cache_name]
                 logger.debug(
                     "permission: persistent cache hit tool=%s decision=%s", tool_name, cached,
                 )
@@ -111,9 +116,10 @@ class PermissionManager:
 
             # Tier 6: tool default
             if policy is not None:
-                if policy.default == PermissionDecision.ALLOW:
+                default = PermissionDecision.ASK if global_memory else policy.default
+                if default == PermissionDecision.ALLOW:
                     return True, "auto_allow"
-                if policy.default == PermissionDecision.DENY:
+                if default == PermissionDecision.DENY:
                     return False, "auto_deny"
             # default == ASK（bash、unknown tool）→ fall through to Future
 
@@ -138,7 +144,7 @@ class PermissionManager:
                 raw = await asyncio.wait_for(future, timeout=self._timeout_s)
             else:
                 raw = await future
-            return self._apply_response(raw, session_id, tool_name), raw
+            return self._apply_response(raw, session_id, cache_name), raw
         except TimeoutError:
             return False, "timeout"
         finally:
