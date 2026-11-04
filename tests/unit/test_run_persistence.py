@@ -60,7 +60,7 @@ def test_save_uses_current_run_and_preserves_history_files(tmp_path: Path) -> No
     raw = json.loads(persistence.store.checkpoints.path("sess-one").read_text(encoding="utf-8"))
     assert set(raw) == {
         "schema_version", "revision", "updated_at", "session", "messages", "run",
-        "history_pending", "history_initialized",
+        "history_pending", "history_initialized", "token_estimation",
     }
     assert raw["schema_version"] == 1
     folder = persistence.store.session_dir("sess-one")

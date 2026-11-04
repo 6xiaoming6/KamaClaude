@@ -2,7 +2,29 @@
 
 一个 Python 本地 AI Agent：TUI 展示对话、工具进度和审批，Core 调用模型与工具。前后端使用 TCP / JSON-RPC / NDJSON 通信。
 
-S9 改进**上下文组织、分层压缩与 Markdown 记忆**：先用程序缩减工具输出，再按需请求摘要；记忆按条目维护、按预算注入。沿用 S8 检查点恢复，不增加额外服务。
+S9 改进**运行保护、上下文组织、分层压缩与 Markdown 记忆**：增加可选运行预算和 Usage 锚点估算，先用程序缩减工具输出，再按需请求摘要；记忆按条目维护、按预算注入。沿用 S8 检查点恢复，不增加额外服务。
+
+## 运行保护与 Usage 锚点估算
+
+- 运行限制：原有 Step 上限，加上可选累计时间与 Token 上限；恢复不重置累计值。
+- 连续相同工具失败第 3 次提醒模型改变方法，默认第 5 次停止。
+- 命令分块读取、最多保留 64 KiB 输出，超时和取消时清理受管进程。未知副作用仍由用户确认。
+- 请求估算：上次真实总输入 Usage＋新增消息的 UTF-8 字节数 ÷ 4；历史改变时全文重估。
+- 动态阈值：低估系数 `min(4, max(1, 上次真实输入 / 本次全文粗估))`；用原输入上限除以系数，再乘压缩比例。
+- 普通请求、自动摘要和模型重试共用预算。失败或缺少 Usage 的请求保留估算占用，不当成零消耗。
+- TUI 分开显示实际已知 Token、估算占用和执行时间；缓存输入计入上下文占用。
+
+```toml
+[agent]
+max_steps = 20
+max_run_seconds = 0       # 0关闭；例如1800秒
+max_total_tokens = 0      # 0关闭；例如200000
+repeat_failure_limit = 5  # 0关闭
+```
+
+已移除 tokenizer 依赖和配置。锚点按 Provider、模型与请求用途隔离，随检查点保存；system、工具定义或旧消息变化时失效。主 Run Token 上限不包含子 Agent 的模型请求；未知用量保留估算占用，不是精确账单。
+
+详见 [运行保护与 Usage 锚点估算](./docs/S9-运行保护与Usage锚点估算.md)，包含新旧对照、配置、保存链路和阅读顺序。
 
 ## 四层处理顺序
 
@@ -129,19 +151,20 @@ tool_result_keep = 4000
 - [S9 分层压缩说明](./docs/S9-上下文组织与压缩.md)：完整流程、核心方法、两个例子和故障边界。
 - [Compactor](./src/kama_claude/core/compact/compactor.py)：分层候选生成与最终摘要。
 - [程序处理](./src/kama_claude/core/compact/pruning.py)：精确去重与旧结果归档。
-- [预算与全文归档](./src/kama_claude/core/compact/budget.py)。
+- [请求估算器](./src/kama_claude/core/compact/estimator.py)、[运行预算](./src/kama_claude/core/run_budget.py)、[受管模型请求](./src/kama_claude/core/llm/managed.py)。
+- [基础字符计数与全文归档](./src/kama_claude/core/compact/budget.py)。
 - [S8 恢复基线](./docs/S8-中断与恢复链路速查.md)、[运行说明](./RUNBOOK.md)、[通信协议](./WIRE_PROTOCOL.md)。
 
 ## 验证
 
 ```text
-uv run python -X utf8 -m pytest tests/unit tests/integration/test_s9_memory.py tests/integration/test_s9_compaction.py tests/integration/test_s8_recovery.py tests/integration/test_s5_permission_flow.py tests/integration/test_s4_session_ipc.py tests/integration/test_s2_dual_process.py tests/integration/test_ping_roundtrip.py -q
+uv run python -X utf8 -m pytest tests/unit tests/integration/test_s9_run_budget.py tests/integration/test_s9_memory.py tests/integration/test_s9_compaction.py tests/integration/test_s8_recovery.py tests/integration/test_s5_permission_flow.py tests/integration/test_s4_session_ipc.py tests/integration/test_s2_dual_process.py tests/integration/test_ping_roundtrip.py -q
 uv run mypy src
 uv run python -X utf8 scripts/gen_protocol_doc.py --check
 ```
 
 在 26 份相同只读结果的假模型对比中，摘要调用由 1 次变为 0 次，程序层读取了 13 次归档全文。详细的前后输入量见学习文档。此结果不代表真实模型质量或账单收益：程序保留的历史可能更长，后续请求、缓存与重新读取的代价也需考虑。
 
-验证结果：**443 项非付费测试通过**；mypy（94 个源码文件）、协议一致性和改动文件 Ruff 通过。覆盖 Markdown 文件保护、注入预算、工具维护、冻结提示、TUI 和真实 TCP/Core 重启。全仓 Ruff 仍有 6 条既有问题，位于未修改的 MCP、Skill loader 和旧权限测试中。
+本轮相关单元测试与非付费集成测试共 **484 项通过**，覆盖 Usage 锚点、动态阈值、运行预算、命令清理、完整历史、TUI 和真实 TCP/Core 重启；改动文件 Ruff、mypy（98 个源码文件）、协议一致性检查通过。初始基线中一项 TUI 时序测试已改为明确等待刷新任务，不修改记忆业务逻辑。全仓 Ruff 的 6 条既有问题仍位于未修改的 MCP、Skill loader 和旧权限测试中。
 
 本轮不做旧完整对话删除、语义去重、向量检索或子 Agent 自动压缩。新增学习文档限于 `docs/S9-*.md`；本地练习、运行数据和密钥不上传。

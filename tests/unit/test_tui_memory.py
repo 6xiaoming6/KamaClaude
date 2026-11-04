@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -140,7 +141,22 @@ async def test_memory_screen_pagination_and_scope_switch(
         await pilot.pause()
         assert "4000/" in screen.query_one("#memory-detail", TextArea).text
         assert screen.query_one("#memory-more", Button).disabled
+        refresh_started = asyncio.Event()
+        refresh_workers = []
+        original_run_worker = screen.run_worker
+
+        # 等待真实索引刷新任务，避免仅等待一帧就检查异步结果
+        def track_refresh(*args, **kwargs):
+            worker = original_run_worker(*args, **kwargs)
+            if kwargs.get("group") == "memory-index":
+                refresh_workers.append(worker)
+                refresh_started.set()
+            return worker
+
+        monkeypatch.setattr(screen, "run_worker", track_refresh)
         screen.query_one("#memory-scope", Select).value = "session"
+        await asyncio.wait_for(refresh_started.wait(), 3)
+        await refresh_workers[-1].wait()
         await pilot.pause()
         assert len(screen.query_one(ListView).children) == 0
         assert screen.query_one("#memory-prev", Button).disabled

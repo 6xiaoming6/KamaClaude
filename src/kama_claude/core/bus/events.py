@@ -114,6 +114,7 @@ class LlmUsageEvent(BaseModel):
     type: Literal["llm.usage"] = "llm.usage"
     run_id: str
     input_tokens: int
+    total_input_tokens: int | None = None
     output_tokens: int
     cache_read_input_tokens: int
     cache_creation_input_tokens: int
@@ -270,11 +271,30 @@ class SkillInvokedEvent(BaseModel):
     ts: str
 
 
+# 运行预算快照；estimated 字段是估算占用，不是实际账单
+class RunBudgetEvent(BaseModel):
+    type: Literal["run.budget"] = "run.budget"
+    run_id: str
+    method: str = ""
+    estimated_input_tokens: int = 0
+    trigger_tokens: int = 0  # 本次动态压缩阈值；0 表示关闭自动压缩
+    underestimate_factor: float = 1.0  # Cline 式低估系数，范围一到四
+    actual_tokens: int = 0
+    estimated_tokens: int = 0
+    elapsed_seconds: float = 0.0
+    max_total_tokens: int = 0
+    max_run_seconds: int = 0
+    usage_complete: bool = True
+    reason: str = ""
+    ts: str
+
+
 # 根据 type 字段决定事件类型的判别联合
 Event = Annotated[
     CoreStartedEvent
     | RunStartedEvent
     | RunFinishedEvent
+    | RunBudgetEvent
     | RunInterruptedEvent
     | RunResumedEvent
     | StepStartedEvent

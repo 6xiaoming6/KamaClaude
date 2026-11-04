@@ -19,17 +19,20 @@ from kama_claude.core.bus.events import (
 from kama_claude.core.checkpoint.checkpoint import Checkpoint, CheckpointError, RunCheckpoint
 from kama_claude.core.checkpoint.persistence import RunPersistence
 from kama_claude.core.compact.compactor import Compactor
+from kama_claude.core.compact.estimator import TokenEstimator
 from kama_claude.core.config import KamaConfig
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus, EventHandler
 from kama_claude.core.events.writer import EventWriter
 from kama_claude.core.llm.base import LLMProvider
+from kama_claude.core.llm.managed import ManagedProvider
 from kama_claude.core.llm.provider import AnthropicProvider, DeepseekProvider, OpenaiProvider
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.mcp.server import McpServerManager
 from kama_claude.core.memory.context import build_memory_context
 from kama_claude.core.memory.store import MemoryStore
 from kama_claude.core.permissions.manager import PermissionManager
+from kama_claude.core.run_budget import RunBudget
 from kama_claude.core.runs import RUNS_DIR, new_run_id
 from kama_claude.core.session.model import Session
 from kama_claude.core.session.store import SessionStore
@@ -344,6 +347,9 @@ class AgentRunner:
             run_id=run_id, goal=goal, provider=provider, model=model,
             workspace=str(Path.cwd().resolve()),
             max_steps=self._config.agent.max_steps,
+            max_run_seconds=self._config.agent.max_run_seconds,
+            max_total_tokens=self._config.agent.max_total_tokens,
+            repeat_failure_limit=self._config.agent.repeat_failure_limit,
             tool_whitelist=tool_whitelist,
         )
 
@@ -427,7 +433,17 @@ class AgentRunner:
                     frozen_registry.register(tool)
             registry = frozen_registry
         self._save_tool_schemas(context.run, registry, persistence, resuming=resuming)
-        compactor = Compactor(self._config.compaction)
+        estimator = TokenEstimator(
+            context.run.provider, context.run.model,
+            persistence.checkpoint.token_estimation if persistence else None,
+        )
+        budget = RunBudget(context.run)
+        # 子 Agent 保留原 Provider，不进入主 Run 的累计预算
+        provider = ManagedProvider(
+            provider, estimator, self._config.compaction,
+            budget=budget, persistence=persistence, event_bus=bus,
+        )
+        compactor = Compactor(self._config.compaction, estimator)
         return AgentLoop(
             provider, registry, bus, context=context,
             permission_manager=self._permission_manager,
@@ -436,6 +452,7 @@ class AgentRunner:
             run_path=run_path,
             session_id=session.id if session else "",
             persistence=persistence,
+            budget=budget, estimator=estimator,
         )
 
     # 校验原后端身份并重建客户端，凭证错误不允许退出整个 Core

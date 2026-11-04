@@ -15,14 +15,17 @@ from kama_claude.core.bus.events import (
     StepFinishedEvent,
     StepStartedEvent,
 )
-from kama_claude.core.checkpoint.checkpoint import ToolCheckpoint
-from kama_claude.core.compact.budget import estimate_request, estimate_tokens
+from kama_claude.core.checkpoint.checkpoint import CheckpointError, ToolCheckpoint
 from kama_claude.core.compact.compactor import write_summary
+from kama_claude.core.compact.estimator import TokenEstimator
 from kama_claude.core.config import CompactionConfig
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.base import LLMProvider
+from kama_claude.core.llm.managed import ManagedProvider
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock
+from kama_claude.core.run_budget import BudgetExceeded, RunBudget
+from kama_claude.core.tools.base import ToolResult
 from kama_claude.core.tools.invocation import invoke_tool, publish_tool_result
 from kama_claude.core.tools.registry import ToolRegistry
 
@@ -54,6 +57,8 @@ class AgentLoop:
         run_path: Path | None = None,
         session_id: str = "",
         persistence: RunPersistence | None = None,
+        budget: RunBudget | None = None,
+        estimator: TokenEstimator | None = None,
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -65,29 +70,65 @@ class AgentLoop:
         self._run_path = run_path
         self._session_id = session_id
         self._persistence = persistence
+        self._budget = budget or RunBudget(context.run)
+        self._estimator = estimator or TokenEstimator(context.run.provider, context.run.model)
 
     # 只调度步骤准备、模型调用和工具批次
     async def run(self) -> None:
         context = self._context
         # 这里只是同一对象的简写，修改 run 就是在修改 context.run
         run = context.run
-        while not context.is_done():
-            # 使用独立 if，让同一步依次进入模型和工具阶段
-            if run.phase == "ready" and not self._start_step():
-                return
-            if run.phase == "llm" and not await self._call_model():
-                return
-            if run.phase == "tools" and not context.is_done():
-                if not await self._run_tools():
-                    return
-            await self._bus.publish_safe(
-                StepFinishedEvent(run_id=run.run_id, step=run.step, ts=_now())
-            )
+        try:
+            async with asyncio.timeout(self._budget.remaining_seconds()):
+                while not context.is_done():
+                    # 使用独立 if，让同一步依次进入模型和工具阶段
+                    if run.phase == "ready" and not self._start_step():
+                        return
+                    if run.phase == "llm" and not await self._call_model():
+                        return
+                    if run.phase == "tools" and not context.is_done():
+                        if not await self._run_tools():
+                            return
+                    await self._bus.publish_safe(
+                        StepFinishedEvent(run_id=run.run_id, step=run.step, ts=_now())
+                    )
+        except (BudgetExceeded, TimeoutError) as exc:
+            reason = str(exc) if isinstance(exc, BudgetExceeded) else "run_time_budget_exceeded"
+            self._stop_for_budget(reason)
+            if isinstance(self._provider, ManagedProvider):
+                await self._provider.notify(reason=reason)
+        finally:
+            # 正常取消也结算最后一段等待时间，由 Runner 原有收尾保存
+            self._budget.tick()
+
+    # 预算终止补齐未执行调用；执行结果未知时保留现场，仍由用户确认
+    def _stop_for_budget(self, reason: str) -> None:
+        context = self._context
+        run = context.run
+        if any(tool.status in ("executing", "unknown") for tool in run.tools):
+            for tool in run.tools:
+                if tool.status == "executing":
+                    tool.status = "unknown"
+            context.mark_interrupted(reason)
+        else:
+            for tool in run.tools[run.tool_index:]:
+                result = ToolResult(
+                    content=f"Tool not executed: {reason}", is_error=True, error_type="budget",
+                )
+                tool.result = asdict(result)
+                tool.status = "completed"
+                context.add_tool_result(tool.id, result.content, is_error=True)
+                if self._persistence is not None:
+                    self._persistence.record_message("user", [context.messages[-1]["content"][-1]])
+            run.tool_index = len(run.tools)
+            context.mark_failed(reason)
+        self._save_checkpoint()
 
     # 检查步数预算并提交新步骤，恢复已有模型调用时不经过这里
     def _start_step(self) -> bool:
         context = self._context
         run = context.run
+        self._budget.check()
         if run.step >= run.max_steps:
             context.mark_failed("exceeded_max_steps")
             self._save_checkpoint()
@@ -125,6 +166,8 @@ class AgentLoop:
                 system=system,
                 max_output_tokens=self._compaction.output_reserve_tokens,
             )
+        except (BudgetExceeded, CheckpointError):
+            raise
         except asyncio.CancelledError:
             if self._persistence is None:
                 context.mark_failed("cancelled")
@@ -139,6 +182,8 @@ class AgentLoop:
             return False
         # 保存放在模型异常捕获之外，磁盘错误必须直接上抛
         self._record_response(response)
+        if run.max_total_tokens and run.actual_tokens + run.estimated_tokens > run.max_total_tokens:
+            raise BudgetExceeded("run_token_budget_exceeded")
         return True
 
     # 请求前执行同一条分层管线，程序层不足才调用摘要，提交后再通知
@@ -148,16 +193,17 @@ class AgentLoop:
         context = self._context
         run = context.run
         config = self._compaction
+        counter = self._estimator.select(system, context.messages, schemas)
         if self._compactor is not None:
             pressure = (
                 config.auto_threshold > 0
-                and estimate_request(system, context.messages, schemas)
-                >= config.input_limit * config.auto_threshold
+                and counter.request(system, context.messages, schemas)
+                >= counter.trigger(config.input_limit, config.auto_threshold)
             )
             if pressure:
                 await self._bus.publish_safe(ContextCompactionStartedEvent(
                     session_id=self._session_id, run_id=run.run_id,
-                    original_tokens=estimate_tokens(context.messages), ts=_now(),
+                    original_tokens=counter.count(context.messages), ts=_now(),
                 ))
             result = await self._compactor.prepare_context(
                 context.messages, self._provider, system=system, tool_schemas=schemas,
@@ -183,7 +229,11 @@ class AgentLoop:
                     reason=result.reason, applied_stages=result.applied_stages,
                     llm_used=result.llm_used, ts=_now(),
                 ))
-        if estimate_request(system, context.messages, schemas) > config.input_limit:
+        # 整理若改变旧前缀，重新选择会自然回退全文估算，不能继续套旧 Usage
+        counter = self._estimator.select(system, context.messages, schemas)
+        if counter.request(system, context.messages, schemas) > (
+            counter.effective_limit(config.input_limit)
+        ):
             context.mark_interrupted("context_budget_exceeded")
             self._save_checkpoint()
             return False
@@ -233,6 +283,7 @@ class AgentLoop:
         run = context.run
         # 开始按上次记录的顺序执行工具
         while run.tool_index < len(run.tools):
+            self._budget.check()
             tool = run.tools[run.tool_index]
             if tool.status == "completed":
                 run.tool_index += 1
@@ -255,6 +306,7 @@ class AgentLoop:
                 notify_result=False,
             )
 
+            repeated = self._budget.record_tool_result(tool.name, tool.input, result)
             tool.result = asdict(result)
             if result.outcome_unknown and self._persistence is not None:
                 # 结果未知时保留当前位置，等待用户核实后决定
@@ -284,6 +336,8 @@ class AgentLoop:
                 int((time.monotonic() - started_at) * 1000),
                 attempt=max(1, tool.attempts - attempts_before),
             )
+            if repeated:
+                raise BudgetExceeded("repeated_tool_failure")
             if context.is_done():
                 return False
         await self._finish_tool_batch()
@@ -293,6 +347,8 @@ class AgentLoop:
     def _save_tool_phase(self, phase: Literal["awaiting_approval", "executing"]) -> None:
         run = self._context.run
         tool = run.tools[run.tool_index]
+        if phase == "executing":
+            self._budget.check()
         tool.status = phase
         if phase == "executing":
             tool.attempts += 1
@@ -310,5 +366,6 @@ class AgentLoop:
 
     # 直接提交本轮检查点，保存错误不经过 Runner 回调且不被吞掉
     def _save_checkpoint(self) -> None:
+        self._budget.tick()
         if self._persistence is not None:
             self._persistence.save()

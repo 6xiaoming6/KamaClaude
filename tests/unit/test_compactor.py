@@ -8,8 +8,8 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from kama_claude.core.checkpoint.checkpoint import CheckpointError
-from kama_claude.core.compact.budget import estimate_tokens
 from kama_claude.core.compact.compactor import SUMMARY_ACK, SUMMARY_MARKER, Compactor
+from kama_claude.core.compact.estimator import estimate_bytes
 from kama_claude.core.config import CompactionConfig
 from kama_claude.core.llm.types import LlmResponse, UsageStats
 
@@ -94,7 +94,7 @@ async def test_repeated_compaction_replaces_previous_summary() -> None:
 @pytest.mark.parametrize(("response", "reason"), [
     (LlmResponse("end_turn", text=""), "empty_summary"),
     (LlmResponse("max_tokens", text="partial"), "summary_incomplete"),
-    (LlmResponse("end_turn", text="中" * 2_100), "summary_too_large"),
+    (LlmResponse("end_turn", text="中" * 3_000), "summary_too_large"),
     (LlmResponse("end_turn", text="x" * 12_000), "summary_too_large"),
 ])
 # 功能：验证空摘要、未完成回复和超长摘要均不会替换原历史
@@ -158,8 +158,8 @@ async def test_unfinished_tool_batch_is_rejected() -> None:
 # 功能：验证最近两组过大时减少为一组，同时仍完整保留最新一组
 # 设计：近期两组各含大量中文，让按字符除四的错误估算无法掩盖额度超限
 async def test_recent_groups_shrink_without_splitting() -> None:
-    messages = [*history(), {"role": "assistant", "content": "甲" * 5_000},
-                {"role": "assistant", "content": "乙" * 5_000}]
+    messages = [*history(), {"role": "assistant", "content": "甲" * 6_000},
+                {"role": "assistant", "content": "乙" * 6_000}]
     result = await Compactor().compact_messages(messages, provider())
     assert result.compacted and result.messages[-1] == messages[-1]
     assert messages[-2] not in result.messages
@@ -170,7 +170,7 @@ async def test_recent_groups_shrink_without_splitting() -> None:
 async def test_uncompressible_inputs_do_not_call_model() -> None:
     model = provider()
     result = await Compactor().compact_messages(
-        [*history(), {"role": "assistant", "content": "中" * 9_000}], model,
+        [*history(), {"role": "assistant", "content": "中" * 12_000}], model,
     )
     assert result.reason == "recent_context_too_large"
     config = CompactionConfig(context_window_tokens=4_096, output_reserve_tokens=512)
@@ -184,8 +184,8 @@ async def test_uncompressible_inputs_do_not_call_model() -> None:
 async def test_candidate_budget_includes_system_and_tools() -> None:
     result = await Compactor().compact_messages(
         history(), provider(), system="s" * 100,
-        tool_schemas=[{"description": "中" * 60_000}],
+        tool_schemas=[{"description": "中" * 80_000}],
     )
     assert not result.compacted and result.reason == "required_context_too_large"
     assert not result.llm_used
-    assert result.original_token_estimate == estimate_tokens(history())
+    assert result.original_token_estimate == estimate_bytes(history())

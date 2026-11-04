@@ -16,6 +16,7 @@ dependencies = [
     "anthropic>=0.25",     # Anthropic LLM SDK（流式 + prompt caching）
     "textual>=0.75",       # 终端 UI 框架（kama-tui）
     "httpx[socks]>=0.28.1",
+    "psutil>=6.0,<8",
 ]
 
 # 安装后可在 PATH 中执行的入口：`kama` / `kama-core` / `kama-tui`
@@ -32,6 +33,7 @@ packages = ["src/kama_claude"] # 源码在 src/kama_claude
 [dependency-groups]
 dev = [
     "ruff>=0.4",            # 快速 linter + import 排序等
+    "types-psutil>=6.0",
     "mypy>=1.10",           # 静态类型检查
     "pytest>=8.0",          # 单元测试
     "pytest-asyncio>=0.23", # 异步测试支持

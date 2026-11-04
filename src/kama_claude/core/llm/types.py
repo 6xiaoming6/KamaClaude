@@ -10,6 +10,13 @@ class UsageStats:
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
     context_pct: float = 0.0
+    # Provider 显式归一化；测试替身默认把 input_tokens 当作总输入
+    total_input_tokens: int | None = None
+
+    @property
+    # 不重复累加已经包含在总输入中的缓存命中
+    def total_input(self) -> int:
+        return self.input_tokens if self.total_input_tokens is None else self.total_input_tokens
 
 
 @dataclass

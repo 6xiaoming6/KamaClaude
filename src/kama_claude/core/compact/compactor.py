@@ -10,10 +10,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from kama_claude.core.checkpoint.checkpoint import CheckpointError
-from kama_claude.core.compact.budget import estimate_request, estimate_tokens, truncate_tool_results
+from kama_claude.core.compact.budget import truncate_tool_results
+from kama_claude.core.compact.estimator import TokenCounter, TokenEstimator, estimate_bytes
 from kama_claude.core.compact.pruning import deduplicate_results, prune_results
 from kama_claude.core.config import CompactionConfig
 from kama_claude.core.events.bus import EventBus
+from kama_claude.core.run_budget import BudgetExceeded
 
 if TYPE_CHECKING:
     from kama_claude.core.llm.base import LLMProvider
@@ -113,6 +115,7 @@ def _history_starts(messages: list[dict[str, Any]]) -> tuple[int, list[int]]:
 # 以 assistant 回复为组界，连同全部工具结果保留，并单独保护最新用户原文
 def _split_history(
     messages: list[dict[str, Any]], keep_groups: int,
+    count_tokens: Callable[[Any], int] = estimate_bytes,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     summary_end, starts = _history_starts(messages)
     latest_user = next(
@@ -127,7 +130,7 @@ def _split_history(
         recent = messages[cut:]
         if latest_user is not None and latest_user < cut:
             recent = [messages[latest_user], *recent]
-        if estimate_tokens(recent) <= _RECENT_TOKEN_LIMIT:
+        if count_tokens(recent) <= _RECENT_TOKEN_LIMIT:
             # 只有旧摘要而没有新旧消息时，不再原地反复总结同一份摘要
             return (old if cut > summary_end else []), recent
     raise ValueError("recent_context_too_large")
@@ -145,8 +148,12 @@ def write_summary(directory: Path, summary: str) -> None:
 
 class Compactor:
     # 只构建候选消息，不改 Context、不写检查点，也不发布压缩成功事件
-    def __init__(self, config: CompactionConfig | None = None) -> None:
+    def __init__(
+        self, config: CompactionConfig | None = None, estimator: TokenEstimator | None = None,
+    ) -> None:
         self._config = config or CompactionConfig()
+        self._estimator = estimator or TokenEstimator()
+        self._counter = TokenCounter()
 
     # 程序层逐层尝试，只有处理后仍达软阈值才取得模型并生成摘要
     async def prepare_context(
@@ -163,29 +170,33 @@ class Compactor:
     ) -> CompactionResult:
         config = self._config
         schemas = tool_schemas or []
+        self._counter = self._estimator.select(system, messages, schemas)
         working = deepcopy(messages)
-        before = estimate_tokens(messages)
+        before = self._counter.count(messages)
         # 第一层总是可用；全文归档失败时不会修改调用方的历史
         if outputs_dir is not None:
             working = truncate_tool_results(
                 working, config.tool_result_limit, config.tool_result_keep,
                 outputs_dir=outputs_dir,
             )
-        result = CompactionResult(working, before, estimate_tokens(working))
+        result = CompactionResult(working, before, self._counter.count(working))
         if working != messages:
             result.compacted = True
             result.applied_stages.append("tool_preview")
             logger.info(
                 "context stage=tool_preview input_before=%d input_after=%d",
-                estimate_request(system, messages, schemas),
-                estimate_request(system, working, schemas),
+                self._counter.request(system, messages, schemas),
+                self._counter.request(system, working, schemas),
             )
+        # 第一层可能改写旧结果，此时旧锚点失效，阈值按整理后的请求重算
+        self._counter = self._estimator.select(system, working, schemas)
         threshold = config.auto_threshold or (0.8 if manual else 0.0)
         if not threshold:
             result.reason = "auto_disabled"
             return result
-        soft_limit = config.input_limit * threshold
-        if estimate_request(system, working, schemas) < soft_limit:
+        # Cline 式缩小整个预算，触发阈值与程序整理目标使用同一个系数
+        soft_limit = self._counter.trigger(config.input_limit, threshold)
+        if self._counter.request(system, working, schemas) < soft_limit:
             result.reason = "below_threshold"
             return result
         if not _validate_pairs(working):
@@ -199,20 +210,21 @@ class Compactor:
             for stage, reduce in (
                 ("deduplicate", deduplicate_results), ("tool_archive", prune_results),
             ):
-                input_before = estimate_request(system, working, schemas)
+                input_before = self._counter.request(system, working, schemas)
                 changes = reduce(
                     working, outputs_dir, protected_start, system, schemas,
-                    config.input_limit * config.prune_target_ratio,
+                    self._counter.trigger(config.input_limit, config.prune_target_ratio),
+                    counter=self._counter,
                 )
                 if changes:
                     result.compacted = True
                     result.applied_stages.append(stage)
-                    result.remaining_token_estimate = estimate_tokens(working)
+                    result.remaining_token_estimate = self._counter.count(working)
                 logger.info(
                     "context stage=%s input_before=%d input_after=%d",
-                    stage, input_before, estimate_request(system, working, schemas),
+                    stage, input_before, self._counter.request(system, working, schemas),
                 )
-                if estimate_request(system, working, schemas) < soft_limit:
+                if self._counter.request(system, working, schemas) < soft_limit:
                     result.reason = "below_threshold"
                     return result
 
@@ -220,7 +232,7 @@ class Compactor:
         if provider is None and provider_factory is not None:
             try:
                 provider = provider_factory()
-            except CheckpointError:
+            except (CheckpointError, BudgetExceeded):
                 raise
             except (Exception, SystemExit):
                 logger.exception("cannot create summary provider")
@@ -230,7 +242,7 @@ class Compactor:
             result.reason = "provider_unavailable"
             return result
         summary = await self.compact_messages(
-            working, provider, focus, system=system, tool_schemas=schemas,
+            working, provider, focus, system=system, tool_schemas=schemas, counter=self._counter,
         )
         result.messages = summary.messages
         result.remaining_token_estimate = summary.remaining_token_estimate
@@ -242,8 +254,8 @@ class Compactor:
         result.reason = summary.reason
         logger.info(
             "context stage=llm_summary input_before=%d input_after=%d llm_used=%s",
-            estimate_request(system, working, schemas),
-            estimate_request(system, result.messages, schemas), result.llm_used,
+            self._counter.request(system, working, schemas),
+            self._counter.request(system, result.messages, schemas), result.llm_used,
         )
         return result
 
@@ -256,21 +268,28 @@ class Compactor:
         *,
         system: str = "",
         tool_schemas: list[dict[str, Any]] | None = None,
+        counter: TokenCounter | None = None,
     ) -> CompactionResult:
-        before = estimate_tokens(messages)
+        self._counter = counter or self._estimator.select(
+            system, messages, tool_schemas or [],
+        )
+        before = self._counter.count(messages)
         unchanged = CompactionResult(messages, before, before)
         if not _validate_pairs(messages):
             unchanged.reason = "incomplete_tool_batch"
             return unchanged
         try:
-            old, recent = _split_history(messages, self._config.keep_recent_groups)
+            old, recent = _split_history(
+                messages, self._config.keep_recent_groups, self._counter.count,
+            )
         except ValueError as exc:
             unchanged.reason = str(exc)
             return unchanged
         if not old:
             unchanged.reason = "no_old_history"
             return unchanged
-        if estimate_request(system, recent, tool_schemas or []) >= self._config.input_limit:
+        effective_limit = self._counter.effective_limit(self._config.input_limit)
+        if self._counter.request(system, recent, tool_schemas or []) >= effective_limit:
             unchanged.reason = "required_context_too_large"
             return unchanged
 
@@ -289,7 +308,12 @@ class Compactor:
         summary_limit = (
             self._config.context_window_tokens - self._config.summary_max_tokens - 1_024
         )
-        if estimate_request(_SUMMARY_SYSTEM, request, []) > summary_limit:
+        summary_counter = self._estimator.select(
+            _SUMMARY_SYSTEM, request, [], kind="summary",
+        )
+        if summary_counter.request(_SUMMARY_SYSTEM, request, []) > (
+            summary_counter.effective_limit(summary_limit)
+        ):
             unchanged.reason = "summary_input_too_large"
             return unchanged
         unchanged.llm_used = True
@@ -299,7 +323,7 @@ class Compactor:
                 run_id="compact", step=0, system=_SUMMARY_SYSTEM,
                 max_output_tokens=self._config.summary_max_tokens,
             )
-        except CheckpointError:
+        except (CheckpointError, BudgetExceeded):
             raise
         except Exception:
             logger.exception("summary request failed; preserving original history")
@@ -308,7 +332,7 @@ class Compactor:
 
         summary = response.text.strip()
         tokens = max(
-            estimate_tokens(summary), response.usage.output_tokens if response.usage else 0,
+            self._counter.count(summary), response.usage.output_tokens if response.usage else 0,
         )
         if response.stop_reason != "end_turn" or response.tool_calls:
             unchanged.reason = "summary_incomplete"
@@ -322,12 +346,15 @@ class Compactor:
                 {"role": "assistant", "content": SUMMARY_ACK},
                 *recent,
             ]
-            after = estimate_tokens(candidate)
+            after = self._counter.count(candidate)
             if not _validate_pairs(candidate):
                 unchanged.reason = "incomplete_tool_batch"
             elif after > before * 0.9:
                 unchanged.reason = "insufficient_reduction"
-            elif estimate_request(system, candidate, tool_schemas or []) > self._config.input_limit:
+            elif (
+                self._counter.request(system, candidate, tool_schemas or [])
+                > effective_limit
+            ):
                 unchanged.reason = "context_budget_exceeded"
             else:
                 return CompactionResult(

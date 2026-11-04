@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -8,7 +7,6 @@ from datetime import UTC, datetime
 from typing import Any
 
 import anthropic
-import httpx
 
 from kama_claude.core.bus.events import LlmModelSelectedEvent, LlmTokenEvent, LlmUsageEvent
 from kama_claude.core.events.bus import EventBus
@@ -19,9 +17,6 @@ _MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "claude-haiku-4-5-20251001": 200_000,
     "claude-opus-4-7": 200_000,
 }
-
-_MAX_STREAM_RETRIES = 3
-_RETRY_BACKOFF_S = (1.0, 2.0, 4.0)
 
 log = logging.getLogger(__name__)
 
@@ -50,7 +45,7 @@ class AnthropicProvider:
             api_key = os.environ.get("ANTHROPIC_API_KEY")
             if not api_key:
                 raise SystemExit("ANTHROPIC_API_KEY not set")
-            self._client: Any = anthropic.AsyncAnthropic(api_key=api_key)
+            self._client: Any = anthropic.AsyncAnthropic(api_key=api_key, max_retries=0)
         else:
             self._client = client
         self._model = model
@@ -96,45 +91,25 @@ class AnthropicProvider:
             kwargs["tools"] = tools
 
         text_parts: list[str] = []
-        final_message: Any = None
-
-        for attempt in range(1, _MAX_STREAM_RETRIES + 1):
-            text_parts = []
-            try:
-                async with self._client.messages.stream(**kwargs) as stream:
-                    async for text in stream.text_stream:
-                        # Only publish token events on the first attempt to avoid TUI duplicates
-                        if attempt == 1:
-                            await bus.publish(LlmTokenEvent(run_id=run_id, token=text, ts=_now()))
-                        text_parts.append(text)
-                    final_message = await stream.get_final_message()
-                break  # success
-            except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as exc:
-                if attempt == _MAX_STREAM_RETRIES:
-                    log.error(
-                        "stream failed after %d attempts run_id=%s step=%d: %s",
-                        _MAX_STREAM_RETRIES, run_id, step, exc,
-                    )
-                    raise
-                delay = _RETRY_BACKOFF_S[attempt - 1]
-                log.warning(
-                    "stream dropped (attempt %d/%d) run_id=%s step=%d: %s — retrying in %.0fs",
-                    attempt, _MAX_STREAM_RETRIES, run_id, step, exc, delay,
-                )
-                await asyncio.sleep(delay)
-
-        assert final_message is not None
+        # 重试由 ManagedProvider 逐次预留预算，这里只执行一次请求
+        async with self._client.messages.stream(**kwargs) as stream:
+            async for text in stream.text_stream:
+                text_parts.append(text)
+                await bus.publish(LlmTokenEvent(run_id=run_id, token=text, ts=_now()))
+            final_message = await stream.get_final_message()
 
         # 提取并发布token用量
         usage = final_message.usage
         cache_read: int = getattr(usage, "cache_read_input_tokens", 0) or 0
         cache_create: int = getattr(usage, "cache_creation_input_tokens", 0) or 0
-        context_pct = usage.input_tokens / _context_window(self._model)
+        total_input = usage.input_tokens + cache_read + cache_create
+        context_pct = total_input / _context_window(self._model)
 
         await bus.publish(
             LlmUsageEvent(
                 run_id=run_id,
                 input_tokens=usage.input_tokens,
+                total_input_tokens=total_input,
                 output_tokens=usage.output_tokens,
                 cache_read_input_tokens=cache_read,
                 cache_creation_input_tokens=cache_create,
@@ -165,6 +140,7 @@ class AnthropicProvider:
             thinking_blocks=thinking_blocks,
             usage=UsageStats(
                 input_tokens=usage.input_tokens,
+                total_input_tokens=total_input,
                 output_tokens=usage.output_tokens,
                 cache_read_input_tokens=cache_read,
                 cache_creation_input_tokens=cache_create,
@@ -186,7 +162,7 @@ class OpenaiProvider:
                 if exc.name != "openai":
                     raise
                 raise SystemExit("OpenaiProvider requires the openai package") from exc
-            self._client: Any = openai.AsyncOpenAI(api_key=api_key)
+            self._client: Any = openai.AsyncOpenAI(api_key=api_key, max_retries=0)
         else:
             self._client = client
         self._model = model
@@ -291,6 +267,7 @@ class OpenaiProvider:
                     details = getattr(chunk.usage, "prompt_tokens_details", None)
                     usage = UsageStats(
                         input_tokens=chunk.usage.prompt_tokens,
+                        total_input_tokens=chunk.usage.prompt_tokens,
                         output_tokens=chunk.usage.completion_tokens,
                         cache_read_input_tokens=getattr(details, "cached_tokens", 0) or 0,
                         context_pct=chunk.usage.prompt_tokens / _context_window(self._model),
@@ -325,6 +302,7 @@ class OpenaiProvider:
                 LlmUsageEvent(
                     run_id=run_id,
                     input_tokens=usage.input_tokens,
+                    total_input_tokens=usage.total_input,
                     output_tokens=usage.output_tokens,
                     cache_read_input_tokens=usage.cache_read_input_tokens,
                     cache_creation_input_tokens=usage.cache_creation_input_tokens,
@@ -365,6 +343,7 @@ class DeepseekProvider(AnthropicProvider):
             client = anthropic.AsyncAnthropic(
                 api_key=api_key,
                 base_url='https://api.deepseek.com/anthropic',
+                max_retries=0,
             )
 
         super().__init__(model=model, client=client)
