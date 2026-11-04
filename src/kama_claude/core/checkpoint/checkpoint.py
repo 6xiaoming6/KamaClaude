@@ -15,6 +15,13 @@ from kama_claude.core.memory.model import MemorySnapshot
 class CheckpointError(RuntimeError):
     pass
 
+
+# 最近一次请求的总输入用量和消息前缀，不保存另一份对话内容
+class UsageAnchor(BaseModel):
+    input_tokens: int = Field(gt=0, strict=True)
+    message_count: int = Field(ge=0, strict=True)
+    prefix_hash: str
+
 # 某一个工具的检查点
 # 记录工具状态：等待执行、等待审批、执行中、结果未知、已完成
 # 恢复时根据状态判断是否需要重新执行
@@ -41,6 +48,15 @@ class RunCheckpoint(BaseModel):
     tool_schemas: list[dict[str, Any]] = Field(default_factory=list)
     schemas_frozen: bool = False
     max_steps: int
+    max_run_seconds: int = Field(default=0, ge=0)
+    max_total_tokens: int = Field(default=0, ge=0)
+    repeat_failure_limit: int = Field(default=5, ge=0)
+    elapsed_seconds: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    actual_tokens: int = Field(default=0, ge=0)
+    estimated_tokens: int = Field(default=0, ge=0)
+    usage_complete: bool = True
+    failure_fingerprint: str = ""
+    repeated_failures: int = Field(default=0, ge=0)
     step: int = 0
     status: Literal["running", "interrupted", "success", "failed"] = "running"
     phase: Literal["ready", "llm", "tools", "finished"] = "ready"
@@ -63,6 +79,8 @@ class Checkpoint(BaseModel):
     # 原始消息先随快照提交，再幂等追加到 thread；不是另一份模型工作历史
     history_pending: list[dict[str, Any]] = Field(default_factory=list)
     history_initialized: bool = False
+    # 输入 Usage 与对应消息前缀指纹；不保存 tokenizer 或滑动样本
+    token_estimation: dict[str, UsageAnchor] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     # 校验消息形状，防止合法 JSON 中的损坏内容进入界面或模型请求

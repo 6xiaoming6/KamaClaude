@@ -1228,6 +1228,34 @@ class KamaTuiApp(App[None]):
                     classes="run-err",
                 ))
 
+        elif t == "run.budget":
+            if str(event.get("run_id", "")) in self._subagent_run_ids:
+                return
+            method = "Usage+增量" if event.get("method") == "usage_anchor" else "UTF-8字节"
+            estimate = event.get("estimated_input_tokens", 0)
+            actual = event.get("actual_tokens", 0)
+            uncertain = event.get("estimated_tokens", 0)
+            budget_elapsed = float(event.get("elapsed_seconds", 0))
+            reason = str(event.get("reason") or "")
+            if reason == "model_retry":
+                self._break_llm()
+                self._append(Static("上段模型输出未完成，正在重新请求。", markup=False))
+            budget_text = (
+                f"预算：{method}输入估算 {estimate}"
+                + (f" / 压缩阈值 {event.get('trigger_tokens')}"
+                   if event.get("trigger_tokens") else "")
+                + f"；累计已知 {actual}"
+                f" + 估算占用 {uncertain} tokens；执行 {budget_elapsed:.1f}s"
+                + (f"；提示：{reason}" if reason else "")
+            )
+            budget_id = "budget-" + str(event.get("run_id", ""))
+            matches = [widget for widget in self.query(Static) if widget.id == budget_id]
+            if matches:
+                matches[0].update(budget_text)
+            else:
+                self._append(Static(
+                    budget_text, id=budget_id, markup=False, classes="usage",
+                ))
         elif t == "llm.usage":
             run_id = event.get("run_id", "")
             if run_id in self._subagent_run_ids:
@@ -1235,9 +1263,12 @@ class KamaTuiApp(App[None]):
             pct = float(event.get("context_pct") or 0.0)
             self._last_context_pct = pct
             ctx_bar = self._render_ctx_bar(pct)
+            total_input = event.get("total_input_tokens")
+            if total_input is None:
+                total_input = event.get("input_tokens")
             self._append(Static(
                 f"[dim]  tokens  "
-                f"in={event.get('input_tokens')} "
+                f"in={total_input} "
                 f"out={event.get('output_tokens')} "
                 f"cache={event.get('cache_read_input_tokens')}[/dim]"
                 f"  {ctx_bar}",

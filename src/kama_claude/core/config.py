@@ -29,6 +29,9 @@ class LoggingConfig:
 @dataclass
 class AgentConfig:
     max_steps: int = _DEFAULT_MAX_STEPS
+    max_run_seconds: int = 0
+    max_total_tokens: int = 0
+    repeat_failure_limit: int = 5
 
 
 @dataclass
@@ -184,7 +187,9 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
         agent = data["agent"]
         if not isinstance(agent, dict):
             raise SystemExit("Config error: [agent] must be a table")
-        unknown_agent: set[str] = set(agent.keys()) - {"max_steps"}
+        unknown_agent: set[str] = set(agent.keys()) - {
+            "max_steps", "max_run_seconds", "max_total_tokens", "repeat_failure_limit",
+        }
         if unknown_agent:
             raise SystemExit(f"Unknown [agent] keys: {', '.join(sorted(unknown_agent))}")
         if "max_steps" in agent:
@@ -192,6 +197,13 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
             if not isinstance(val, int) or val <= 0:
                 raise SystemExit("Config error: agent.max_steps must be a positive integer")
             config.agent.max_steps = val
+
+        for key in ("max_run_seconds", "max_total_tokens", "repeat_failure_limit"):
+            if key in agent:
+                value = agent[key]
+                if type(value) is not int or value < 0:
+                    raise SystemExit(f"Config error: agent.{key} must be a nonnegative integer")
+                setattr(config.agent, key, value)
 
     if "llm" in data:
         llm = data["llm"]
@@ -488,6 +500,17 @@ def _apply_env(config: KamaConfig) -> None:
             raise SystemExit(f"Config error: {name} must be a nonnegative integer")
         setattr(config.memory, scope + "_tokens", memory_amount)
 
+    for key in ("max_run_seconds", "max_total_tokens", "repeat_failure_limit"):
+        name = "KAMA_AGENT_" + key.upper()
+        raw = os.environ.get(name)
+        if raw is not None:
+            try:
+                amount = int(raw)
+            except ValueError as exc:
+                raise SystemExit(f"Config error: {name} must be a nonnegative integer") from exc
+            if amount < 0:
+                raise SystemExit(f"Config error: {name} must be a nonnegative integer")
+            setattr(config.agent, key, amount)
     prune_target = os.environ.get("KAMA_COMPACT_PRUNE_TARGET")
     if prune_target is not None:
         try:

@@ -8,10 +8,9 @@ from typing import Any
 from kama_claude.core.compact.budget import (
     ARCHIVED_RESULT_MARKER,
     archive_tool_output,
-    estimate_request,
-    estimate_tokens,
     read_archived_output,
 )
+from kama_claude.core.compact.estimator import TokenCounter
 
 _READ_ONLY_TOOLS = {"read_file", "list_dir", "task_get", "task_list"}
 
@@ -50,6 +49,7 @@ def _short_record(
 def _replace_result(
     call: dict[str, Any], block: dict[str, Any], original: str,
     archived: Path | None, outputs_dir: Path, duplicate_of: str = "",
+    *, counter: TokenCounter | None = None,
 ) -> bool:
     text = block["content"]
     if text.startswith(ARCHIVED_RESULT_MARKER):
@@ -57,7 +57,8 @@ def _replace_result(
     digest = hashlib.sha256((str(call["id"]) + "\0" + original).encode("utf-8")).hexdigest()
     path = archived or (outputs_dir.resolve() / f"{digest}.txt")
     replacement = _short_record(call, path, duplicate_of)
-    if estimate_tokens(replacement) >= estimate_tokens(text):
+    measure = counter or TokenCounter()
+    if measure.count(replacement) >= measure.count(text):
         return False
     if archived is None:
         archive_tool_output(str(call["id"]), original, outputs_dir)
@@ -69,11 +70,13 @@ def _replace_result(
 def deduplicate_results(
     messages: list[dict[str, Any]], outputs_dir: Path, protected_start: int,
     system: str, tool_schemas: list[dict[str, Any]], target_tokens: float,
+    *, counter: TokenCounter | None = None,
 ) -> int:
     seen: dict[tuple[str, str, str], tuple[int, str]] = {}
     changes = 0
+    measure = counter or TokenCounter()
     for index, call, block in reversed(_tool_results(messages)):
-        if estimate_request(system, messages, tool_schemas) <= target_tokens:
+        if measure.request(system, messages, tool_schemas) <= target_tokens:
             break
         text = block.get("content")
         if (
@@ -93,7 +96,8 @@ def deduplicate_results(
         if index >= protected_start or latest == occurrence:
             continue
         changes += _replace_result(
-            call, block, original, archived[1] if archived else None, outputs_dir, latest[1],
+            call, block, original, archived[1] if archived else None,
+            outputs_dir, latest[1], counter=measure,
         )
     return changes
 
@@ -102,10 +106,12 @@ def deduplicate_results(
 def prune_results(
     messages: list[dict[str, Any]], outputs_dir: Path, protected_start: int,
     system: str, tool_schemas: list[dict[str, Any]], target_tokens: float,
+    *, counter: TokenCounter | None = None,
 ) -> int:
     changes = 0
+    measure = counter or TokenCounter()
     for index, call, block in _tool_results(messages):
-        if estimate_request(system, messages, tool_schemas) <= target_tokens:
+        if measure.request(system, messages, tool_schemas) <= target_tokens:
             break
         text = block.get("content")
         if (
@@ -116,6 +122,6 @@ def prune_results(
         archived = read_archived_output(text, str(call["id"]))
         changes += _replace_result(
             call, block, archived[0] if archived else text,
-            archived[1] if archived else None, outputs_dir,
+            archived[1] if archived else None, outputs_dir, counter=measure,
         )
     return changes

@@ -82,6 +82,12 @@ class SessionRecovery:
                 raise HandlerError(
                     RECOVERY_REQUIRED, "unfinished subagent recovery is not supported"
                 )
+            if (
+                (run.max_run_seconds and run.elapsed_seconds >= run.max_run_seconds)
+                or (run.max_total_tokens
+                    and run.actual_tokens + run.estimated_tokens >= run.max_total_tokens)
+            ):
+                raise HandlerError(RECOVERY_REQUIRED, "run budget exhausted; abort this run")
             if Path(run.workspace).resolve() != Path.cwd().resolve():
                 raise HandlerError(RECOVERY_REQUIRED, f"start Core in workspace: {run.workspace}")
 
