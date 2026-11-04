@@ -5,6 +5,7 @@ from kama_claude.core.tools.base import BaseTool, ToolResult
 
 
 class TaskListTool(BaseTool):
+    retry_safe = True
     name = "task_list"
     description = (
         "List all tasks with their current status and blocking dependencies. "

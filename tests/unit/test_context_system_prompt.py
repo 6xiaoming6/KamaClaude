@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from kama_claude.core.checkpoint.checkpoint import RunCheckpoint
 from kama_claude.core.context import ExecutionContext
 
 
+# 构造带唯一 Run 状态的提示词测试上下文
 def _make_ctx(**kwargs) -> ExecutionContext:
-    defaults = dict(run_id="r1", goal="test goal", max_steps=5)
+    defaults = dict(run=RunCheckpoint(run_id="r1", goal="test goal", max_steps=5, model="", workspace=""))
     defaults.update(kwargs)
     return ExecutionContext(**defaults)
 

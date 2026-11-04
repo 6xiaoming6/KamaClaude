@@ -90,7 +90,7 @@ class Compactor:
         await self._bus.publish(
             ContextCompactedEvent(
                 session_id=self._session_id,
-                run_id=context.run_id,
+                run_id=context.run.run_id,
                 original_tokens=result.original_token_estimate,
                 summary_tokens=result.summary_tokens,
                 ts=_now(),
@@ -98,7 +98,7 @@ class Compactor:
         )
         logger.info(
             "context compacted session=%s run=%s original≈%d summary=%d tokens",
-            self._session_id, context.run_id,
+            self._session_id, context.run.run_id,
             result.original_token_estimate, result.summary_tokens,
         )
         return result

@@ -13,6 +13,7 @@ from kama_claude.core.tools.registry import ToolRegistry
 # --- stub tools --------------------------------------------------------------
 
 class _FailNTimes(BaseTool):
+    retry_safe = True
     """Fails with runtime_error for the first n calls, then succeeds."""
     name = "fail_n"
     description = "Fails n times then succeeds"
@@ -30,6 +31,7 @@ class _FailNTimes(BaseTool):
 
 
 class _RateLimitedNTimes(BaseTool):
+    retry_safe = True
     """Raises RateLimitedError for the first n calls, then succeeds."""
     name = "rate_n"
     description = "Rate-limits n times then succeeds"
@@ -46,6 +48,7 @@ class _RateLimitedNTimes(BaseTool):
 
 
 class _AlwaysFails(BaseTool):
+    retry_safe = True
     name = "always_fail"
     description = "Always fails"
     input_schema: dict[str, object] = {"type": "object", "properties": {}, "required": []}

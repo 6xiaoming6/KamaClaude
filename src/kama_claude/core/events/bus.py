@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 
 from pydantic import BaseModel
@@ -21,3 +22,15 @@ class EventBus:
     async def publish(self, event: BaseModel) -> None:
         for handler in self._subscribers:
             await handler(event)
+
+    # 释放订阅者，避免短生命周期写入器被共享总线保留
+    def unsubscribe(self, handler: EventHandler) -> None:
+        self._subscribers = [h for h in self._subscribers if h != handler]
+
+    # 单独隔离观察者异常，通知失败不得改变已提交的执行结果
+    async def publish_safe(self, event: BaseModel) -> None:
+        for handler in list(self._subscribers):
+            try:
+                await handler(event)
+            except Exception:
+                logging.getLogger(__name__).exception("event observer failed")

@@ -30,7 +30,7 @@ class AgentRunResult(BaseModel):
 class EventSubscribeCommand(BaseModel):
     type: Literal["event.subscribe"] = "event.subscribe"
     topics: list[str]          # fnmatch 模式，如 ["step.*", "tool.*"]
-    scope: str = "global"      # "global" | "run:<run_id>"
+    scope: str = "global"      # "global" | "run:<run_id>" | "session:<session_id>"
     replay_from_run: str | None = None  # 设置则先从 events.jsonl 回放历史再接实时流
 
 
@@ -100,6 +100,42 @@ class SessionCompactResult(BaseModel):
     saved_tokens: int
 
 
+class SessionListCommand(BaseModel):
+    type: Literal["session.list"] = "session.list"
+
+
+class SessionListResult(BaseModel):
+    sessions: list[dict[str, Any]]
+
+
+class SessionOpenCommand(BaseModel):
+    type: Literal["session.open"] = "session.open"
+    session_id: str
+
+
+class SessionOpenResult(BaseModel):
+    session: dict[str, Any]
+    revision: int
+    messages: list[dict[str, Any]]
+    run: dict[str, Any] | None
+    running: bool
+    pending_permissions: list[dict[str, Any]]
+    event_seq: int = 0
+
+
+class SessionResumeCommand(BaseModel):
+    type: Literal["session.resume"] = "session.resume"
+    session_id: str
+    expected_revision: int
+    action: Literal["continue", "retry_tool", "abort"] = "continue"
+
+
+class SessionResumeResult(BaseModel):
+    run_id: str
+    status: str
+    revision: int
+
+
 # 根据 type 字段决定命令类型的判别联合
 Command = Annotated[
     PingCommand
@@ -110,6 +146,9 @@ Command = Annotated[
     | SessionGetHistoryCommand
     | SessionCloseCommand
     | PermissionRespondCommand
-    | SessionCompactCommand,
+    | SessionCompactCommand
+    | SessionListCommand
+    | SessionOpenCommand
+    | SessionResumeCommand,
     Discriminator("type"),
 ]

@@ -26,10 +26,11 @@ class TraceWriter:
         # join() 会阻塞等待，直到队列中每一个被 get() 的项都调用了 task_done()
         # 靠这个机制来保证"退出前把所有积压的记录写完"
         await self._queue.join()
+        # 已经停止写入了，写task需要停止，如果还没停的话就停止
         if self._task is not None:
-            self._task.cancel()
+            self._task.cancel() # 发送取消请求，向 _drain 挂起的地方注入 CancelledError
             try:
-                await self._task
+                await self._task # 等待任务结束，CancelledError会传播到这里
             except asyncio.CancelledError:
                 pass
 

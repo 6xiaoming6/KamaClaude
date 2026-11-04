@@ -13,12 +13,14 @@ class ToolResult:
     is_error: bool = False
     # "runtime_error" | "timeout" | "schema_error" | "permission_denied"
     error_type: str | None = None
+    outcome_unknown: bool = False
 
 
 class BaseTool(ABC):
     name: str
     description: str
     input_schema: dict[str, object]
+    retry_safe: ClassVar[bool] = False
     params_model: ClassVar[type[BaseModel] | None] = None
 
     # 执行工具调用，返回结果或错误

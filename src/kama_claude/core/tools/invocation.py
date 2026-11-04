@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import ValidationError
 
@@ -24,43 +25,55 @@ from kama_claude.core.tools.registry import ToolRegistry
 if TYPE_CHECKING:
     from kama_claude.core.permissions.manager import PermissionManager
 
+type ToolCheckpointHook = Callable[[Literal["awaiting_approval", "executing"]], None]
 _DEFAULT_TIMEOUT: float = 120.0
 _MAX_RETRIES: int = 2
-_RETRY_BASE_S: float = 2.0  # backoff base; tests can monkeypatch to 0
-_RETRYABLE: frozenset[str] = frozenset({"runtime_error", "rate_limited"})
+_RETRY_BASE_S: float = 2.0
+_RETRYABLE = frozenset({"runtime_error", "rate_limited"})
 
 
+# 返回当前 UTC 时间
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-# 发布 ToolCallFailedEvent 并返回对应 ToolResult
-async def _fail(
+# 发布工具最终结果，持久化调用方应在保存成功后调用
+async def publish_tool_result(
     bus: EventBus,
     run_id: str,
     tool_call: ToolCallBlock,
-    error_class: str,
-    error_message: str,
+    result: ToolResult,
     elapsed_ms: int,
     *,
     attempt: int = 1,
-) -> ToolResult:
-    await bus.publish(
-        ToolCallFailedEvent(
-            run_id=run_id,
-            tool_use_id=tool_call.id,
-            tool_name=tool_call.name,
-            error_class=error_class,
-            error_message=error_message,
-            elapsed_ms=elapsed_ms,
-            attempt=attempt,
-            ts=_now(),
+) -> None:
+    if result.is_error:
+        await bus.publish_safe(
+            ToolCallFailedEvent(
+                run_id=run_id,
+                tool_use_id=tool_call.id,
+                tool_name=tool_call.name,
+                error_class=result.error_type or "runtime_error",
+                error_message=result.content,
+                elapsed_ms=elapsed_ms,
+                attempt=attempt,
+                ts=_now(),
+            )
         )
-    )
-    return ToolResult(content=error_message, is_error=True, error_type=error_class)
+    else:
+        await bus.publish_safe(
+            ToolCallFinishedEvent(
+                run_id=run_id,
+                tool_use_id=tool_call.id,
+                tool_name=tool_call.name,
+                elapsed_ms=elapsed_ms,
+                output=result.content,
+                ts=_now(),
+            )
+        )
 
 
-# 校验参数、检查权限、限时调用工具、发布进度事件，失败时指数退避重试，返回 ToolResult（不抛异常）
+# 校验参数、检查权限并执行工具，返回结果；保存错误和取消直接向上传播
 async def invoke_tool(
     registry: ToolRegistry,
     tool_call: ToolCallBlock,
@@ -70,10 +83,11 @@ async def invoke_tool(
     *,
     permission_manager: PermissionManager | None = None,
     session_id: str = "",
+    checkpoint_hook: ToolCheckpointHook | None = None,
+    notify_result: bool = True,
 ) -> ToolResult:
     t0 = time.monotonic()
-
-    await bus.publish(
+    await bus.publish_safe(
         ToolCallStartedEvent(
             run_id=run_id,
             tool_use_id=tool_call.id,
@@ -83,49 +97,53 @@ async def invoke_tool(
         )
     )
 
-    def elapsed() -> int:
-        return int((time.monotonic() - t0) * 1000)
+    # 普通调用直接通知；Loop 会延后到结果保存成功后再通知
+    async def finish(result: ToolResult, attempt: int = 1) -> ToolResult:
+        if notify_result:
+            await publish_tool_result(
+                bus, run_id, tool_call, result, int((time.monotonic() - t0) * 1000),
+                attempt=attempt,
+            )
+        return result
 
     tool = registry.get(tool_call.name)
     if tool is None:
-        return await _fail(
-            bus, run_id, tool_call,
-            "runtime_error", f"unknown tool: {tool_call.name}", elapsed(),
+        return await finish(
+            ToolResult(
+                content=f"unknown tool: {tool_call.name}",
+                is_error=True,
+                error_type="runtime_error",
+            )
         )
-    # 先验证工具调用的具体参数是否正确
     if tool.params_model is not None:
         try:
             tool.params_model.model_validate(dict(tool_call.input))
         except ValidationError as exc:
-            return await _fail(
-                bus, run_id, tool_call,
-                "schema_error", str(exc), elapsed(),
+            return await finish(
+                ToolResult(
+                    content=str(exc),
+                    is_error=True,
+                    error_type="schema_error",
+                )
             )
-    # 参数验证通过后再检查权限：allow 放行，deny 拒绝，ask 等待用户决定
     if permission_manager is not None:
-        async def _emit_permission(raw: dict[str, Any]) -> None:
-            await bus.publish(PermissionRequestedEvent(**raw, run_id=run_id))
-        # 阻塞在这里等待用户审批
+        if checkpoint_hook:
+            checkpoint_hook("awaiting_approval")
+
+        # 将审批事件安全交给观察者，Future 的生命周期仍由权限管理器负责
+        async def emit_permission(raw: dict[str, Any]) -> None:
+            await bus.publish_safe(PermissionRequestedEvent(**raw, run_id=run_id))
+
         allowed, decision = await permission_manager.check_and_wait(
             tool_use_id=tool_call.id,
             tool_name=tool_call.name,
             params=dict(tool_call.input),
             session_id=session_id,
-            event_emitter=_emit_permission,
+            event_emitter=emit_permission,
         )
-        if allowed:
-            if decision not in ("auto_allow",):
-                await bus.publish(
-                    PermissionGrantedEvent(
-                        run_id=run_id,
-                        tool_use_id=tool_call.id,
-                        decision=decision,
-                        ts=_now(),
-                    )
-                )
-        else:
+        if not allowed:
             if decision != "auto_deny":
-                await bus.publish(
+                await bus.publish_safe(
                     PermissionDeniedEvent(
                         run_id=run_id,
                         tool_use_id=tool_call.id,
@@ -133,82 +151,71 @@ async def invoke_tool(
                         ts=_now(),
                     )
                 )
-            return await _fail(
-                bus, run_id, tool_call,
-                "permission_denied",
-                "Permission denied by user. You may not execute this command. "
-                "Try an alternative approach or ask the user what to do.",
-                elapsed(),
-            )
-
-    # 用户同意后开始执行，如果工具出现允许重试的错误，允许重试_MAX_RETRIES次
-    for attempt in range(1, _MAX_RETRIES + 2):
-        error_class: str | None = None
-        error_message: str | None = None
-
-        try:
-            result = await asyncio.wait_for(
-                tool.invoke(dict(tool_call.input)), timeout=timeout
-            )
-            ms = elapsed()
-
-            # 工具执行失败后拿到错误类型，然后根据错误类型判断是否需要重试
-            if result.is_error:
-                error_class = result.error_type or "runtime_error"
-                error_message = result.content
-            else:
-                # 工具执行成功了就正常返回
-                await bus.publish(
-                    ToolCallFinishedEvent(
-                        run_id=run_id,
-                        tool_use_id=tool_call.id,
-                        tool_name=tool_call.name,
-                        elapsed_ms=ms,
-                        output=result.content,
-                        ts=_now(),
-                    )
+            return await finish(
+                ToolResult(
+                    content="Permission denied. Do not execute this operation.",
+                    is_error=True,
+                    error_type="permission_denied",
                 )
-                return result
-
-        except RateLimitedError as exc:
-            error_class = "rate_limited"
-            error_message = str(exc)
-        except TimeoutError:
-            return await _fail(
-                bus, run_id, tool_call,
-                "timeout", f"tool timed out after {timeout}s", elapsed(),
-                attempt=attempt,
             )
-        except Exception as exc:
-            error_class = "runtime_error"
-            error_message = str(exc)
-
-        assert error_class is not None and error_message is not None
-        ms = elapsed()
-
-        if error_class in _RETRYABLE and attempt <= _MAX_RETRIES:
-            await bus.publish(
-                ToolCallFailedEvent(
+        if decision != "auto_allow":
+            await bus.publish_safe(
+                PermissionGrantedEvent(
                     run_id=run_id,
                     tool_use_id=tool_call.id,
-                    tool_name=tool_call.name,
-                    error_class=error_class,
-                    error_message=error_message,
-                    elapsed_ms=ms,
-                    attempt=attempt,
+                    decision=decision,
                     ts=_now(),
                 )
             )
-            # 按照2、4、8...设置重试时长
-            await asyncio.sleep(_RETRY_BASE_S * (2 ** (attempt - 1)))
-            continue
 
-        # 如果错误不允许重试或者重试次数超过了限制就返回失败
-        return await _fail(
-            bus, run_id, tool_call,
-            error_class, error_message, ms,
-            attempt=attempt,
+    for attempt in range(1, _MAX_RETRIES + 2):
+        # 执行意图提交成功后，才允许进入可能产生副作用的工具函数
+        if checkpoint_hook:
+            checkpoint_hook("executing")
+        try:
+            result = await asyncio.wait_for(
+                tool.invoke(dict(tool_call.input)),
+                timeout=timeout,
+            )
+        except RateLimitedError as exc:
+            result = ToolResult(content=str(exc), is_error=True, error_type="rate_limited")
+        # 超时不代表操作未发生，非安全工具要保守记录结果未知
+        except TimeoutError:
+            result = ToolResult(
+                content=f"tool timed out after {timeout}s",
+                is_error=True,
+                error_type="timeout",
+                outcome_unknown=not tool.retry_safe,
+            )
+        except Exception as exc:
+            result = ToolResult(
+                content=str(exc),
+                is_error=True,
+                error_type="runtime_error",
+                outcome_unknown=not tool.retry_safe,
+            )
+
+        retry = (
+            result.is_error
+            and tool.retry_safe
+            and result.error_type in _RETRYABLE
+            and attempt <= _MAX_RETRIES
         )
-
-    # unreachable, but keeps mypy happy
-    return ToolResult(content="internal error", is_error=True, error_type="runtime_error")
+        # 成功、不可重试或次数耗尽时，返回本次调用的最终结果
+        if not retry:
+            return await finish(result, attempt)
+        await bus.publish_safe(
+            ToolCallFailedEvent(
+                run_id=run_id,
+                tool_use_id=tool_call.id,
+                tool_name=tool_call.name,
+                error_class=result.error_type or "runtime_error",
+                error_message=result.content,
+                elapsed_ms=int((time.monotonic() - t0) * 1000),
+                attempt=attempt,
+                retrying=True,
+                ts=_now(),
+            )
+        )
+        await asyncio.sleep(_RETRY_BASE_S * (2 ** (attempt - 1)))
+    raise AssertionError("unreachable")

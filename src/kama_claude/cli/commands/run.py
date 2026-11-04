@@ -56,6 +56,14 @@ class StdoutPrinter:
             self._ensure_newline()
             print(f"[step {event.get('step')}] done")
 
+        elif t == "run.interrupted":
+            self._ensure_newline()
+            print(
+                f"[run] interrupted: {event.get('reason', '')}; "
+                "reopen this session in TUI to recover",
+                file=sys.stderr,
+            )
+
         elif t == "run.finished":
             self._ensure_newline()
             elapsed = time.monotonic() - self._run_start
@@ -75,15 +83,22 @@ async def _run_async(goal: str, config: KamaConfig) -> int:
     printer = StdoutPrinter()
     finished = asyncio.Event()
     exit_code = 0
+    expected_run: str | None = None
+    buffered: list[dict[str, Any]] = []
 
     # 事件回调函数，core的事件发布后都会经过这个函数
     async def on_event(event: dict[str, Any]) -> None:
         nonlocal exit_code
+        if expected_run is None:
+            buffered.append(event)
+            return
+        if event.get("run_id") != expected_run:
+            return
         # 先打印这个事件
         await printer.handle(event)
         # 如果事件是任务完成事件的话，就把finished等待设为完成，就会结束_run_async
-        if event.get("type") == "run.finished":
-            if event.get("status") != "success":
+        if event.get("type") in ("run.finished", "run.interrupted"):
+            if event.get("type") == "run.interrupted" or event.get("status") != "success":
                 exit_code = 1
             finished.set()
     # 注册事件回调函数，client收到事件后，交给这个函数处理
@@ -94,7 +109,7 @@ async def _run_async(goal: str, config: KamaConfig) -> int:
     loop_task = asyncio.create_task(client.run_event_loop())
 
     try:
-        # 先向core发送消息注册订阅
+        # 先向core发送消息注册订阅，并等待响应
         await client.send_command(
             "event.subscribe",
             {
@@ -103,23 +118,34 @@ async def _run_async(goal: str, config: KamaConfig) -> int:
             },
         )
         # 再启动运行，AgentRunner在后端启动，前端cli只负责发送命令和查看进度
-        await client.send_command("agent.run", {"goal": goal})
-    except IpcError as e:
+        result = await client.send_command("agent.run", {"goal": goal})
+        expected_run = str(result["run_id"])
+        for event in buffered:
+            await on_event(event)
+        buffered.clear()
+    except (IpcError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
         await client.close()
         return 1
 
-    # 等待任务完成
-    await finished.wait()
-    # 任务完成后就不需要循环监听后端的消息了
-    loop_task.cancel()
+    # 等待业务终态或连接结束，断线时不再永久挂在 finished.wait
+    waiter = asyncio.create_task(finished.wait())
     try:
-        await loop_task
-    except asyncio.CancelledError:
-        pass
-
-    await client.close()
+        await asyncio.wait({waiter, loop_task}, return_when=asyncio.FIRST_COMPLETED)
+        if not finished.is_set():
+            print(
+                "error: Core disconnected; reopen the session in TUI to inspect it",
+                file=sys.stderr,
+            )
+            exit_code = 1
+    finally:
+        waiter.cancel()
+        if not loop_task.done():
+            loop_task.cancel()
+        await asyncio.gather(waiter, loop_task, return_exceptions=True)
+        await client.close()
     return exit_code
 
 

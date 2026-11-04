@@ -51,13 +51,21 @@ class SocketClient:
     async def send_command(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         if self._writer is None:
             raise RuntimeError("not connected — call connect() first")
+        # 生成该请求的rpc_id
         req_id = str(uuid.uuid4())
         request = JsonRpcRequest(id=req_id, method=method, params=params)
+        # 创建futrue等待服务端响应
         fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[req_id] = fut
-        self._writer.write(request.model_dump_json().encode() + b"\n")
-        await self._writer.drain()
-        return await fut
+        try:
+            self._writer.write(request.model_dump_json().encode() + b"\n")
+            await self._writer.drain()
+            # 服务端按请求 ID 填入 Future 后，这次命令才返回
+            return await fut
+        finally:
+            self._pending.pop(req_id, None)
+            if not fut.done():
+                fut.cancel()
 
     # 持续读取服务器消息，分发 RPC 响应到 pending future 或事件到 event handler
     async def run_event_loop(self) -> None:
@@ -76,10 +84,10 @@ class SocketClient:
                     break
                 await self._dispatch(line)
         finally:
-            # _pending里面存的是等待响应的请求
+            # _pending里面存的是等待响应的请求，防止一直空等，finally里要处理掉这些等待的future
             for fut in self._pending.values():
                 if not fut.done():
-                    fut.cancel()
+                    fut.set_exception(ConnectionError("Core disconnected"))
             self._pending.clear()
 
     # 解析单行消息并路由到 pending future（RPC 响应）或 event handler（服务器推送）

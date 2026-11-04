@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+from kama_claude.core.checkpoint.checkpoint import RunCheckpoint
 from kama_claude.core.compact.compactor import Compactor
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus
@@ -64,7 +65,7 @@ async def test_compact_replaces_context_messages(tmp_path: Path) -> None:
     provider = _stub_provider()
     bus = EventBus()
     compactor = Compactor(bus, tmp_path, "sess-1")
-    ctx = ExecutionContext(run_id="r1", goal="test", max_steps=5)
+    ctx = ExecutionContext(run=RunCheckpoint(run_id="r1", goal="test", max_steps=5, model="", workspace=""))
     ctx.messages = _make_messages()
 
     await compactor.compact(ctx, provider)
@@ -80,7 +81,7 @@ async def test_compact_writes_summary_file(tmp_path: Path) -> None:
     provider = _stub_provider()
     bus = EventBus()
     compactor = Compactor(bus, tmp_path, "sess-1")
-    ctx = ExecutionContext(run_id="r1", goal="test", max_steps=5)
+    ctx = ExecutionContext(run=RunCheckpoint(run_id="r1", goal="test", max_steps=5, model="", workspace=""))
     ctx.messages = _make_messages()
 
     await compactor.compact(ctx, provider)
@@ -101,7 +102,7 @@ async def test_compact_publishes_event(tmp_path: Path) -> None:
 
     bus.subscribe(handler)
     compactor = Compactor(bus, tmp_path, "sess-1")
-    ctx = ExecutionContext(run_id="r1", goal="test", max_steps=5)
+    ctx = ExecutionContext(run=RunCheckpoint(run_id="r1", goal="test", max_steps=5, model="", workspace=""))
     ctx.messages = _make_messages()
 
     await compactor.compact(ctx, provider)
@@ -117,7 +118,7 @@ async def test_compact_failure_preserves_context(tmp_path: Path) -> None:
     provider.chat = AsyncMock(side_effect=RuntimeError("LLM error"))
     bus = EventBus()
     compactor = Compactor(bus, tmp_path, "sess-1")
-    ctx = ExecutionContext(run_id="r1", goal="test", max_steps=5)
+    ctx = ExecutionContext(run=RunCheckpoint(run_id="r1", goal="test", max_steps=5, model="", workspace=""))
     original_messages = _make_messages()
     ctx.messages = list(original_messages)
 

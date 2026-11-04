@@ -32,6 +32,17 @@ class IpcEventBroadcaster:
     def __init__(self, trace: TraceWriter | None = None) -> None:
         self._subscriptions: list[_Subscription] = []
         self._trace = trace
+        self._run_sessions: dict[str, str] = {}
+        self._sequences: dict[str, int] = {}
+
+    # 将主运行或恢复运行绑定到所属会话
+    def bind_run(self, run_id: str, session_id: str) -> None:
+        self._run_sessions[run_id] = session_id
+
+    # 返回会话事件水位，用于打开快照后的客户端去重
+    def sequence(self, session_id: str) -> int:
+        return self._sequences.get(session_id, 0)
+
 
     # 注册一个客户端订阅，返回 subscription_id
     def subscribe(
@@ -54,13 +65,22 @@ class IpcEventBroadcaster:
         event_dict = event.model_dump()
         event_type: str = event_dict.get("type", "")
         run_id: str | None = event_dict.get("run_id")
+        parent = event_dict.get("parent_run_id")
+        if run_id and parent in self._run_sessions:
+            self.bind_run(run_id, self._run_sessions[parent])
+        sid = event_dict.get("session_id") or self._run_sessions.get(run_id or "")
+        if sid:
+            self._sequences[sid] = self.sequence(sid) + 1
+            event_dict["session_id"] = sid
+            event_dict["event_seq"] = self.sequence(sid)
+
 
         dead: list[asyncio.StreamWriter] = []
 
         for sub in list(self._subscriptions):
             if not self._matches_topic(event_type, sub.topics):
                 continue
-            if not self._matches_scope(run_id, sub.scope):
+            if not self._matches_scope(run_id, sub.scope, sid):
                 continue
             try:
                 envelope = EventPushEnvelope(event=event_dict)
@@ -93,9 +113,11 @@ class IpcEventBroadcaster:
 
     # 检查事件 run_id 是否匹配订阅的 scope（global 全通，run:<id> 精确匹配）
     @staticmethod
-    def _matches_scope(run_id: str | None, scope: str) -> bool:
+    def _matches_scope(run_id: str | None, scope: str, session_id: str | None = None) -> bool:
         if scope == "global":
             return True
+        if scope.startswith("session:"):
+            return session_id == scope[8:]
         if scope.startswith("run:"):
             return run_id == scope[4:]
         return False
