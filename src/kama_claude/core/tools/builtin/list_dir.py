@@ -17,6 +17,7 @@ class ListDirParams(BaseModel):
 
 
 class ListDirTool(BaseTool):
+    retry_safe = True
     params_model = ListDirParams
     name = "list_dir"
     description = (

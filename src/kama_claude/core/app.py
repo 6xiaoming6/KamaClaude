@@ -5,6 +5,7 @@ import datetime
 import fnmatch
 import json
 import logging
+import os
 import signal
 import sys
 import time
@@ -31,6 +32,12 @@ from kama_claude.core.bus.commands import (
     SessionCreateResult,
     SessionGetHistoryCommand,
     SessionGetHistoryResult,
+    SessionListCommand,
+    SessionListResult,
+    SessionOpenCommand,
+    SessionOpenResult,
+    SessionResumeCommand,
+    SessionResumeResult,
     SessionSendMessageCommand,
     SessionSendMessageResult,
 )
@@ -64,7 +71,6 @@ class CoreApp:
         self._broadcaster: IpcEventBroadcaster | None = None
         self._trace: TraceWriter | None = None
         self._config: KamaConfig | None = None
-        self._running_runs: set[asyncio.Task[Any]] = set()
         self._sessions: SessionManager | None = None
         self._permission_manager: PermissionManager | None = None
         self._mcp_manager: McpServerManager | None = None
@@ -101,11 +107,9 @@ class CoreApp:
         cmd = AgentRunCommand.model_validate(params)
         session = await self._sessions.create(mode="one_shot", title=cmd.goal[:40])
         run_id = new_run_id()
-        run_task = asyncio.create_task(
-            self._sessions.send_message(session.id, cmd.goal, run_id=run_id)
-        )
-        self._running_runs.add(run_task)
-        run_task.add_done_callback(self._running_runs.discard)
+        if self._broadcaster:
+            self._broadcaster.bind_run(run_id, session.id)
+        await self._sessions.send_message(session.id, cmd.goal, run_id=run_id, wait=False)
         return AgentRunResult(run_id=run_id)
 
     # 创建 chat 或 one_shot session，并返回 session_id
@@ -119,8 +123,42 @@ class CoreApp:
     async def _session_send_handler(self, params: dict[str, Any]) -> SessionSendMessageResult:
         assert self._sessions is not None
         cmd = SessionSendMessageCommand.model_validate(params)
-        run_id = await self._sessions.send_message(cmd.session_id, cmd.content)
+        run_id = new_run_id()
+        if self._broadcaster:
+            self._broadcaster.bind_run(run_id, cmd.session_id)
+        await self._sessions.send_message(cmd.session_id, cmd.content, run_id=run_id)
         return SessionSendMessageResult(run_id=run_id)
+
+    # 列出可打开的历史会话与中断状态
+    async def _session_list_handler(self, params: dict[str, Any]) -> SessionListResult:
+        assert self._sessions is not None
+        SessionListCommand.model_validate(params)
+        return SessionListResult(sessions=self._sessions.list_sessions())
+
+    # 原子地绑定会话事件并返回已提交快照，不在两者之间等待网络
+    async def _session_open_handler(self, params: dict[str, Any]) -> SessionOpenResult:
+        assert self._sessions is not None and self._broadcaster is not None
+        cmd = SessionOpenCommand.model_validate(params)
+        result = await self._sessions.open(cmd.session_id)
+        writer = get_connection_writer()
+        self._broadcaster.unsubscribe(writer)
+        if result["run"]:
+            self._broadcaster.bind_run(result["run"]["run_id"], cmd.session_id)
+        self._broadcaster.subscribe(writer, ["*"], f"session:{cmd.session_id}")
+        result["event_seq"] = self._broadcaster.sequence(cmd.session_id)
+        return SessionOpenResult(**result)
+
+    # 校验恢复决定并立即返回已登记的运行身份
+    async def _session_resume_handler(self, params: dict[str, Any]) -> SessionResumeResult:
+        assert self._sessions is not None
+        cmd = SessionResumeCommand.model_validate(params)
+        state = await self._sessions.open(cmd.session_id)
+        if self._broadcaster and state["run"]:
+            self._broadcaster.bind_run(state["run"]["run_id"], cmd.session_id)
+        result = await self._sessions.resume(
+            cmd.session_id, cmd.expected_revision, cmd.action,
+        )
+        return SessionResumeResult(**result)
 
     # 返回 session 的完整 Anthropic messages 历史
     async def _session_history_handler(self, params: dict[str, Any]) -> SessionGetHistoryResult:
@@ -181,7 +219,9 @@ class CoreApp:
     ) -> int:
         path = events_file(run_id)
         if not path.exists():
-            for candidate in Path("~/.kama/sessions").expanduser().glob(
+            for candidate in Path(
+                os.environ.get("KAMA_SESSIONS_DIR", "~/.kama/sessions")
+            ).expanduser().glob(
                 f"*/runs/{run_id}/events.jsonl"
             ):
                 path = candidate
@@ -190,7 +230,7 @@ class CoreApp:
             return 0
 
         count = 0
-        for line in path.read_text().splitlines():
+        for line in path.read_text(encoding="utf-8").splitlines():
             if not line:
                 continue
             try:
@@ -234,7 +274,7 @@ class CoreApp:
         self._broadcaster = IpcEventBroadcaster(trace=self._trace)
         # Trace 初始化后注册广播器，之后发布的事件都会经过广播器。
         self._bus.subscribe(self._broadcaster.handle)
-        sessions_root = Path("~/.kama/sessions").expanduser()
+        sessions_root = Path(os.environ.get("KAMA_SESSIONS_DIR", "~/.kama/sessions")).expanduser()
         store = SessionStore(sessions_root)
         assert self._config is not None
         config = self._config
@@ -254,6 +294,7 @@ class CoreApp:
             ),
             bus=self._bus,
             provider_factory=lambda: DeepseekProvider(config.llm.default_model),
+            permission_manager=self._permission_manager,
         )
 
         server = SocketServer(
@@ -266,6 +307,9 @@ class CoreApp:
         server.register("agent.run", self._agent_run_handler)
         server.register("event.subscribe", self._subscribe_handler)
         server.register("session.create", self._session_create_handler)
+        server.register("session.list", self._session_list_handler)
+        server.register("session.open", self._session_open_handler)
+        server.register("session.resume", self._session_resume_handler)
         server.register("session.send_message", self._session_send_handler)
         server.register("session.get_history", self._session_history_handler)
         server.register("session.close", self._session_close_handler)
@@ -290,10 +334,8 @@ class CoreApp:
         finally:
             # Windows系统下，用户按 Ctrl+C 时，asyncio.run() 会取消主任务，无须额外注册信号处理器
             logger.info("shutting down")
-            for run_task in list(self._running_runs):
-                run_task.cancel()
-            if self._running_runs:
-                await asyncio.gather(*self._running_runs, return_exceptions=True)
+            if self._sessions is not None:
+                await self._sessions.shutdown()
             if self._mcp_manager is not None:
                 await self._mcp_manager.stop_all()
             await server.stop()

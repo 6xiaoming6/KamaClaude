@@ -5,34 +5,24 @@ from pathlib import Path
 import pytest
 
 from kama_claude.core.bus.envelope import HandlerError
+from kama_claude.core.config import KamaConfig
 from kama_claude.core.events.bus import EventBus
-from kama_claude.core.runner import RunOutcome
+from kama_claude.core.llm.types import LlmResponse
+from kama_claude.core.runner import AgentRunner
 from kama_claude.core.session.manager import SESSION_CLOSED, SESSION_NOT_FOUND, SessionManager
-from kama_claude.core.session.model import Session
 from kama_claude.core.session.store import SessionStore
 
 
-class _Runner:
-    # 模拟 AgentRunner，将 run 新消息写入 thread 后返回成功
-    async def run_and_capture(
-        self,
-        goal: str,
-        *,
-        run_id: str | None = None,
-        session: Session | None = None,
-        store: SessionStore | None = None,
-        system_prompt_override: str | None = None,
-        tool_whitelist: list[str] | None = None,
-    ) -> RunOutcome:
-        assert run_id is not None
-        assert session is not None
-        assert store is not None
-        store.append_messages(
-            session.id,
-            [{"role": "assistant", "content": [{"type": "text", "text": f"done {goal}"}]}],
-            run_id,
-        )
-        return RunOutcome(status="success", result="done", reason=None)
+class _Provider:
+    # 返回固定回复，不访问外部模型
+    async def chat(self, **kwargs: object) -> LlmResponse:
+        return LlmResponse(stop_reason="end_turn", text="done")
+
+
+class _Runner(AgentRunner):
+    # 使用真实 Runner 的保存和收尾契约，只替换模型
+    def __init__(self) -> None:
+        super().__init__(KamaConfig(), provider=_Provider())  # type: ignore[arg-type]
 
 
 # 功能：验证 create 会创建 active session、写入 meta 并发布 session.created 事件
@@ -56,7 +46,7 @@ async def test_create_session_writes_meta_and_event(tmp_path: Path) -> None:
 
 
 # 功能：验证 chat session 处理一条消息后进入 waiting_for_input，并保留 user/assistant thread
-# 设计：mock runner 主动追加 assistant 消息，确认 send_message 负责 user 消息、状态流转和 run_id 记录
+# 设计：仅替换模型，使用真实 Runner 提交终态，确认 Manager 记录输入并发送会话事件
 async def test_send_message_chat_enters_waiting_and_writes_thread(tmp_path: Path) -> None:
     store = SessionStore(tmp_path)
     manager = SessionManager(store, lambda: _Runner(), EventBus())  # type: ignore[arg-type]

@@ -1,19 +1,30 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
+from typing import Any
 
-from kama_claude.core.bus.events import RunFinishedEvent, RunStartedEvent
+from kama_claude.core.bus.events import (
+    RunFinishedEvent,
+    RunInterruptedEvent,
+    RunResumedEvent,
+    RunStartedEvent,
+)
+from kama_claude.core.checkpoint.checkpoint import Checkpoint, CheckpointError, RunCheckpoint
+from kama_claude.core.checkpoint.persistence import RunPersistence
 from kama_claude.core.compact.compactor import Compactor
 from kama_claude.core.config import KamaConfig
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus, EventHandler
 from kama_claude.core.events.writer import EventWriter
 from kama_claude.core.llm.base import LLMProvider
-from kama_claude.core.llm.provider import DeepseekProvider
+from kama_claude.core.llm.provider import AnthropicProvider, DeepseekProvider, OpenaiProvider
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.mcp.server import McpServerManager
 from kama_claude.core.memory.loader import load_context_file
@@ -40,6 +51,7 @@ from kama_claude.core.trace.provider import TracingProvider
 from kama_claude.core.trace.writer import TraceWriter
 
 
+# 返回当前事件时间
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -49,6 +61,7 @@ class RunOutcome:
     status: str
     result: str
     reason: str | None
+
 
 # 每次完整的[用户输入-结束]run都会创建一个新的runner
 class AgentRunner:
@@ -66,7 +79,7 @@ class AgentRunner:
         mcp_manager: McpServerManager | None = None,
     ) -> None:
         self._config = config
-        self._bus = bus # 现在事件总线放到了core里面，所有事件
+        self._bus = bus  # 现在事件总线放到了core里面，所有事件
         self._provider = provider
         self._extra_handlers: list[EventHandler] = extra_handlers or []
         self._runs_dir = runs_dir or RUNS_DIR
@@ -140,11 +153,44 @@ class AgentRunner:
                     registry.register(mcp_tool)
         return registry
 
-    # 执行一次完整的 agent run（委托给 run_and_capture，忽略返回值）
+    # 记录真实后端类型和模型，不把凭证写入检查点
+    def _provider_identity(self) -> tuple[str, str]:
+        provider = self._provider
+        name = (
+            "deepseek"
+            if provider is None or isinstance(provider, DeepseekProvider)
+            else "anthropic"
+            if isinstance(provider, AnthropicProvider)
+            else "openai"
+            if isinstance(provider, OpenaiProvider)
+            else "custom"
+        )
+        return name, str(getattr(provider, "_model", self._config.llm.default_model))
+
+    # 在接收目标时先提交初始 Run，避免任务尚未调度就退出而丢失目标
+    def prepare_checkpoint(
+        self,
+        cp: Checkpoint,
+        session: Session,
+        goal: str,
+        run_id: str,
+        system_prompt: str | None,
+        tools: list[str] | None,
+        store: SessionStore,
+    ) -> None:
+        context = self._create_context(
+            self._new_run_state(goal, run_id, tools),
+            cp.messages,
+            notes=store.read_notes(session.id),
+            system_prompt_override=system_prompt,
+        )
+        RunPersistence(context, cp, session, store).save()
+
+    # 执行一次完整 Run，忽略返回的文字结果
     async def run(self, goal: str, *, run_id: str | None = None) -> None:
         await self.run_and_capture(goal, run_id=run_id)
 
-    # 执行 agent run 并返回 RunOutcome（含最终文字结果）
+    # 按准备、观察、执行和收尾的顺序协调 Run，执行状态仅存在 context.run
     async def run_and_capture(
         self,
         goal: str,
@@ -154,117 +200,306 @@ class AgentRunner:
         store: SessionStore | None = None,
         system_prompt_override: str | None = None,
         tool_whitelist: list[str] | None = None,
+        checkpoint: Checkpoint | None = None,
     ) -> RunOutcome:
-        run_id = run_id or new_run_id()
-        if session is not None and store is not None:
-            run_path = store.runs_dir(session.id) / run_id
-            history = store.read_messages(session.id)
-            notes = store.read_notes(session.id)
-        else:
-            run_path = self._runs_dir / run_id
-            history = [{"role": "user", "content": goal}]
-            notes = ""
+        # 显式传入待恢复检查点才是续跑，普通新消息仍开始新的 Run
+        resuming = checkpoint is not None
+        context, persistence = self._prepare_context(
+            goal, run_id=run_id, session=session, store=store,
+            system_prompt_override=system_prompt_override,
+            tool_whitelist=tool_whitelist, checkpoint=checkpoint,
+        )
+        run_path = (
+            store.runs_dir(session.id) / context.run.run_id
+            if session is not None and store is not None
+            else self._runs_dir / context.run.run_id
+        )
         run_path.mkdir(parents=True, exist_ok=True)
-
-        global_ctx = load_context_file(Path("~/.kama/context.md").expanduser())
-        project_ctx = load_context_file(Path(".kama/context.md"))
-
-        task_manager = TaskManager(run_path / ".tasks")
-
         bus = self._bus if self._bus is not None else EventBus()
-        for h in self._extra_handlers:
-            bus.subscribe(h)
+        # 观察者和事件文件只在本轮有效，任何退出路径都会清理
+        with ExitStack() as observers:
+            for handler in self._extra_handlers:
+                bus.subscribe(handler)
+                observers.callback(bus.unsubscribe, handler)
+            track_children = partial(self._track_children, context)
+            bus.subscribe(track_children)
+            observers.callback(bus.unsubscribe, track_children)
+            if persistence is not None:
+                persistence.save()
+            async with EventWriter(run_path / "events.jsonl", run_id=context.run.run_id) as writer:
+                writer.subscribe(bus)
+                if resuming:
+                    await bus.publish_safe(
+                        RunResumedEvent(
+                            run_id=context.run.run_id,
+                            session_id=session.id if session else "",
+                            step=context.run.step, ts=_now(),
+                        )
+                    )
+                else:
+                    await bus.publish_safe(
+                        RunStartedEvent(run_id=context.run.run_id, goal=context.run.goal, ts=_now())
+                    )
 
-        # 使用 thread.jsonl 作为历史消息，将基础提示词与会话笔记组合成 system prompt
-        context = ExecutionContext(
-            run_id=run_id,
-            goal=goal,
-            max_steps=self._config.agent.max_steps,
-            prefill_messages=history,
-            session_notes=notes,
-            global_context=global_ctx,
-            project_context=project_ctx,
+                # 和 S7 一样，在主流程中组装并运行 Loop，直接看见异常处理边界
+                cancelled = False
+                try:
+                    loop = self._build_loop(
+                        context, bus, run_path, persistence, resuming=resuming,
+                    )
+                    await loop.run()
+                except CheckpointError:
+                    # 保存失败立即传播，不再进入正常收尾或发布成功
+                    await bus.publish_safe(
+                        RunInterruptedEvent(
+                            run_id=context.run.run_id,
+                            session_id=session.id if session else "",
+                            reason="checkpoint_save_failed",
+                            revision=persistence.checkpoint.revision if persistence else 0,
+                            ts=_now(),
+                        )
+                    )
+                    raise
+                # 正常取消，比如ctrl + c取消后，会出现这个异常
+                except asyncio.CancelledError:
+                    cancelled = True
+                    if persistence is not None:
+                        context.mark_interrupted("core_stopped")
+                    else:
+                        context.mark_failed("cancelled")
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "agent run failed run_id=%s", context.run.run_id,
+                    )
+                    reason = context.run.reason or "run_error"
+                    if persistence is not None:
+                        context.mark_interrupted(reason)
+                    else:
+                        context.mark_failed(reason)
+                # 没有异常的话就是正常执行完一次agent loop，调用该方法收尾
+                return await self._finish_run(context, bus, persistence, cancelled=cancelled)
+
+    # 读取原检查点或新建 Run，返回上下文及可选的持久化绑定
+    def _prepare_context(
+        self,
+        goal: str,
+        *,
+        run_id: str | None,
+        session: Session | None,
+        store: SessionStore | None,
+        system_prompt_override: str | None,
+        tool_whitelist: list[str] | None,
+        checkpoint: Checkpoint | None,
+    ) -> tuple[ExecutionContext, RunPersistence | None]:
+        cp = checkpoint
+        if session is not None and store is not None and cp is None:
+            if not store.checkpoints.exists(session.id):
+                store.write_meta(session)
+            cp = store.ensure_checkpoint(session.id)
+        # 恢复沿用原 Run，不能重新生成身份或重置步数预算
+        if checkpoint is not None and cp is not None and cp.run is not None:
+            run = cp.run
+        else:
+            run_id = run_id or new_run_id()
+            run = (
+                cp.run
+                if cp and cp.run and cp.run.run_id == run_id
+                else self._new_run_state(goal, run_id, tool_whitelist)
+            )
+        context = self._create_context(
+            run,
+            cp.messages if cp else [],
+            notes=store.read_notes(session.id) if session and store else "",
             system_prompt_override=system_prompt_override,
         )
-        prefill_len = len(history)
+        run.status = "running"
+        run.reason = None
+        persistence = (
+            RunPersistence(context, cp, session, store)
+            if cp is not None and session is not None and store is not None
+            else None
+        )
+        return context, persistence
 
-        # AgentRunner启动后把事件写入工具注册到bus
-        async with EventWriter(run_path / "events.jsonl") as writer:
-            writer.subscribe(bus)
-            await bus.publish(RunStartedEvent(run_id=run_id, goal=goal, ts=_now()))
+    # 统一构建新 Run，模型、工作目录与预算只记录在这一份状态中
+    def _new_run_state(
+        self, goal: str, run_id: str, tool_whitelist: list[str] | None,
+    ) -> RunCheckpoint:
+        provider, model = self._provider_identity()
+        return RunCheckpoint(
+            run_id=run_id, goal=goal, provider=provider, model=model,
+            workspace=str(Path.cwd().resolve()),
+            max_steps=self._config.agent.max_steps,
+            tool_whitelist=tool_whitelist,
+        )
 
-            cancelled = False
-            try:
-                provider: LLMProvider = self._provider or DeepseekProvider(
-                    self._config.llm.default_model
-                )
-                if self._trace is not None:
-                    provider = TracingProvider(
-                        provider,
-                        self._trace,
-                        include_payload=self._config.trace.include_llm_payload,
-                    )
-                session_id_str = session.id if session is not None else ""
-                child_runs_dir = (
-                    store.runs_dir(session.id)
-                    if session is not None and store is not None
-                    else self._runs_dir
-                )
-                registry = self._build_registry(
-                    task_manager,
-                    session=session,
-                    store=store,
-                    run_id=run_id,
-                    provider=provider,
-                    bus=bus,
-                    child_runs_dir=child_runs_dir,
-                    session_id=session_id_str,
-                    tool_whitelist=tool_whitelist,
-                )
-                session_dir = (
-                    store.session_dir(session.id)
-                    if session is not None and store is not None
-                    else run_path
-                )
-                compactor = Compactor(bus, session_dir, session_id_str)
-                loop = AgentLoop(
-                    provider, registry, bus,
-                    permission_manager=self._permission_manager,
-                    compactor=compactor,
-                    compact_threshold=self._config.compaction.auto_threshold,
-                    session_id=session_id_str,
-                )
-                await loop.run(context)
-            except asyncio.CancelledError:
-                cancelled = True
-                if not context.is_done():
-                    context.mark_failed("cancelled")
-            except Exception:
-                logging.getLogger(__name__).exception(
-                    "agent run failed run_id=%s step=%d", run_id, context.step
-                )
-                if not context.is_done():
-                    context.mark_failed("llm_error")
+    # 新任务与恢复共用 Context 构建，已有系统提示优先使用冻结值
+    def _create_context(
+        self,
+        run: RunCheckpoint,
+        messages: list[dict[str, Any]],
+        *,
+        notes: str,
+        system_prompt_override: str | None,
+    ) -> ExecutionContext:
+        context = ExecutionContext(
+            run=run,
+            messages=messages,
+            session_notes=notes,
+            global_context=load_context_file(Path("~/.kama/context.md").expanduser()),
+            project_context=load_context_file(Path(".kama/context.md")),
+            system_prompt_override=system_prompt_override,
+        )
+        # 没有冻结提示才重新构建，已有值不随记忆文件变化而覆盖
+        if not run.system_prompt:
+            run.system_prompt = context.system_prompt(
+                "You are a helpful AI assistant. "
+                "Use the available tools to complete the user's goal. "
+                "When the goal is fully achieved, respond with a final answer "
+                "and do not call any more tools."
+            )
+        return context
 
-            await bus.publish(
-                RunFinishedEvent(
-                    run_id=run_id,
-                    status=context.status,
-                    reason=context.reason,
-                    steps=context.step,
+    # 更新唯一 Run 中的子任务标记，此观察路径不负责检查点提交
+    async def _track_children(self, context: ExecutionContext, event: Any) -> None:
+        run = context.run
+        if getattr(event, "type", "") == "subagent.started":
+            if event.parent_run_id == run.run_id or event.parent_run_id in run.subagents:
+                current = run.tools[run.tool_index] if run.tool_index < len(run.tools) else None
+                background = (
+                    current is not None
+                    and current.name == "spawn_agent"
+                    and bool(current.input.get("run_in_background"))
+                ) or run.subagents.get(event.parent_run_id) == "background"
+                run.subagents[event.run_id] = "background" if background else "running"
+        elif getattr(event, "type", "") == "subagent.finished":
+            if event.run_id in run.subagents and run.subagents[event.run_id] != "background":
+                run.subagents[event.run_id] = event.status
+
+    # 组装模型、工具和压缩器，Loop 直接持有 Context 与持久化对象
+    def _build_loop(
+        self,
+        context: ExecutionContext,
+        bus: EventBus,
+        run_path: Path,
+        persistence: RunPersistence | None,
+        *,
+        resuming: bool,
+    ) -> AgentLoop:
+        task_manager = TaskManager(run_path / ".tasks")
+        provider = self._create_provider(context.run, resuming=resuming)
+        session = persistence.session if persistence else None
+        store = persistence.store if persistence else None
+        registry = self._build_registry(
+            task_manager,
+            session=session,
+            store=store,
+            run_id=context.run.run_id,
+            provider=provider,
+            bus=bus,
+            child_runs_dir=store.runs_dir(session.id) if session and store else self._runs_dir,
+            session_id=session.id if session else "",
+            tool_whitelist=context.run.tool_whitelist,
+        )
+        self._save_tool_schemas(context.run, registry, persistence, resuming=resuming)
+        compactor = Compactor(
+            bus, store.session_dir(session.id) if session and store else run_path,
+            session.id if session else "",
+        )
+        return AgentLoop(
+            provider, registry, bus, context=context,
+            permission_manager=self._permission_manager,
+            compactor=compactor,
+            compact_threshold=self._config.compaction.auto_threshold,
+            session_id=session.id if session else "",
+            persistence=persistence,
+        )
+
+    # 校验原后端身份并重建客户端，凭证错误不允许退出整个 Core
+    def _create_provider(self, run: RunCheckpoint, *, resuming: bool) -> LLMProvider:
+        provider_name, model = self._provider_identity()
+        if resuming and (
+            provider_name != run.provider
+            or (self._provider is not None and model != run.model)
+        ):
+            run.reason = "provider or model changed; restore the original backend"
+            raise RuntimeError(run.reason)
+        try:
+            provider: LLMProvider = self._provider or DeepseekProvider(run.model)
+        except SystemExit as exc:
+            raise RuntimeError(str(exc)) from exc
+        if self._trace is not None:
+            provider = TracingProvider(
+                provider, self._trace, include_payload=self._config.trace.include_llm_payload,
+            )
+        return provider
+
+    # 恢复时校验冻结的工具定义，并在模型执行前提交当前 schema
+    def _save_tool_schemas(
+        self,
+        run: RunCheckpoint,
+        registry: ToolRegistry,
+        persistence: RunPersistence | None,
+        *,
+        resuming: bool,
+    ) -> None:
+        schemas = registry.tool_schemas()
+        if (
+            resuming and run.schemas_frozen
+            and json.dumps(schemas, sort_keys=True) != json.dumps(run.tool_schemas, sort_keys=True)
+        ):
+            run.reason = "tool schemas changed; restore compatible tools before resuming"
+            raise RuntimeError(run.reason)
+        run.tool_schemas = schemas
+        run.schemas_frozen = True
+        if persistence is not None:
+            persistence.save()
+
+    # 收敛会话与未知工具状态，先保存和导出历史，再发终态并传播取消
+    async def _finish_run(
+        self,
+        context: ExecutionContext,
+        bus: EventBus,
+        persistence: RunPersistence | None,
+        *,
+        cancelled: bool,
+    ) -> RunOutcome:
+        # 一次runner结束后整理最终状态
+        run = context.run
+        if run.status in ("success", "failed"):
+            run.phase = "finished"
+        else:
+            for tool in run.tools:
+                if tool.status == "executing":
+                    tool.status = "unknown"
+        if persistence is not None:
+            session = persistence.session
+            session.status = (
+                "interrupted" if run.status == "interrupted"
+                else "closed" if session.mode == "one_shot" else "waiting_for_input"
+            )
+            session.updated_at = _now()
+            # 先提交终态再导出和通知，通知丢失也能从磁盘确认结果
+            persistence.save()
+            persistence.export_history()
+
+        if run.status == "interrupted":
+            await bus.publish_safe(
+                RunInterruptedEvent(
+                    run_id=run.run_id,
+                    session_id=persistence.session.id if persistence else "",
+                    reason=run.reason or "interrupted",
+                    revision=persistence.checkpoint.revision if persistence else 0,
                     ts=_now(),
                 )
             )
-
-        # 把这次运行的的中间历史对话保存到session对应的thread.jsonl文件中，只保存后面新增的内容即可
-        if session is not None and store is not None:
-            store.append_messages(session.id, context.messages[prefill_len:], run_id=run_id)
-
+        else:
+            await bus.publish_safe(
+                RunFinishedEvent(
+                    run_id=run.run_id, status=run.status, reason=run.reason,
+                    steps=run.step, ts=_now(),
+                )
+            )
         if cancelled:
             raise asyncio.CancelledError()
-
-        return RunOutcome(
-            status=context.status,
-            result=context.result,
-            reason=context.reason,
-        )
+        return RunOutcome(status=run.status, result=run.result, reason=run.reason)

@@ -15,4 +15,10 @@ uv.lock
 .idea/
 .DS_Store
 *.log
-docs/learning/
+
+# Local practice files
+/workspace/
+
+# Only publish this stage's new documentation
+/docs/*
+!/docs/S8-*.md

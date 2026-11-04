@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict
 
 from kama_claude.core.agents.loader import AgentProfile, AgentProfileLoader
 from kama_claude.core.bus.events import SubagentFinishedEvent, SubagentStartedEvent
+from kama_claude.core.checkpoint.checkpoint import RunCheckpoint
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.events.writer import EventWriter
@@ -121,9 +122,10 @@ class SpawnAgentTool(BaseTool):
 
         child_run_id = new_run_id()
         child_context = ExecutionContext(
-            run_id=child_run_id,
-            goal=p.prompt,
-            max_steps=self._max_steps,
+            run=RunCheckpoint(
+                run_id=child_run_id, goal=p.prompt, max_steps=self._max_steps,
+                model="", workspace="",
+            ),
             system_prompt_override=profile.system_prompt if profile else None,
         )
 
@@ -142,6 +144,7 @@ class SpawnAgentTool(BaseTool):
             self._provider,
             child_registry,
             child_bus,
+            context=child_context,
             permission_manager=self._permission_manager,
             session_id=self._session_id,
         )
@@ -177,25 +180,28 @@ class SpawnAgentTool(BaseTool):
         # 前台agent的话就挂载在这里等待结果
         async with EventWriter(child_run_path / "events.jsonl") as writer:
             writer.subscribe(child_bus)
-            await child_loop.run(child_context)
+            await child_loop.run()
 
         await self._parent_bus.publish(
             SubagentFinishedEvent(
                 run_id=child_run_id,
                 parent_run_id=self._parent_run_id,
-                status=child_context.status,
+                status=child_context.run.status,
                 ts=_now(),
             )
         )
 
-        if child_context.status == "success":
+        if child_context.run.status == "success":
             return ToolResult(
-                content=child_context.result or "Subagent completed with no text output."
+                content=child_context.run.result or "Subagent completed with no text output."
             )
         return ToolResult(
             content=(
-                child_context.result
-                or f"Subagent failed (status={child_context.status}, reason={child_context.reason})"
+                child_context.run.result
+                or (
+                    f"Subagent failed (status={child_context.run.status}, "
+                    f"reason={child_context.run.reason})"
+                )
             ),
             is_error=True,
             error_type="runtime_error",
@@ -212,12 +218,12 @@ class SpawnAgentTool(BaseTool):
     ) -> None:
         async with EventWriter(run_path / "events.jsonl") as writer:
             writer.subscribe(bus)
-            await loop.run(context)
+            await loop.run()
         await self._parent_bus.publish(
             SubagentFinishedEvent(
                 run_id=run_id,
                 parent_run_id=self._parent_run_id,
-                status=context.status,
+                status=context.run.status,
                 ts=_now(),
             )
         )
@@ -330,4 +336,4 @@ class AgentResultTool(BaseTool):
                 is_error=True,
                 error_type="runtime_error",
             )
-        return ToolResult(content=context.result or "Subagent completed with no text result.")
+        return ToolResult(content=context.run.result or "Subagent completed with no text result.")

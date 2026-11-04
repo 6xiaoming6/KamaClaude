@@ -20,6 +20,12 @@ from kama_claude.core.bus.commands import (
     SessionCreateResult,
     SessionGetHistoryCommand,
     SessionGetHistoryResult,
+    SessionListCommand,
+    SessionListResult,
+    SessionOpenCommand,
+    SessionOpenResult,
+    SessionResumeCommand,
+    SessionResumeResult,
     SessionSendMessageCommand,
     SessionSendMessageResult,
 )
@@ -31,6 +37,8 @@ from kama_claude.core.bus.events import (
     LlmUsageEvent,
     LogLineEvent,
     RunFinishedEvent,
+    RunInterruptedEvent,
+    RunResumedEvent,
     RunStartedEvent,
     SessionClosedEvent,
     SessionCreatedEvent,
@@ -187,8 +195,17 @@ def generate() -> str:
         _model_section("SessionCloseCommand", SessionCloseCommand),
         "\n",
         _model_section("SessionCloseResult", SessionCloseResult),
+        _model_section("SessionListCommand", SessionListCommand),
+        _model_section("SessionListResult", SessionListResult),
+        _model_section("SessionOpenCommand", SessionOpenCommand),
+        _model_section("SessionOpenResult", SessionOpenResult),
+        _model_section("SessionResumeCommand", SessionResumeCommand),
+        _model_section("SessionResumeResult", SessionResumeResult),
         "\n## Server Push\n\n",
         "Events pushed from daemon to subscribed clients over the same TCP connection.\n\n",
+        "Session-scoped pushes include session_id and event_seq inside event. "
+        "SessionOpenResult.event_seq is the snapshot watermark; sequence numbers reset "
+        "on Core restart and are not a durable event log.\n\n",
         _model_section("EventPushEnvelope", EventPushEnvelope, event_push_example),
         "\n## IPC Events\n\n",
         "Events sent over the IPC socket (daemon → client).\n\n",
@@ -202,6 +219,8 @@ def generate() -> str:
             "type": "run.finished", "run_id": run_id,
             "status": "success", "reason": None, "steps": 2, "ts": ts}),
         "\n",
+        _model_section("RunInterruptedEvent", RunInterruptedEvent),
+        _model_section("RunResumedEvent", RunResumedEvent),
         _model_section("StepStartedEvent", StepStartedEvent,
             {"type": "step.started", "run_id": run_id, "step": 1, "ts": ts}),
         "\n",
@@ -261,6 +280,9 @@ def generate() -> str:
         "| -32602 | Invalid Params | Parameter validation failed |\n",
         "| -32603 | Internal Error | Handler raised an unhandled exception |\n",
         "| -32000 | Application Error | e.g. another run already in progress |\n",
+        "| -32030 | Recovery Required | Explicit recovery decision or compatible state required |\n",
+        "| -32031 | Recovery Conflict | Checkpoint revision changed; reopen session |\n",
+        "| -32032 | Checkpoint Unavailable | Checkpoint could not be read or committed |\n",
     ]
     return "".join(sections)
 

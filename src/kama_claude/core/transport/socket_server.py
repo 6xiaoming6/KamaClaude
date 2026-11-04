@@ -21,6 +21,7 @@ from kama_claude.core.bus.envelope import (
     JsonRpcSuccess,
     make_error,
 )
+from kama_claude.core.checkpoint.checkpoint import CheckpointError
 from kama_claude.core.trace.record import TraceRecord
 from kama_claude.core.trace.writer import TraceWriter
 from kama_claude.core.transport.ipc_broadcaster import IpcEventBroadcaster
@@ -113,7 +114,11 @@ class SocketServer:
         try:
             # 持续读取对应连接的请求
             await self._read_loop(reader, writer)
+        except ConnectionError as exc:
+            # 客户端退出可能触发连接重置，按正常断线清理，不取消业务 Run
+            logger.debug("client connection lost: %s (%s)", peer, exc)
         finally:
+            # 客户端退出后，捕获异常后把退出的客户端的writer移除，清理订阅
             self._active_writers.discard(writer)
             if self._broadcaster is not None:
                 self._broadcaster.unsubscribe(writer)
@@ -179,10 +184,14 @@ class SocketServer:
             )
             return
 
+        # 处理请求前，把当前连接的writer保存到_writer_var，便于后面广播器保存对应的writer
         _writer_var.set(writer)
         try:
             # 拿到处理该请求的方法返回的结果返回
             result = await handler(req.params)
+        except CheckpointError as e:
+            await self._send(writer, make_error(req.id, -32032, str(e)))
+            return
         except HandlerError as e:
             await self._send(writer, make_error(req.id, e.code, str(e), e.data))
             return

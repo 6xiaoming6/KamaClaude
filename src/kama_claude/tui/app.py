@@ -6,8 +6,6 @@ import logging
 import time
 from typing import Any
 
-log = logging.getLogger(__name__)
-
 from rich.markdown import Markdown
 from textual import events
 from textual.app import App, ComposeResult
@@ -16,11 +14,14 @@ from textual.containers import VerticalScroll
 from textual.css.query import NoMatches
 from textual.message import Message
 from textual.widget import Widget
-from textual.widgets import Label, Static, TextArea
+from textual.widgets import Button, Label, Static, TextArea
 
 from kama_claude.core.config import KamaConfig
 from kama_claude.core.skills.loader import SkillLoader
 from kama_claude.core.transport.socket_client import IpcError, SocketClient
+from kama_claude.tui.recovery import RecoveryActions, SessionPicker
+
+log = logging.getLogger(__name__)
 
 
 def _preview(s: str, n: int) -> str:
@@ -204,7 +205,10 @@ class PermissionSelect(Static):
 
     # 焦点到达时记录，用于确认 focus() 是否真正生效
     def on_focus(self, event: events.Focus) -> None:
-        log.debug("PermissionSelect.on_focus  has_focus=%s  app.focused=%r", self.has_focus, self.app.focused)
+        log.debug(
+            "PermissionSelect.on_focus  has_focus=%s  app.focused=%r",
+            self.has_focus, self.app.focused,
+        )
 
     # 焦点离开时记录，用于追踪是否被其他控件抢走焦点
     def on_blur(self, event: events.Blur) -> None:
@@ -466,7 +470,9 @@ class KamaTuiApp(App[None]):
 
     TITLE = "KamaClaude"
     BINDINGS = [
-        Binding("ctrl+q", "quit", "quit"),
+        Binding("ctrl+q", "quit", "退出", priority=True),
+        Binding("ctrl+o", "open_sessions", "历史会话", priority=True),
+        Binding("ctrl+w", "close_session", "关闭会话", priority=True),
     ]
     CSS = """
     Screen { background: $background; }
@@ -492,13 +498,20 @@ class KamaTuiApp(App[None]):
     """
 
     _BANNER = (
-        "[bold cyan]██╗  ██╗ █████╗ ███╗   ███╗ █████╗  ██████╗██╗      █████╗ ██╗   ██╗██████╗ ███████╗[/bold cyan]\n"
-        "[bold cyan]██║ ██╔╝██╔══██╗████╗ ████║██╔══██╗██╔════╝██║     ██╔══██╗██║   ██║██╔══██╗██╔════╝[/bold cyan]\n"
-        "[bold cyan]█████╔╝ ███████║██╔████╔██║███████║██║     ██║     ███████║██║   ██║██║  ██║█████╗  [/bold cyan]\n"
-        "[bold cyan]██╔═██╗ ██╔══██║██║╚██╔╝██║██╔══██║██║     ██║     ██╔══██║██║   ██║██║  ██║██╔══╝  [/bold cyan]\n"
-        "[bold cyan]██║  ██╗██║  ██║██║ ╚═╝ ██║██║  ██║╚██████╗███████╗██║  ██║╚██████╔╝██████╔╝███████╗[/bold cyan]\n"
-        "[bold cyan]╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝ ╚═════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝[/bold cyan]\n"
-        "[dim]  输入消息开始对话  ·  键入 / 触发 skill  ·  Ctrl+C 退出[/dim]"
+        '[bold cyan]██╗  ██╗ █████╗ ███╗   ███╗ █████╗  ██████╗'
+        '██╗      █████╗ ██╗   ██╗██████╗ ███████╗[/bold cyan]\n'
+        '[bold cyan]██║ ██╔╝██╔══██╗████╗ ████║██╔══██╗██╔════╝'
+        '██║     ██╔══██╗██║   ██║██╔══██╗██╔════╝[/bold cyan]\n'
+        '[bold cyan]█████╔╝ ███████║██╔████╔██║███████║██║     '
+        '██║     ███████║██║   ██║██║  ██║█████╗  [/bold cyan]\n'
+        '[bold cyan]██╔═██╗ ██╔══██║██║╚██╔╝██║██╔══██║██║     '
+        '██║     ██╔══██║██║   ██║██║  ██║██╔══╝  [/bold cyan]\n'
+        '[bold cyan]██║  ██╗██║  ██║██║ ╚═╝ ██║██║  ██║╚██████╗'
+        '███████╗██║  ██║╚██████╔╝██████╔╝███████╗[/bold cyan]\n'
+        '[bold cyan]╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝ ╚═════╝'
+        '╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝[/bold cyan]\n'
+        "[dim]  输入消息开始对话  ·  键入 / 触发 skill  ·  "
+        "Ctrl+Q 退出 · Ctrl+O 会话 · Ctrl+W 关闭会话[/dim]"
     )
 
     # 初始化连接参数和 TUI 内部状态
@@ -513,6 +526,15 @@ class KamaTuiApp(App[None]):
         self._pending_permission_blocks: dict[str, PermissionBlock] = {}
         self._session_id: str | None = None
         self._busy = False
+        self._opening = False
+        self._open_lock = asyncio.Lock()
+        self._completed_run_ids: set[str] = set()
+        self._recovering = False
+        self._event_buffer: list[dict[str, Any]] = []
+        self._last_event_seq = 0
+        self._snapshot_revision = 0
+        self._completed_tool_ids: set[str] = set()
+        self._current_llm_run_id: str | None = None
         self._last_context_pct: float = 0.0
         self._slash_items: list[tuple[str, str]] = []
         self._subagent_run_ids: dict[str, str] = {}  # child run_id -> description
@@ -601,14 +623,27 @@ class KamaTuiApp(App[None]):
         except Exception:
             pass
 
-    # 退出前尽力关闭当前 session，失败也不阻塞 TUI 退出
+    # 退出仅断开界面，保留可重新打开的会话
     async def action_quit(self) -> None:
-        if self._client is not None and self._session_id is not None:
-            try:
-                await self._client.send_command("session.close", {"session_id": self._session_id})
-            except (IpcError, RuntimeError, OSError):
-                self._append(Static("[yellow]warning: failed to close session[/yellow]"))
         self.exit()
+
+    # 打开历史选择器，不取消当前 Core 中的运行
+    def action_open_sessions(self) -> None:
+        if self._client is not None and not self._opening:
+            self.run_worker(self._pick_session(), name="session_picker", exclusive=False)
+
+    # 主动关闭会话与退出界面是两个不同动作
+    def action_close_session(self) -> None:
+        self.run_worker(self._close_session(), name="close_session", exclusive=False)
+
+    # 向 Core 发送显式关闭请求
+    async def _close_session(self) -> None:
+        if self._client is None or self._session_id is None:
+            return
+        try:
+            await self._client.send_command("session.close", {"session_id": self._session_id})
+        except (IpcError, RuntimeError, OSError) as exc:
+            self._append(Static(f"[red]close error: {exc}[/red]"))
 
     # 将输入框提交内容发送给当前 chat session；用 worker 发送，避免 await 阻塞 App 消息泵
     async def on_chat_text_area_submitted(self, event: ChatTextArea.Submitted) -> None:
@@ -657,22 +692,24 @@ class KamaTuiApp(App[None]):
 
     # 在 worker 中执行 IPC 发送，使 App 消息泵在 agent 运行期间仍能处理键盘/焦点等消息
     async def _do_send_message(self, content: str) -> None:
-        if self._client is None:
+        client, sid = self._client, self._session_id
+        if client is None:
             return
         try:
-            await self._client.send_command(
-                "session.send_message",
-                {"session_id": self._session_id, "content": content},
+            await client.send_command(
+                "session.send_message", {"session_id": sid, "content": content},
             )
-        except (IpcError, RuntimeError, OSError) as e:
-            self._busy = False
-            prompt = self._prompt()
-            if prompt is not None:
-                prompt.disabled = False
-                prompt.read_only = False
-                prompt.border_title = "type a message — enter to send, ⌘/⇧/⌥+enter for newline"
-            self._update_header("ready")
-            self._append(Static(f"[red]send error: {e}[/red]", classes="log-line"))
+        except (IpcError, RuntimeError, OSError) as exc:
+            if self._client is not client or self._session_id != sid:
+                return
+            self._append(Static(f"[red]send error: {exc}[/red]", classes="log-line"))
+            if isinstance(exc, ConnectionError):
+                self._update_header("disconnected")
+                prompt = self._prompt()
+                if prompt is not None:
+                    prompt.disabled = True
+            else:
+                await self._refresh_session()
 
     # 处理内联审批控件的用户决策：发送 IPC 响应并恢复输入框
     # self.post_message(self.Decided(...))后，框架会自动调用on_permission_select_decided
@@ -751,93 +788,267 @@ class KamaTuiApp(App[None]):
             "running": "yellow",
             "disconnected": "red",
             "connecting": "dim",
+            "interrupted": "yellow",
+            "closed": "dim",
         }.get(state, "dim")
         header.update(
             f"[bold]KamaClaude[/bold]  [dim]{self._host}:{self._port}[/dim]"
             f"{session}  [{color}]{state}[/{color}]"
         )
 
-    # 管理 SocketClient 生命周期：连接、订阅事件、断线重连
-    async def _socket_loop(self) -> None:
-        header = self.query_one("#header", Label)
+    # 选择历史或新建会话，仅用户明确操作才恢复中断任务，选择后并打开会话
+    async def _pick_session(self) -> None:
+        if self._client is None:
+            return
+        try:
+            # 向 Core 发送请求获取会话列表
+            result = await self._client.send_command("session.list", {})
+            sessions = result["sessions"]
+            # 显示选择框，等待用户选择
+            selected: str | None
+            # 没有历史会话默认创建新会话
+            if not sessions:
+                selected = "__new__"
+            else:
+                # 有历史会话，可以选择打开历史会话或者创建新的会话
+                selected = await self.push_screen_wait(SessionPicker(sessions))
+            # 创建新会话
+            if selected == "__new__":
+                created = await self._client.send_command("session.create", {"mode": "chat"})
+                selected = str(created["session_id"])
+            # 打开选中的会话
+            if selected is not None:
+                await self._open_session(selected)
+        except (IpcError, RuntimeError, OSError) as exc:
+            self._append(Static(f"[red]open error: {exc}[/red]"))
 
+    # 先缓冲推送，再用权威快照重建显示，最后应用水位之后的事件
+    async def _open_session(self, sid: str) -> None:
+        async with self._open_lock:
+            await self._load_session(sid)
+
+    # 在已持有打开锁时加载会话的历史快照并刷新组件，防止多个恢复通知交叉覆盖
+    async def _load_session(self, sid: str) -> None:
+        if self._client is None:
+            return
+        previous = self._session_id
+        # 加载期间先缓冲事件，避免历史快照与实时更新交叉覆盖
+        self._opening = True
+        self._event_buffer = []
+        self._session_id = sid
+        try:
+            data = await self._client.send_command("session.open", {"session_id": sid})
+            await self.query_one("#log-view", VerticalScroll).remove_children()
+            self._current_llm = None
+            self._current_llm_run_id = None
+            self._pending_tool_blocks.clear()
+            self._pending_permission_blocks.clear()
+            for select in list(self.query(PermissionSelect)):
+                select.remove()
+            for control in list(self.query(RecoveryActions)):
+                control.remove()
+            self._subagent_run_ids.clear()
+            self._subagent_start_times.clear()
+            self._snapshot_revision = int(data["revision"])
+            # 水位过滤旧事件，完成 ID 再防止迟到通知重复显示
+            self._last_event_seq = int(data.get("event_seq", 0))
+            self._completed_tool_ids.clear()
+            self._completed_run_ids.clear()
+            self._render_history(data["messages"])
+            # 拿到该会话检查点的运行状态
+            run = data.get("run")
+            if run:
+                self._completed_tool_ids = {
+                    tool["id"] for tool in run["tools"] if tool["status"] == "completed"
+                }
+                # 状态为interrupted就需要用户决定是否从中断恢复运行
+                if run["status"] == "interrupted":
+                    self._append(RecoveryActions(self._snapshot_revision, run))
+                # 状态为成功或者失败都说明上次的运行是完整的
+                elif run["status"] in ("success", "failed"):
+                    self._completed_run_ids.add(run["run_id"])
+                    self._append(Static(
+                        f"run {run['run_id']} — {run['status']} ({run['step']} steps)",
+                        classes="run-ok" if run["status"] == "success" else "run-err",
+                    ))
+            # 拿到整个该会话的整体状态
+            status = data["session"]["status"]
+            self._busy = bool(data["running"]) or status == "interrupted"
+            prompt = self._prompt()
+            if prompt is not None:
+                prompt.disabled = self._busy or status == "closed"
+                prompt.read_only = False
+                prompt.border_title = (
+                    "任务中断：请确认继续或终止" if status == "interrupted" else
+                    "session closed — Ctrl+O 选择会话" if status == "closed" else
+                    "agent is working..." if self._busy else "输入消息"
+                )
+                if not prompt.disabled:
+                    prompt.focus()
+            self._update_header(
+                "interrupted" if status == "interrupted" else
+                "closed" if status == "closed" else "running" if self._busy else "ready"
+            )
+            for permission in data.get("pending_permissions", []):
+                self._handle_event_inner(permission)
+        except BaseException:
+            self._session_id = previous
+            raise
+        finally:
+            self._opening = False
+            buffered, self._event_buffer = self._event_buffer, []
+            for event in buffered:
+                self._handle_event(event)
+
+    # 将已提交的消息与工具结果恢复成界面组件，不重放任何工具
+    def _render_history(self, messages: list[dict[str, Any]]) -> None:
+        blocks: dict[str, ToolCallBlock] = {}
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, str):
+                if message["role"] == "user":
+                    self._append(Static("> " + content, markup=False, classes="user-turn"))
+                elif content:
+                    block = LLMStreamBlock()
+                    block.append_token(content)
+                    block.finalize_markdown()
+                    self._append(block)
+                continue
+            for item in content or []:
+                if item.get("type") == "text":
+                    block = LLMStreamBlock()
+                    block.append_token(item.get("text", ""))
+                    block.finalize_markdown()
+                    self._append(block)
+                elif item.get("type") == "tool_use":
+                    tool = ToolCallBlock(item["name"], item.get("input", {}))
+                    blocks[item["id"]] = tool
+                    self._pending_tool_blocks[item["id"]] = tool
+                    self._append(tool)
+                elif item.get("type") == "tool_result":
+                    tool_id = item["tool_use_id"]
+                    result_block = blocks.get(tool_id)
+                    if result_block is not None:
+                        result_block.set_result(
+                            str(item.get("content", "")), 0,
+                            is_error=bool(item.get("is_error")),
+                        )
+                        self._pending_tool_blocks.pop(tool_id, None)
+
+    # 恢复按钮只提交明确决定，不在重连后自动启动执行
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        actions = {
+            "recovery-continue": "continue",
+            "recovery-retry": "retry_tool",
+            "recovery-abort": "abort",
+        }
+        action = actions.get(event.button.id or "")
+        if action is not None and not self._recovering:
+            self._recovering = True
+            self.run_worker(self._resume_session(action), name="resume", exclusive=False)
+
+    # 使用用户看到的修订提交决定，冲突后重新读取权威状态
+    async def _resume_session(self, action: str) -> None:
+        try:
+            if self._client is None or self._session_id is None:
+                return
+            await self._client.send_command("session.resume", {
+                "session_id": self._session_id,
+                "expected_revision": self._snapshot_revision, "action": action,
+            })
+            await self._open_session(self._session_id)
+        except (IpcError, RuntimeError, OSError) as exc:
+            if self._client is not None and self._session_id is not None:
+                try:
+                    await self._open_session(self._session_id)
+                except (IpcError, RuntimeError, OSError):
+                    pass
+            self._append(Static(f"[red]resume error: {exc}[/red]"))
+        finally:
+            self._recovering = False
+
+    # 中断通知后刷新快照，按钮与未知工具信息来自持久化状态
+    async def _refresh_session(self) -> None:
+        if self._session_id is not None:
+            try:
+                await self._open_session(self._session_id)
+            except (IpcError, RuntimeError, OSError):
+                log.exception("session refresh failed")
+
+    # 保留会话身份进行重连，Core 中的任务不随 TCP 连接取消
+    async def _socket_loop(self) -> None:
+        # 外层循环只在连接结束后创建新客户端，正常连接停在 receiver 等待处
         while True:
             client = SocketClient(self._host, self._port)
             self._client = None
             try:
                 await client.connect()
             except (ConnectionRefusedError, OSError):
-                log.warning("connection refused %s:%s, retrying", self._host, self._port)
                 self._update_header("disconnected")
                 await asyncio.sleep(2)
                 continue
-
-            log.info("connected to %s:%s", self._host, self._port)
             self._client = client
-            self._update_header("connecting")
-            loop_task = asyncio.create_task(client.run_event_loop())
 
+            # 初始化快照期间暂存实时事件
             async def on_event(event: dict[str, Any]) -> None:
-                self._handle_event(event)
+                if self._opening:
+                    self._event_buffer.append(event)
+                else:
+                    self._handle_event(event)
 
             client.on_event(on_event)
-
+            # 客户端创建事件循环，开始接收服务端发来的内容
+            receiver = asyncio.create_task(client.run_event_loop())
             try:
-                loop_task.add_done_callback(
-                    lambda t: log.error("loop_task failed: %s", t.exception())
-                    if not t.cancelled() and t.exception() is not None
-                    else None
-                )
-                params: dict[str, Any] = {
-                    "topics": [
-                        "session.*",
-                        "run.*",
-                        "step.*",
-                        "tool.*",
-                        "llm.token",
-                        "llm.usage",
-                        "log.*",
-                        "permission.*",
-                        "context.*",
-                        "subagent.*",
-                        "skill.*",
-                    ],
-                    "scope": "global",
-                }
                 if self._replay_run_id is not None:
-                    params["replay_from_run"] = self._replay_run_id
-                await client.send_command("event.subscribe", params)
-                created = await client.send_command("session.create", {"mode": "chat"})
-                self._session_id = str(created["session_id"])
-                log.info("session created session_id=%s", self._session_id)
-                prompt = self._prompt()
-                if prompt is not None:
-                    prompt.disabled = False
-                    prompt.read_only = False
-                    prompt.border_title = "type a message — enter to send, ⌘/⇧/⌥+enter for newline"
-                    prompt.focus()
-                self._update_header("ready")
-                await loop_task
-            except IpcError as e:
-                header.update(f"[bold]KamaClaude[/bold]  [red]subscribe error: {e}[/red]")
+                    await client.send_command("event.subscribe", {
+                        "topics": ["*"], "scope": f"run:{self._replay_run_id}",
+                        "replay_from_run": self._replay_run_id,
+                    })
+                    self._update_header("replay")
+                # 如果是重连，还会保存上一次的_session_id，直接打开会话
+                elif self._session_id is not None:
+                    try:
+                        await self._open_session(self._session_id)
+                    except IpcError as exc:
+                        self._append(Static(f"[red]open error: {exc}[/red]"))
+                        self._session_id = None
+                        await self._pick_session()
+                # 如果是重启客户端后第一次连接，需要选择打开历史会话还是创建新会话
+                else:
+                    await self._pick_session()
+                # 打开或创建会话后，就挂起持续接收服务端的消息，直到连接中断
+                # 此时前端tui还可以响应其他的事情
+                await receiver
+            except (IpcError, RuntimeError, OSError):
+                log.exception("socket session failed")
             finally:
-                if not loop_task.done():
-                    loop_task.cancel()
+                if not receiver.done():
+                    receiver.cancel()
+                try:
+                    await receiver
+                except asyncio.CancelledError:
+                    pass
                 self._client = None
-                self._session_id = None
+                self._break_llm()
                 prompt = self._prompt()
                 if prompt is not None:
                     prompt.disabled = True
-                    prompt.read_only = False
                     prompt.border_title = "disconnected, retrying..."
-                self._break_llm()
                 await client.close()
-
             self._update_header("disconnected")
             await asyncio.sleep(2)
 
     # 根据事件 type 路由到对应渲染逻辑；捕获异常防止 socket loop 因单个事件崩溃
     def _handle_event(self, event: dict[str, Any]) -> None:
+        if self._replay_run_id is None and self._session_id is not None:
+            if event.get("session_id") != self._session_id:
+                return
+        seq = event.get("event_seq")
+        if isinstance(seq, int):
+            if seq <= self._last_event_seq:
+                return
+            self._last_event_seq = seq
         try:
             self._handle_event_inner(event)
         except Exception:
@@ -848,6 +1059,9 @@ class KamaTuiApp(App[None]):
         t = event.get("type", "")
 
         if t == "llm.token":
+            if self._current_llm_run_id != event.get("run_id"):
+                self._break_llm()
+                self._current_llm_run_id = event.get("run_id")
             token = event.get("token", "")
             if self._current_llm is None:
                 llm_block = LLMStreamBlock()
@@ -868,6 +1082,19 @@ class KamaTuiApp(App[None]):
                 prompt.focus()
             self._update_header("ready")
 
+        elif t == "run.interrupted":
+            self._append(Static(
+                "任务已中断：" + str(event.get("reason", "interrupted")),
+                markup=False, classes="run-err",
+            ))
+            self._busy = True
+            self._update_header("interrupted")
+            self.run_worker(self._refresh_session(), name="refresh", exclusive=False)
+
+        elif t == "run.resumed":
+            self._busy = True
+            self._update_header("running")
+
         elif t == "session.closed":
             self._busy = False
             prompt = self._prompt()
@@ -875,7 +1102,7 @@ class KamaTuiApp(App[None]):
                 prompt.disabled = True
                 prompt.read_only = False
                 prompt.border_title = "session closed"
-            self._update_header("disconnected")
+            self._update_header("closed")
 
         elif t == "run.started":
             run_id = event.get("run_id", "")
@@ -947,6 +1174,9 @@ class KamaTuiApp(App[None]):
 
         elif t == "tool.call_finished":
             tool_use_id = str(event.get("tool_use_id", ""))
+            if tool_use_id in self._completed_tool_ids:
+                return
+            self._completed_tool_ids.add(tool_use_id)
             elapsed_ms = int(event.get("elapsed_ms") or 0)
             output = str(event.get("output") or "")
             if tool_use_id in self._pending_tool_blocks:
@@ -954,6 +1184,8 @@ class KamaTuiApp(App[None]):
                 tc_done.set_result(output, elapsed_ms)
 
         elif t == "tool.call_failed":
+            if event.get("retrying"):
+                return
             tool_use_id = str(event.get("tool_use_id", ""))
             elapsed_ms = int(event.get("elapsed_ms") or 0)
             error_msg = str(event.get("error_message") or "")
@@ -962,6 +1194,10 @@ class KamaTuiApp(App[None]):
                 tc_done.set_result(error_msg, elapsed_ms, is_error=True)
 
         elif t == "run.finished":
+            run_id = str(event.get("run_id", ""))
+            if run_id in self._completed_run_ids:
+                return
+            self._completed_run_ids.add(run_id)
             status = event.get("status", "")
             steps = event.get("steps", 0)
             reason = event.get("reason") or ""
@@ -1024,10 +1260,14 @@ class KamaTuiApp(App[None]):
             self._append(perm_block)
             select = PermissionSelect(tool_use_id)
             self._mount_permission_select(select)
-            log.debug("PermissionSelect mounted before #prompt  pending=%d", len(self._pending_permission_blocks))
+            log.debug(
+                "PermissionSelect mounted before #prompt  pending=%d",
+                len(self._pending_permission_blocks),
+            )
 
         elif t == "permission.denied":
-            # 处理超时或断连等非用户交互触发的 deny（用户主动 deny 已由 on_permission_select_decided 处理）
+            # 处理超时或断连等非用户交互触发的 deny
+            # 用户主动 deny 已由 on_permission_select_decided 处理
             tool_use_id = str(event.get("tool_use_id", ""))
             decision = str(event.get("decision", "denied"))
             if tool_use_id in self._pending_permission_blocks:

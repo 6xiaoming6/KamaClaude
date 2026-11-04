@@ -5,13 +5,14 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
+# prc请求消息格式
 class JsonRpcRequest(BaseModel):
     jsonrpc: Literal["2.0"] = "2.0"
     id: str
     method: str
     params: dict[str, Any] = Field(default_factory=dict)
 
-
+# 事件消息格式
 class EventPushEnvelope(BaseModel):
     kind: Literal["event"] = "event"
     event: dict[str, Any]  # Event.model_dump() 的序列化结果

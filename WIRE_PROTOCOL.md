@@ -359,6 +359,7 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
       "enum": [
         "active",
         "waiting_for_input",
+        "interrupted",
         "closed"
       ],
       "title": "Status",
@@ -567,6 +568,7 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
       "enum": [
         "active",
         "waiting_for_input",
+        "interrupted",
         "closed"
       ],
       "title": "Status",
@@ -580,10 +582,237 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
   "type": "object"
 }
 ```
+### SessionListCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "session.list",
+      "default": "session.list",
+      "title": "Type",
+      "type": "string"
+    }
+  },
+  "title": "SessionListCommand",
+  "type": "object"
+}
+```
+### SessionListResult
+
+| Field | Type | Required |
+|---|---|---|
+| `sessions` | `array` | yes |
+
+```json
+{
+  "properties": {
+    "sessions": {
+      "items": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "title": "Sessions",
+      "type": "array"
+    }
+  },
+  "required": [
+    "sessions"
+  ],
+  "title": "SessionListResult",
+  "type": "object"
+}
+```
+### SessionOpenCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "session.open",
+      "default": "session.open",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id"
+  ],
+  "title": "SessionOpenCommand",
+  "type": "object"
+}
+```
+### SessionOpenResult
+
+| Field | Type | Required |
+|---|---|---|
+| `session` | `object` | yes |
+| `revision` | `integer` | yes |
+| `messages` | `array` | yes |
+| `run` | `object | null` | yes |
+| `running` | `boolean` | yes |
+| `pending_permissions` | `array` | yes |
+| `event_seq` | `integer` | no |
+
+```json
+{
+  "properties": {
+    "session": {
+      "additionalProperties": true,
+      "title": "Session",
+      "type": "object"
+    },
+    "revision": {
+      "title": "Revision",
+      "type": "integer"
+    },
+    "messages": {
+      "items": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "title": "Messages",
+      "type": "array"
+    },
+    "run": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Run"
+    },
+    "running": {
+      "title": "Running",
+      "type": "boolean"
+    },
+    "pending_permissions": {
+      "items": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "title": "Pending Permissions",
+      "type": "array"
+    },
+    "event_seq": {
+      "default": 0,
+      "title": "Event Seq",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "session",
+    "revision",
+    "messages",
+    "run",
+    "running",
+    "pending_permissions"
+  ],
+  "title": "SessionOpenResult",
+  "type": "object"
+}
+```
+### SessionResumeCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+| `expected_revision` | `integer` | yes |
+| `action` | `string` | no |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "session.resume",
+      "default": "session.resume",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "expected_revision": {
+      "title": "Expected Revision",
+      "type": "integer"
+    },
+    "action": {
+      "default": "continue",
+      "enum": [
+        "continue",
+        "retry_tool",
+        "abort"
+      ],
+      "title": "Action",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "expected_revision"
+  ],
+  "title": "SessionResumeCommand",
+  "type": "object"
+}
+```
+### SessionResumeResult
+
+| Field | Type | Required |
+|---|---|---|
+| `run_id` | `string` | yes |
+| `status` | `string` | yes |
+| `revision` | `integer` | yes |
+
+```json
+{
+  "properties": {
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "status": {
+      "title": "Status",
+      "type": "string"
+    },
+    "revision": {
+      "title": "Revision",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "run_id",
+    "status",
+    "revision"
+  ],
+  "title": "SessionResumeResult",
+  "type": "object"
+}
+```
 
 ## Server Push
 
 Events pushed from daemon to subscribed clients over the same TCP connection.
+
+Session-scoped pushes include session_id and event_seq inside event. SessionOpenResult.event_seq is the snapshot watermark; sequence numbers reset on Core restart and are not a durable event log.
 
 ### EventPushEnvelope
 
@@ -797,6 +1026,104 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 }
 ```
 
+### RunInterruptedEvent
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `run_id` | `string` | yes |
+| `session_id` | `string` | yes |
+| `reason` | `string` | yes |
+| `revision` | `integer` | yes |
+| `ts` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "run.interrupted",
+      "default": "run.interrupted",
+      "title": "Type",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "reason": {
+      "title": "Reason",
+      "type": "string"
+    },
+    "revision": {
+      "title": "Revision",
+      "type": "integer"
+    },
+    "ts": {
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "session_id",
+    "reason",
+    "revision",
+    "ts"
+  ],
+  "title": "RunInterruptedEvent",
+  "type": "object"
+}
+```
+### RunResumedEvent
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `run_id` | `string` | yes |
+| `session_id` | `string` | yes |
+| `step` | `integer` | yes |
+| `ts` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "run.resumed",
+      "default": "run.resumed",
+      "title": "Type",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "step": {
+      "title": "Step",
+      "type": "integer"
+    },
+    "ts": {
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "session_id",
+    "step",
+    "ts"
+  ],
+  "title": "RunResumedEvent",
+  "type": "object"
+}
+```
 ### StepStartedEvent
 
 | Field | Type | Required |
@@ -1053,6 +1380,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | `error_class` | `string` | yes |
 | `error_message` | `string` | yes |
 | `elapsed_ms` | `integer` | yes |
+| `retrying` | `boolean` | no |
 | `attempt` | `integer` | no |
 | `ts` | `string` | yes |
 
@@ -1088,6 +1416,11 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "elapsed_ms": {
       "title": "Elapsed Ms",
       "type": "integer"
+    },
+    "retrying": {
+      "default": false,
+      "title": "Retrying",
+      "type": "boolean"
     },
     "attempt": {
       "default": 1,
@@ -1643,3 +1976,6 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | -32602 | Invalid Params | Parameter validation failed |
 | -32603 | Internal Error | Handler raised an unhandled exception |
 | -32000 | Application Error | e.g. another run already in progress |
+| -32030 | Recovery Required | Explicit recovery decision or compatible state required |
+| -32031 | Recovery Conflict | Checkpoint revision changed; reopen session |
+| -32032 | Checkpoint Unavailable | Checkpoint could not be read or committed |

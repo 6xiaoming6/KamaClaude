@@ -5,7 +5,7 @@ import datetime
 import logging
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC
 from pathlib import Path
 from typing import Any
@@ -31,6 +31,7 @@ class _PendingRequest:
     future: asyncio.Future[str]
     session_id: str
     tool_name: str
+    payload: dict[str, Any] = field(default_factory=dict)
 
 
 # 管理工具调用权限：策略评估、用户审批挂起、session 级和持久化 always 缓存、超时
@@ -97,7 +98,9 @@ class PermissionManager:
             # Tier 4: persistent always（跨 session）
             if tool_name in self._persistent_always:
                 cached = self._persistent_always[tool_name]
-                logger.debug("permission: persistent cache hit tool=%s decision=%s", tool_name, cached)
+                logger.debug(
+                    "permission: persistent cache hit tool=%s decision=%s", tool_name, cached,
+                )
                 return cached == "allow", f"auto_{cached}"
 
             # Tier 5: allow_patterns（bash only）
@@ -122,32 +125,33 @@ class PermissionManager:
             session_id=session_id,
             tool_name=tool_name,
         )
-        # 发布PermissionRequestedEvent
-        await event_emitter(
-            {
-                "type": "permission.requested",
-                "tool_use_id": tool_use_id,
-                "tool_name": tool_name,
-                "params": params,
-                "param_preview": param_preview(tool_name, params),
-                "session_id": session_id,
-                "ts": _now(),
-            }
-        )
-
-        # 等待用户的审批结果
+        payload = {
+            "type": "permission.requested", "tool_use_id": tool_use_id,
+            "tool_name": tool_name, "params": params,
+            "param_preview": param_preview(tool_name, params),
+            "session_id": session_id, "ts": _now(),
+        }
+        self._pending[tool_use_id].payload = payload
         try:
+            await event_emitter(payload)
             if self._timeout_s > 0:
                 raw = await asyncio.wait_for(future, timeout=self._timeout_s)
             else:
                 raw = await future
-        except asyncio.TimeoutError:
-            self._pending.pop(tool_use_id, None)
-            logger.info("permission: timeout tool_use_id=%s tool=%s", tool_use_id, tool_name)
+            return self._apply_response(raw, session_id, tool_name), raw
+        except TimeoutError:
             return False, "timeout"
-        # 拿到审批结果后先根据审批结果更新工具权限缓存，然后再返回最终是否放行
-        allowed = self._apply_response(raw, session_id, tool_name)
-        return allowed, raw
+        finally:
+            self._pending.pop(tool_use_id, None)
+            if not future.done():
+                future.cancel()
+
+    # 重连时只展示仍有效的审批，不持久化 Future 或一次性授权
+    def pending_for_session(self, session_id: str) -> list[dict[str, Any]]:
+        return [
+            dict(req.payload) for req in self._pending.values()
+            if req.session_id == session_id and not req.future.done()
+        ]
 
     # 处理客户端返回的审批决策，resolve 对应 Future
     def respond(self, tool_use_id: str, decision: str) -> None:
@@ -176,7 +180,9 @@ class PermissionManager:
                     save_policy_file(self._persistent_always, self._policy_file)
                     logger.info("permission: policy.toml written path=%s", self._policy_file)
                 except Exception:
-                    logger.exception("permission: failed to write policy.toml path=%s", self._policy_file)
+                    logger.exception(
+                        "permission: failed to write policy.toml path=%s", self._policy_file,
+                    )
             else:
                 logger.warning("permission: policy_file is None, skipping persistence")
         elif decision == "always_deny":
@@ -191,7 +197,9 @@ class PermissionManager:
                     save_policy_file(self._persistent_always, self._policy_file)
                     logger.info("permission: policy.toml written path=%s", self._policy_file)
                 except Exception:
-                    logger.exception("permission: failed to write policy.toml path=%s", self._policy_file)
+                    logger.exception(
+                        "permission: failed to write policy.toml path=%s", self._policy_file,
+                    )
             else:
                 logger.warning("permission: policy_file is None, skipping persistence")
         return allow

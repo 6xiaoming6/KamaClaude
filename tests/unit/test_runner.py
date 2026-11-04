@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
+import pytest
 from pydantic import BaseModel
 
+from kama_claude.core.bus.events import RunStartedEvent
 from kama_claude.core.config import KamaConfig
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock
 from kama_claude.core.runner import AgentRunner
+from kama_claude.core.session.model import Session
+from kama_claude.core.session.store import SessionStore
 
 # --- mock provider -----------------------------------------------------------
 
@@ -309,3 +314,78 @@ async def test_session_registers_note_save_tool(tmp_path: Path) -> None:
     await runner.run_and_capture("remember", run_id="run-1", session=session, store=store)
 
     assert "Use Python 3.12" in store.read_notes("sess-1")
+
+
+# 功能：验证模型客户端初始化退出时记录中断，并释放本轮订阅和事件写入器
+# 设计：用抛 SystemExit 的本地工厂模拟缺少密钥，结束后再发总线事件检查观察者不会泄漏
+async def test_provider_setup_failure_commits_interruption_and_cleans_observers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    session = Session("sess-setup", "chat", "active", "", "t", "t")
+    store.write_meta(session)
+    bus = EventBus()
+    received: list[BaseModel] = []
+    permanent: list[BaseModel] = []
+
+    # 收集仅应在本轮有效的额外观察事件
+    async def collect(event: BaseModel) -> None:
+        received.append(event)
+
+    # 收集生命周期长于本轮的总线事件
+    async def collect_permanent(event: BaseModel) -> None:
+        permanent.append(event)
+
+    # 模拟默认模型客户端发现缺少凭证并要求退出
+    def unavailable_provider(model: str) -> None:
+        raise SystemExit("missing API key")
+
+    monkeypatch.setattr("kama_claude.core.runner.DeepseekProvider", unavailable_provider)
+    bus.subscribe(collect_permanent)
+    runner = AgentRunner(_config(), bus=bus, extra_handlers=[collect])
+    outcome = await runner.run_and_capture(
+        "goal", run_id="run-setup", session=session, store=store,
+    )
+    cp = store.checkpoints.load(session.id)
+    assert outcome.status == "interrupted" and cp.run.status == "interrupted"
+    assert cp.run.reason == "run_error" and cp.session["status"] == "interrupted"
+    assert received[-1].type == "run.interrupted"
+    assert not any(event.type == "run.finished" for event in received)
+    event_path = store.runs_dir(session.id) / "run-setup" / "events.jsonl"
+    saved_events = event_path.read_text(encoding="utf-8")
+    before = len(received)
+    permanent_before = len(permanent)
+    await bus.publish_safe(RunStartedEvent(run_id="after", goal="probe", ts="t"))
+    assert len(received) == before and len(permanent) == permanent_before + 1
+    assert event_path.read_text(encoding="utf-8") == saved_events
+
+
+# 功能：验证会话执行被取消后先提交中断并发出通知，再继续向上传播取消
+# 设计：假模型在调用时取消，检查磁盘、历史文件和总线终态，避免拆分收尾后吞掉取消信号
+async def test_cancellation_commits_interruption_before_reraising(tmp_path: Path) -> None:
+    class CancellingProvider:
+        # 在模型调用处模拟 Core 正常关闭导致的取消
+        async def chat(self, **kwargs: object) -> LlmResponse:
+            raise asyncio.CancelledError()
+
+    store = SessionStore(tmp_path / "sessions")
+    session = Session("sess-cancel", "chat", "active", "", "t", "t")
+    store.write_meta(session)
+    received: list[BaseModel] = []
+
+    # 收集收尾时发布的中断事件
+    async def collect(event: BaseModel) -> None:
+        received.append(event)
+
+    runner = AgentRunner(
+        _config(), provider=CancellingProvider(), extra_handlers=[collect],
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await runner.run_and_capture(
+            "goal", run_id="run-cancel", session=session, store=store,
+        )
+    cp = store.checkpoints.load(session.id)
+    assert cp.run.status == "interrupted" and cp.run.reason == "core_stopped"
+    assert cp.messages[0] == {"role": "user", "content": "goal"}
+    assert (store.session_dir(session.id) / "thread.jsonl").exists()
+    assert received[-1].type == "run.interrupted"

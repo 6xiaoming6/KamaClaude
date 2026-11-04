@@ -3,30 +3,25 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from kama_claude.core.checkpoint.checkpoint import RunCheckpoint
+
 
 @dataclass
 class ExecutionContext:
-    run_id: str
-    goal: str
-    max_steps: int
-    prefill_messages: list[dict[str, Any]] = field(default_factory=list)
+    # 所有运行字段共用这一份 run，messages 只保存模型工作历史
+    run: RunCheckpoint
+    messages: list[dict[str, Any]] = field(default_factory=list)
     session_notes: str = ""
     global_context: str = ""
     project_context: str = ""
-    messages: list[dict[str, Any]] = field(default_factory=list)
-    step: int = 0
-    status: str = "running"  # "running" | "success" | "failed"
-    reason: str | None = None
-    result: str = ""
     # skill 或 subagent 角色可覆盖默认 system prompt
     system_prompt_override: str | None = None
 
-    # 初始化消息历史，优先使用 session 完整回放内容
+    # 复制输入历史，新会话则以当前 Run 目标建立第一条消息
     def __post_init__(self) -> None:
-        if self.prefill_messages:
-            self.messages = [dict(m) for m in self.prefill_messages]
-        elif not self.messages:
-            self.messages.append({"role": "user", "content": self.goal})
+        self.messages = [dict(message) for message in self.messages]
+        if not self.messages:
+            self.messages.append({"role": "user", "content": self.run.goal})
 
     # 返回当前 run 的 system prompt；有 override 时跳过 base，直接注入记忆层
     def system_prompt(self, base: str) -> str:
@@ -74,13 +69,20 @@ class ExecutionContext:
 
     # 返回 True 表示 loop 应停止（状态不再是 running）
     def is_done(self) -> bool:
-        return self.status != "running"
+        return self.run.status != "running"
 
     # 将 run 标记为成功
     def mark_success(self) -> None:
-        self.status = "success"
+        self.run.status = "success"
+        self.run.phase = "finished"
 
     # 将 run 标记为失败并记录原因
     def mark_failed(self, reason: str) -> None:
-        self.status = "failed"
-        self.reason = reason
+        self.run.status = "failed"
+        self.run.reason = reason
+        self.run.phase = "finished"
+
+    # 记录中断原因并保留原阶段，供恢复时从该位置继续
+    def mark_interrupted(self, reason: str) -> None:
+        self.run.status = "interrupted"
+        self.run.reason = reason

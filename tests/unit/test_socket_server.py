@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import socket
+from unittest.mock import Mock
 
+import pytest
+
+from kama_claude.core.transport.ipc_broadcaster import IpcEventBroadcaster
 from kama_claude.core.transport.socket_server import SocketServer
 
 
@@ -44,3 +48,49 @@ async def test_no_broadcaster_server_starts_and_stops() -> None:
     server = SocketServer("127.0.0.1", port)
     await server.start()
     await server.stop()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ConnectionResetError(22, "peer reset (WinError 64)"),
+        ConnectionAbortedError("peer aborted"),
+        BrokenPipeError("peer closed"),
+    ],
+)
+# 功能：验证客户端连接重置或中止时正常退出连接协程，并清理 writer 和事件订阅
+# 设计：用真实 StreamReader 注入网络异常，模拟 Windows 断开行为，检查 Task 不再以异常结束
+async def test_connection_loss_is_handled_and_cleans_up(error: ConnectionError) -> None:
+    broadcaster = IpcEventBroadcaster()
+    server = SocketServer("127.0.0.1", 1, broadcaster=broadcaster)
+    reader = asyncio.StreamReader()
+    reader.set_exception(error)
+    writer = Mock(spec=asyncio.StreamWriter)
+    broadcaster.subscribe(writer, ["*"])
+
+    task = asyncio.create_task(server._handle_connection(reader, writer))
+    await task
+
+    assert task.exception() is None
+    assert writer not in server._active_writers
+    assert not broadcaster._subscriptions
+    writer.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("error", [RuntimeError("bug"), asyncio.CancelledError()])
+# 功能：验证连接处理不吞掉程序错误和取消信号，异常传播时仍清理连接
+# 设计：对相同读取入口注入非网络异常，约束修复仅覆盖预期断线而非宽泛屏蔽错误
+async def test_other_connection_errors_still_propagate(error: BaseException) -> None:
+    broadcaster = IpcEventBroadcaster()
+    server = SocketServer("127.0.0.1", 1, broadcaster=broadcaster)
+    reader = asyncio.StreamReader()
+    reader.set_exception(error)
+    writer = Mock(spec=asyncio.StreamWriter)
+    broadcaster.subscribe(writer, ["*"])
+
+    with pytest.raises(type(error)):
+        await server._handle_connection(reader, writer)
+
+    assert writer not in server._active_writers
+    assert not broadcaster._subscriptions
+    writer.close.assert_called_once_with()
