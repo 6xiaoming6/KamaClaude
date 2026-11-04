@@ -19,6 +19,7 @@ from textual.widgets import Button, Label, Static, TextArea
 from kama_claude.core.config import KamaConfig
 from kama_claude.core.skills.loader import SkillLoader
 from kama_claude.core.transport.socket_client import IpcError, SocketClient
+from kama_claude.tui.memory import MemoryScreen
 from kama_claude.tui.recovery import RecoveryActions, SessionPicker
 
 log = logging.getLogger(__name__)
@@ -41,7 +42,8 @@ def _param_summary(tool_name: str, params: dict[str, Any], max_len: int = 72) ->
         "write_file": ("path",),
         "list_dir": ("path", "max_depth"),
         "bash": ("command",),
-        "note_save": ("content",),
+        "memory_read": ("scope", "key", "query"),
+        "memory_write": ("scope", "key", "action"),
     }
     keys = keys_by_tool.get(tool_name, ())
     parts = [f"{key}={params[key]!r}" for key in keys if key in params]
@@ -104,9 +106,6 @@ class ToolCallBlock(Widget):
 
     # 生成摘要行文本
     def _summary(self) -> str:
-        if self._tool_name == "note_save" and self._finished and not self._is_error:
-            return f"  [green]remembered[/green]  [dim]{self._elapsed_ms}ms[/dim]"
-
         params_pre = _param_summary(self._tool_name, self._params)
         line = f"  [dim]tool[/dim] [bold]{self._tool_name}[/bold]"
         if params_pre:
@@ -555,7 +554,10 @@ class KamaTuiApp(App[None]):
 
     # 构建斜杠命令候选列表：内建命令 + 所有已注册 skill
     def _build_slash_items(self) -> list[tuple[str, str]]:
-        items: list[tuple[str, str]] = [("compact", "compress context window")]
+        items: list[tuple[str, str]] = [
+            ("compact", "compress context window"),
+            ("memory", "查看 Markdown 记忆与 Run 注入快照"),
+        ]
         try:
             loader = SkillLoader()
             for skill in loader.list_all_skills():
@@ -569,6 +571,9 @@ class KamaTuiApp(App[None]):
 
     # 根据 / 前缀查询字符串挂载、更新或移除自动补全弹窗
     def on_chat_text_area_slash_changed(self, event: ChatTextArea.SlashChanged) -> None:
+        # 模态查看窗口打开后，忽略旧聊天输入框迟到的补全事件
+        if self._prompt() is None or isinstance(self.screen, MemoryScreen):
+            return
         query = event.query
         if query is None:
             try:
@@ -650,6 +655,11 @@ class KamaTuiApp(App[None]):
         content = event.value.strip()
         if not content:
             return
+        if content == "/memory":
+            event.text_area.text = ""
+            if self._client is not None and self._session_id is not None:
+                self.run_worker(self._do_memory(), name="memory", exclusive=False)
+            return
         # 检测 /compact 指令
         if content == "/compact":
             event.text_area.text = ""
@@ -669,24 +679,28 @@ class KamaTuiApp(App[None]):
         self._update_header("running")
         self.run_worker(self._do_send_message(content), name="send_message", exclusive=False)
 
+    # 只读查看记忆，RPC 不产生用户消息或 Agent Run
+    async def _do_memory(self) -> None:
+        client, sid = self._client, self._session_id
+        if client is None or sid is None:
+            return
+        try:
+            data = await client.send_command("memory.inspect", {"session_id": sid, "limit": 50})
+            if self._client is client and self._session_id == sid:
+                await self.push_screen(MemoryScreen(client, sid, data))
+        except (IpcError, RuntimeError, OSError) as exc:
+            self._append(Static("记忆读取失败：" + str(exc), markup=False, classes="run-err"))
+
     # 在 worker 中执行手动压缩命令，完成后显示结果横幅
     async def _do_compact(self) -> None:
         if self._client is None or self._session_id is None:
             return
-        self._append(Static("[dim]⚡ compacting context...[/dim]", classes="log-line"))
         try:
-            result = await self._client.send_command(
+            # 进度与结果统一由会话事件展示，RPC 响应不再重复追加横幅
+            await self._client.send_command(
                 "session.compact",
                 {"session_id": self._session_id, "focus": ""},
             )
-            summary_tokens = result.get("summary_tokens", 0)
-            saved_tokens = result.get("saved_tokens", 0)
-            self._last_context_pct = 0.0
-            self._append(Static(
-                f"[bold cyan]⚡ Context compacted[/bold cyan]"
-                f"  [dim]summary={summary_tokens} tokens  saved≈{saved_tokens} tokens[/dim]",
-                classes="log-line",
-            ))
         except (IpcError, RuntimeError, OSError) as e:
             self._append(Static(f"[red]compact error: {e}[/red]", classes="log-line"))
 
@@ -854,6 +868,7 @@ class KamaTuiApp(App[None]):
             self._last_event_seq = int(data.get("event_seq", 0))
             self._completed_tool_ids.clear()
             self._completed_run_ids.clear()
+            # 后端返回 thread 完整原文；压缩后的工作上下文只供模型使用
             self._render_history(data["messages"])
             # 拿到该会话检查点的运行状态
             run = data.get("run")
@@ -1229,14 +1244,56 @@ class KamaTuiApp(App[None]):
                 classes="usage",
             ))
 
+        elif t == "context.compaction_started":
+            self._append(Static(
+                "[dim]⚡ 正在整理上下文，先尝试程序处理…[/dim]", classes="log-line",
+            ))
+
+        elif t == "context.compaction_failed":
+            reasons = {
+                "no_old_history": "没有需要压缩的旧历史",
+                "incomplete_tool_batch": "工具消息尚未完整配对",
+                "recent_context_too_large": "必须保留的近期原文过大",
+                "summary_input_too_large": "旧历史超出单次摘要请求预算",
+                "summary_request_failed": "摘要请求失败",
+                "summary_incomplete": "摘要输出未完整结束",
+                "empty_summary": "摘要为空",
+                "summary_too_large": "摘要超过长度上限",
+                "insufficient_reduction": "压缩后没有明显缩小",
+                "context_budget_exceeded": "整理后仍超出输入预算",
+                "required_context_too_large": "固定提示与必须保留的近期原文已超预算",
+                "provider_unavailable": "需要摘要，但模型配置不可用",
+                "below_threshold": "空间充足，无需继续压缩",
+                "auto_disabled": "自动压力处理已关闭",
+            }
+            reason = reasons.get(str(event.get("reason")), str(event.get("reason", "")))
+            retained = (
+                "程序化缩减已保存，未采用新摘要" if event.get("applied_stages")
+                else "未替换工作历史"
+            )
+            usage = "已尝试 LLM 摘要" if event.get("llm_used") else "未调用 LLM"
+            self._append(Static(
+                f"⚡ 上下文整理：{reason}；{retained}；{usage}。",
+                classes="log-line", markup=False,
+            ))
+
         elif t == "context.compacted":
             orig = event.get("original_tokens", 0)
             summary = event.get("summary_tokens", 0)
-            self._last_context_pct = 0.0
+            remaining = event.get("remaining_tokens", summary)
+            stage_names = {
+                "tool_preview": "长结果预览", "deduplicate": "重复结果去重",
+                "tool_archive": "旧结果归档", "llm_summary": "LLM 摘要",
+            }
+            stages = " → ".join(stage_names.get(s, s) for s in event.get("applied_stages", []))
+            label = (
+                "已生成 LLM 摘要" if event.get("llm_used", True)
+                else "程序整理完成（未调用 LLM）"
+            )
             self._append(Static(
-                f"[bold cyan]⚡ Context compacted[/bold cyan]"
-                f"  [dim]original≈{orig} tokens → summary={summary} tokens[/dim]",
-                classes="log-line",
+                f"⚡ {label}  history≈{orig} → {remaining} tokens; summary≈{summary}"
+                + (f"  {stages}" if stages else ""),
+                classes="log-line", markup=False,
             ))
 
         elif t == "permission.requested":

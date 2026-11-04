@@ -66,6 +66,7 @@ class AnthropicProvider:
         *,
         step: int = 0,
         system: str | None = None,
+        max_output_tokens: int = 8_192,
     ) -> LlmResponse:
         await bus.publish(
             LlmModelSelectedEvent(run_id=run_id, model=self._model, strategy="static", ts=_now())
@@ -87,7 +88,7 @@ class AnthropicProvider:
 
         kwargs: dict[str, object] = {
             "model": self._model,
-            "max_tokens": 8192,
+            "max_tokens": max_output_tokens,
             "system": system_blocks,
             "messages": messages,
         }
@@ -152,7 +153,9 @@ class AnthropicProvider:
                 )
             elif block.type == "thinking":
                 # thinking blocks must be passed back verbatim in subsequent requests
-                thinking_blocks.append({"type": "thinking", "thinking": block.thinking, "signature": block.signature})
+                thinking_blocks.append({
+                    "type": "thinking", "thinking": block.thinking, "signature": block.signature,
+                })
 
         # 把模型的文字回复和工具调用单独拆分出来，包装成LlmResponse返回
         return LlmResponse(
@@ -252,13 +255,14 @@ class OpenaiProvider:
         *,
         step: int = 0,
         system: str | None = None,
+        max_output_tokens: int = 8_192,
     ) -> LlmResponse:
         await bus.publish(
             LlmModelSelectedEvent(run_id=run_id, model=self._model, strategy="static", ts=_now())
         )
         kwargs: dict[str, object] = {
             "model": self._model,
-            "max_completion_tokens": 4096,
+            "max_completion_tokens": max_output_tokens,
             "messages": self._convert_messages(messages, system=system),
             "stream": True,
             "stream_options": {"include_usage": True},

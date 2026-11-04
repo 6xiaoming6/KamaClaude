@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from kama_claude.core.checkpoint.checkpoint import Checkpoint
@@ -31,11 +31,12 @@ class RunPersistence:
         # 复用唯一 Run 对象，不逐字段复制或维护另一份状态
         self.checkpoint.run = self.context.run
         self.checkpoint.session = self.session.to_dict()
-        self.store.checkpoints.save(self.checkpoint)
+        self.store.save_checkpoint(self.checkpoint)
 
-    # 保留原有 thread.jsonl 历史输出，导出不替代检查点提交
-    def export_history(self) -> None:
+    # 只登记本次新产生的原文，不从可能已压缩的 messages 反推增量
+    def record_message(self, role: str, content: str | list[dict[str, Any]]) -> None:
+        self.store.record_message(self.checkpoint, role, content, self.context.run.run_id)
+
+    # 元数据仍供外部查看，完整对话已在每次 save 时追加
+    def export_metadata(self) -> None:
         self.store.export_meta(self.session)
-        self.store.export_messages(
-            self.session.id, self.context.messages, self.context.run.run_id,
-        )

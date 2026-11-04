@@ -1,188 +1,147 @@
-# KamaClaude
+# KamaClaude · S9
 
-一个基于 Python 的本地 AI Agent 项目：用户通过终端输入目标，Core 调用大模型，由模型选择工具完成任务，前端实时展示回答、工具进度和权限审批。
+一个 Python 本地 AI Agent：TUI 展示对话、工具进度和审批，Core 调用模型与工具。前后端使用 TCP / JSON-RPC / NDJSON 通信。
 
-本分支为 **S8：基于检查点的会话断点恢复**。在 S0–S7 的通信、Agent 循环、TUI、会话、权限、记忆与压缩、Skills、子 Agent 和 MCP 基础上，支持 TUI 断线后重新观察，以及 Core 重启后由用户确认继续主 Agent 任务。
+S9 改进**上下文组织、分层压缩与 Markdown 记忆**：先用程序缩减工具输出，再按需请求摘要；记忆按条目维护、按预算注入。沿用 S8 检查点恢复，不增加额外服务。
 
-## 先抓住这几个关键点
-
-- **前后端分进程**：`kama-tui` 是主要交互界面；`kama-core` 执行任务。两者通过 TCP 连接，以 JSON-RPC 表达请求，以 NDJSON 的换行分隔消息；CLI 用于快速调试。
-- **Session → Run → Step**：Session 是一段会话；每次用户输入触发一个 Run；一个 Run 可以包含多个 Step，每个 Step 调用一次模型，并处理这次回复里的工具调用。
-- **Runner 组装，Loop 执行**：Runner 准备历史、模型、工具和记录器；Loop 反复执行“调用模型 → 执行工具 → 追加结果”，直到模型结束或达到步数限制。
-- **模型提出调用，程序真正执行**：模型只返回工具名和参数；代码负责查找工具、校验参数、检查权限、执行并返回结果。
-- **请求和事件分开理解**：请求用于发起操作、取得响应；事件用于持续报告 token、工具状态、审批和任务结束。它们共用同一条 TCP 连接。
-
-## 一次任务怎样完整执行
+## 四层处理顺序
 
 ```mermaid
 flowchart TD
-    UI["TUI：输入目标、查看进度、处理审批"]
-    IPC["SocketClient ↔ SocketServer<br/>TCP / JSON-RPC / NDJSON"]
-    SM["SessionManager：保存输入、管理会话"]
-    RUN["AgentRunner：加载历史和记忆、组装依赖"]
-    LOOP["AgentLoop + ExecutionContext"]
-    LLM["Provider：调用大模型"]
-    TOOL["invoke_tool：参数校验 → 权限检查 → 工具执行"]
-    SAVE["提交最终检查点、更新会话状态"]
-    BUS["EventBus"]
-    PUSH["IpcEventBroadcaster：按订阅推送"]
-    UI --> IPC --> SM --> RUN --> LOOP
-    LOOP --> LLM
-    LLM -->|工具调用| TOOL
-    TOOL -->|结果追加到上下文| LOOP
-    CP["CheckpointStore：原子快照"]
-    SM -->|接受目标即保存初始 Run| CP
-    LOOP -->|模型完整回复、逐工具、压缩边界| CP
-    LOOP -->|收到最终回答或达到步数上限| SAVE
-    LOOP -.发布执行事件.-> BUS
-    TOOL -.发布工具与审批事件.-> BUS
-    BUS --> PUSH --> UI
+    PREP[Loop 准备本次模型请求] --> L1[第一层：长结果归档，保留头尾预览]
+    L1 --> C1{仍达到软阈值？}
+    C1 -->|否| SAVE[有变化则提交检查点]
+    C1 -->|是| L2[第二层：精确去重旧只读结果]
+    L2 --> C2{仍达到软阈值？}
+    C2 -->|否| SAVE
+    C2 -->|是| L3[第三层：旧结果替换为归档短记录]
+    L3 --> C3{仍达到软阈值？}
+    C3 -->|否| SAVE
+    C3 -->|是| L4[第四层：尝试一次 LLM 旧历史摘要]
+    L4 --> SAVE
+    SAVE --> HARD{输入是否在硬预算内？}
+    HARD -->|是| MODEL[调用普通任务模型]
+    HARD -->|否| STOP[中断，保留 llm 阶段与 Step]
+    MODEL -->|工具调用| TOOL[执行工具并保存完整结果]
+    TOOL --> PREP
 ```
 
-1. **连接并打开会话**：TUI 连接 Core 并启动接收循环；选择旧会话或创建新会话，再通过 `session.open` 同步快照并绑定会话事件。断线后重新绑定原会话。
-2. **发送用户输入**：TUI 调用 `session.send_message`。SocketServer 按方法名分发给 CoreApp，再进入 SessionManager；同一会话通过锁防止同时执行多个 Run。
-3. **准备上下文**：SessionManager 解析 `/skill`，将用户输入和初始 Run 原子提交到 `checkpoint.json` 后才登记后台任务。Runner 加载历史、笔记、全局/项目记忆，创建工具注册表和 ExecutionContext。
-4. **开始模型与工具循环**：Loop 把消息和工具 Schema 交给 Provider。模型返回工具调用时，`invoke_tool()` 校验参数、检查权限、限时执行工具，并将结果追加到上下文，供下一步模型继续判断。
-5. **实时反馈与审批**：执行过程向 EventBus 发布事件；广播器将匹配订阅的事件推给 TUI。需要审批时，Core 等待 Future，TUI 发回 `permission.respond` 后继续执行。
-6. **按需扩展与压缩**：模型可以调用 MCP 工具或 `spawn_agent`；启用自动压缩时，Loop 会在工具结果追加后检查上下文占比。用户也能在会话空闲时输入 `/compact` 手动压缩。
-7. **结束或中断**：模型返回 `end_turn` 时标记成功，达到步数上限时失败；异常中断保留恢复位置。先提交结果再发布终态；chat 会话等待输入，one_shot 会话关闭。中断任务由用户确认后续跑。
-
-`session.send_message` 的响应要等本次 Run 执行完，但中间事件会持续推送。CLI 的 `agent.run` 则先返回 `run_id`，再通过事件观察任务结束。
-
-## 关键组件与代码入口
-
-### 前端、通信和会话
-
-| 组件 | 负责什么、怎样衔接 | 代码入口 |
+| 层 | 处理什么 | 是否额外请求模型 |
 | --- | --- | --- |
-| TUI / CLI | Textual 实现终端界面，展示流式输出、工具与任务状态、审批选项；CLI 复用通信客户端，便于调试 | [tui/app.py](./src/kama_claude/tui/app.py)、[cli/main.py](./src/kama_claude/cli/main.py) |
-| SocketClient / SocketServer | 编解码 NDJSON、发送请求和分发响应；客户端按请求 ID 完成等待中的 Future，同时处理事件推送；服务端并发处理请求，使审批响应能在任务执行中被接收 | [transport/](./src/kama_claude/core/transport/) |
-| 协议模型 | Pydantic 定义命令、结果、事件与消息信封，约束前后端交换的数据结构 | [bus/](./src/kama_claude/core/bus/) |
-| CoreApp | Core 启动入口；创建共享总线、会话/权限/MCP 管理器和 TCP 服务，注册 RPC 方法，退出时清理资源 | [app.py](./src/kama_claude/core/app.py) |
-| SessionManager | 管理磁盘会话索引、会话锁和后台 Run；提供列表、打开、手动恢复、关闭和压缩 | [session/manager.py](./src/kama_claude/core/session/manager.py) |
-| SessionStore | 优先读取权威检查点，导入旧历史并导出兼容文件；单独保存会话笔记 | [session/store.py](./src/kama_claude/core/session/store.py) |
+| 长结果预览 | 超过 8,000 字符的工具正文，归档后保留头尾合计 4,000 字符 | 否 |
+| 精确去重 | 旧只读工具的名称、参数、完整输出都相同的结果，保留最新一份 | 否 |
+| 旧结果归档 | 旧工具正文替换为工具名、调用 ID 和全文位置 | 否 |
+| LLM 摘要 | 前三层结束后仍达到软阈值的旧历史 | 是，最多尝试一次 |
 
-### 模型执行、工具和权限
+程序层保留所有真实用户消息、assistant 内容、工具参数及配对结构；保护最近两组完整模型交互，不进一步缩减错误结果。去重仅缩减模型输入，**不跳过实际工具执行**。
 
-| 组件 | 负责什么、怎样衔接 | 代码入口 |
+核心主线仍是 **SessionManager → AgentRunner → AgentLoop**。分层协调在 Compactor，候选提交仍走原检查点入口。
+
+## Markdown 记忆与注入
+
+每条记忆一个 Markdown 文件，可按 key 新增、更新、删除，文件可直接阅读：
+
+| 层级 | 目录 | 默认自动注入预算 |
 | --- | --- | --- |
-| CheckpointStore | 原子保存上下文、执行阶段、工具结果和修订号，恢复不依赖 Trace | [checkpoint.py](./src/kama_claude/core/checkpoint/checkpoint.py) |
-| SessionRecovery | 识别 Core 重启遗留的运行，校验继续、重试未知工具或终止的决定；不创建 Task | [recovery.py](./src/kama_claude/core/checkpoint/recovery.py) |
-| AgentRunner | 每次 Run 的组装入口；准备 Context、TaskManager、Provider、工具表、压缩器和事件文件，调用 Loop 并保存结果 | [runner.py](./src/kama_claude/core/runner.py) |
-| RunPersistence | 绑定本轮 Context 与会话存储，直接提交检查点并导出历史 | [persistence.py](./src/kama_claude/core/checkpoint/persistence.py) |
-| ExecutionContext | 持有工作历史和唯一的 RunCheckpoint（context.run）；提供消息操作、状态方法和提示构建 | [context.py](./src/kama_claude/core/context.py) |
-| AgentLoop | 驱动多步交互；记录模型回复，执行工具调用并回填 `tool_result`，检查结束条件与自动压缩条件 | [loop.py](./src/kama_claude/core/loop.py) |
-| LLMProvider | 提供统一 `chat()` 接口和 `LlmResponse`；Anthropic、OpenAI、DeepSeek 适配各自格式，模型流式输出转为事件 | [llm/](./src/kama_claude/core/llm/) |
-| BaseTool / ToolRegistry | BaseTool 声明名称、描述、参数 Schema 和执行方法；Registry 按名称注册/查找工具，并向模型提供 Schema | [tools/base.py](./src/kama_claude/core/tools/base.py)、[tools/registry.py](./src/kama_claude/core/tools/registry.py) |
-| invoke_tool | 工具统一执行入口：参数校验 → 权限检查 → 超时控制 → 调用；发布事件，将错误转为 ToolResult，部分运行错误和限流错误可退避重试 | [tools/invocation.py](./src/kama_claude/core/tools/invocation.py) |
-| 内置工具 / TaskManager | 文件读取、目录浏览、文件写入、命令执行、笔记保存；四个 Task 工具通过 TaskManager 维护任务清单和状态。清单条目区别于 `asyncio.Task` | [tools/builtin/](./src/kama_claude/core/tools/builtin/)、[task/](./src/kama_claude/core/task/) |
-| PermissionManager / policy / storage | policy 定义规则与决策类型，storage 读写持久化决策；运行时由 Manager 的 `check_and_wait()` 检查规则/缓存，必要时等待用户审批 | [permissions/](./src/kama_claude/core/permissions/) |
+| 全局偏好 | `~/.kama/memory/<key>.md` | 512 估算 token |
+| 项目事实 | `<项目>/.kama/memory/<key>.md` | 1,024 估算 token |
+| 会话决定 | `<会话目录>/memory/<key>.md` | 512 估算 token |
 
-### 记忆与扩展能力
+新 Run 读取一次，固定条目优先，再按更新时间排序；全文放不下用 key 与摘要，再不足则省略。详情通过 `memory_read` 获取，维护通过 `memory_write`；不额外调用 LLM 提炼记忆。
 
-| 组件 | 负责什么、怎样衔接 | 代码入口 |
-| --- | --- | --- |
-| Memory / Notes | Runner 将全局、项目 Markdown 和会话笔记加入系统提示；`note_save` 可保存会话笔记。当前是文本注入，没有向量检索 | [memory/loader.py](./src/kama_claude/core/memory/loader.py)、[note_save.py](./src/kama_claude/core/tools/builtin/note_save.py) |
-| Budget / Compactor | Budget 截断加载历史中的过长工具结果；Compactor 调模型生成摘要。手动压缩备份并改写会话历史，自动与手动压缩后的工作历史都提交检查点，后续 Run 与 Core 重启继续使用 | [compact/](./src/kama_claude/core/compact/) |
-| SkillLoader | 从项目、用户、内置目录按优先级读取 Markdown Skill；`/名称 参数` 为本次 Run 提供提示模板和工具白名单 | [skills/](./src/kama_claude/core/skills/) |
-| AgentProfileLoader | 从 TOML 读取子 Agent 角色的提示和工具白名单，内置 planner、executor、reviewer；它与 Skill 模板承担不同的配置职责 | [agents/](./src/kama_claude/core/agents/) |
-| SpawnAgentTool / BackgroundTaskRegistry | `spawn_agent` 在同一 Core 进程内创建独立上下文、工具表和 Loop；前台调用等待结果，后台调用返回 ID，再由 `agent_result` 查询 | [subagent/](./src/kama_claude/core/subagent/) |
-| McpServerManager / McpClient / McpTool | Manager 管连接生命周期；Client 完成握手、工具发现和调用；McpTool 将外部工具包装成 BaseTool，进入统一工具执行路径 | [mcp/](./src/kama_claude/core/mcp/) |
+```toml
+[memory]
+global_tokens = 512
+project_tokens = 1024
+session_tokens = 512
+```
 
-### 事件与可观测性
+环境变量为 `KAMA_MEMORY_GLOBAL_TOKENS`、`KAMA_MEMORY_PROJECT_TOKENS`、`KAMA_MEMORY_SESSION_TOKENS`；0 关闭对应层的自动注入。完整请求仍受 S9 总预算控制。
 
-| 组件 | 负责什么、怎样衔接 | 代码入口 |
-| --- | --- | --- |
-| EventBus | Core 内部的发布/订阅总线，按注册顺序 `await` 订阅者；让执行逻辑只需发布事件，由各订阅者负责展示或记录 | [events/bus.py](./src/kama_claude/core/events/bus.py) |
-| IpcEventBroadcaster | 本身是总线订阅者；保存客户端连接及订阅条件，按 topic 和 scope 过滤后，经 TCP 将事件推送到客户端 | [transport/ipc_broadcaster.py](./src/kama_claude/core/transport/ipc_broadcaster.py) |
-| EventWriter / TraceWriter / TracingProvider | EventWriter 记录业务事件；TraceWriter 通过队列记录 IPC、事件、模型调用等链路信息；TracingProvider 包装真实 Provider 以记录模型请求/响应 | [events/writer.py](./src/kama_claude/core/events/writer.py)、[trace/](./src/kama_claude/core/trace/) |
-| Config / Logging | 汇总默认值、全局/项目 TOML、`.env` 和系统环境变量；初始化 Core 日志。已有系统环境变量优先于 `.env`，TUI 单独写日志文件 | [config.py](./src/kama_claude/core/config.py)、[logging_setup.py](./src/kama_claude/core/logging_setup.py) |
+TUI 空闲时输入 **`/memory`**，只读查看当前条目、正文和最近 Run 实际注入的快照，支持作用域切换与分页。查看不调用模型、不创建 Run。恢复旧 Run 沿用冻结提示，不重新加载记忆。
 
-事件广播可以记成：`Loop / 工具 → EventBus.publish() → 广播器.handle() → TCP → 客户端接收循环 → TUI 更新`。总线在 Core 内，前端通过广播器间接接收事件。
+旧 `note_save`、旧 loader 和笔记读写接口已移除；旧 `context.md`、`notes.md` 留在原处，不迁移、不再自动读取。旧 Run 冻结了已删除工具时会明确拒绝恢复，可终止后开始新任务。
 
-权限审批在此基础上形成往返：`工具等待 Future → permission.requested 事件 → TUI 选择 → permission.respond 请求 → Manager 完成 Future → 放行或拒绝工具`。
+会话和项目写入默认允许；全局写入默认审批，并与项目许可分开缓存。记忆文件使用原子替换；删除记忆不删除完整对话。
 
-## 启动与使用
+## 启动与操作
 
-环境：Python **3.12**、uv，支持 Windows、macOS 和 Linux。从项目根目录运行，项目配置及相对文件路径均受当前工作目录影响；Windows Core 可通过 Ctrl+C 进入清理流程。
+环境：Python 3.12、uv；从项目根目录启动。
 
 ```text
 uv sync
-```
-
-在项目根目录创建 `.env`，例如使用仓库当前默认的 DeepSeek Provider：
-
-```dotenv
-DEEPSEEK_API_KEY=替换为你的密钥
-KAMA_LLM_DEFAULT_MODEL=deepseek-flash
-KAMA_MAX_STEPS=20
-```
-
-模型名为项目示例，需按实际账号可用模型填写。Runner 默认实例化 `DeepseekProvider`，但配置内模型默认值和 `.env.example` 仍是 Anthropic 示例，因此需显式设置模型名。当前没有通过环境变量切换 Provider 的开关。
-
-终端一启动 Core：
-
-```text
 uv run kama-core
 ```
 
-终端二启动主要交互界面：
+另开终端：
 
 ```text
 uv run kama-tui
 ```
 
-默认连接 `127.0.0.1:7437`。启动时可选择历史会话；Ctrl+O 切换会话，Ctrl+Q 退出界面但保留会话，Ctrl+W 显式关闭会话。中断任务点击“继续任务”，结果未知的工具需核实后重试或终止。可输入普通目标、`/review` 等 Skill，或在会话空闲时用 `/compact` 压缩历史；工具审批在 TUI 中完成。
+Runner 默认使用 DeepSeek 的 Anthropic 兼容接口。本地 `.env` 设置 `DEEPSEEK_API_KEY` 和 `KAMA_LLM_DEFAULT_MODEL`，模型名按账号实际可用值填写，密钥不上传。
 
-CLI 调试也需要 Core 运行：
+TUI 启动后选择历史会话或新建会话。Ctrl+O 切换，Ctrl+Q 退出界面，Ctrl+W 主动关闭会话。空闲时输入 `/compact` 手动整理。
 
-```text
-uv run kama ping
-uv run kama run --goal "请使用 read_file 读取 README.md，并介绍这个项目"
-uv run kama chat
+手动也走四层流程，空间足够就返回“无需继续压缩，未调用 LLM”，不会强制摘要，也不必创建模型 SDK。界面显示实际处理阶段，以及是否调用 LLM。
+
+## 默认配置
+
+项目 `.kama/config.toml`：
+
+```toml
+[compaction]
+auto_threshold = 0.8
+prune_target_ratio = 0.65
+context_window_tokens = 65536
+output_reserve_tokens = 8192
+keep_recent_groups = 2
+summary_max_tokens = 2048
+tool_result_limit = 8000
+tool_result_keep = 4000
 ```
 
-三家 Provider 均位于 [provider.py](./src/kama_claude/core/llm/provider.py)：Anthropic 使用 Messages API，OpenAI 在类内转换消息与工具格式，DeepSeek 复用 Anthropic 兼容接口。切换其他平台需在代码中注入对应 Provider；OpenAI 适配还需安装 `openai` SDK，当前依赖未自动包含它。
+- 硬输入预算 = 窗口 − 输出预留 − 1,024，默认 **56,320**。
+- 自动压力阈值 = 硬预算 × 80%，默认约 **45,056**。
+- 程序层尽量处理到硬预算 × 65%，默认约 **36,608**；某层结束后只要已低于软阈值，就不进入下一层。
+- `prune_target_ratio` 必须大于零且小于有效软阈值。
+- `auto_threshold=0`：自动只做长结果预览和硬预算检查；手动仍按 80% 压力阈值执行四层。
+- 程序层始终保护最近两组。LLM 后备沿用近期原文约 8,192 token 的额度，必要时减少为一组，仍不得拆开工具批次。
+- 窗口是应用预算，需按实际模型配置；字符估算不等于精确计费 token。
 
-## 数据保存在哪里
+环境变量：`KAMA_COMPACT_THRESHOLD`、`KAMA_COMPACT_PRUNE_TARGET`、`KAMA_COMPACT_WINDOW_TOKENS`、`KAMA_COMPACT_OUTPUT_TOKENS`、`KAMA_COMPACT_KEEP_GROUPS`、`KAMA_COMPACT_SUMMARY_TOKENS`、`KAMA_COMPACT_TOOL_LIMIT`、`KAMA_COMPACT_TOOL_KEEP`。
 
-`~` 表示当前用户主目录；以下为默认位置，可配置的路径以实际配置为准。
+## 保存与失败处理
 
-| 路径 | 内容 |
-| --- | --- |
-| `~/.kama/sessions/<session_id>/checkpoint.json` | 权威工作历史、会话与 Run 状态、工具游标和结果 |
-| 同目录 `meta.json` | 兼容元数据输出；恢复以检查点为准 |
-| 同目录 `thread.jsonl` / `notes.md` | 模型对话历史 / 主动保存的会话笔记 |
-| 同目录 `runs/<run_id>/events.jsonl` | 本次 Run 的业务事件；`.tasks/` 保存任务清单 |
-| `~/.kama/context.md` / `.kama/context.md` | 全局记忆 / 当前项目记忆，需自行维护文件 |
-| `~/.kama/policy.toml` | 持久化权限决策 |
-| `~/.kama/traces/daemon.jsonl` | IPC、事件和模型调用追踪 |
-| `~/.kama/logs/core.log` / `tui.log` | 后端与前端的程序日志 |
+- `checkpoint.json` 保存模型工作上下文和恢复状态，允许预览、去重和摘要，版本仍为 1。
+- `thread.jsonl` 始终追加完整对话原文：用户输入、模型完整回复、工具调用与完整结果。压缩不重写它。
+- TUI 重新打开或重连会话时，从 `thread.jsonl` 显示完整历史；继续运行时，模型读取检查点中的压缩上下文。
+- 原文先随检查点提交，再同步追加到 thread；重启按固定消息 ID 补写，不重复记录。仍保留 `meta.json`、笔记和 Run 记录。
+- 完整输出先保存到对应 `runs/<rid>/outputs/<哈希>.txt`；短记录可以独立定位全文，不依赖另一条重复结果还在上下文中。
+- 摘要成功后额外导出 `runs/<rid>/summary_<时间>.md`，恢复仍依赖检查点。
+- 程序缩减成功、摘要失败时，程序结果仍提交；硬预算内继续任务，超限则中断。
+- 归档或检查点失败立即停止；不发成功通知，不重跑已完成工具。
+- 压缩不重置 Run ID、Step 或工具游标，恢复继续使用原冻结系统提示。
 
-Core 可用 `KAMA_SESSIONS_DIR` 指定会话根目录。直接在代码中运行不带 Session 的 Runner 时，Run 文件默认保存在当前目录的 `runs/<run_id>/`。
+## 代码与学习文档
 
-## 当前边界与后续改进
+- [S9 Markdown 记忆与注入](./docs/S9-Markdown记忆与注入.md)：新旧对照、文件模板、工具维护、注入与恢复链路。
+- [S9 分层压缩说明](./docs/S9-上下文组织与压缩.md)：完整流程、核心方法、两个例子和故障边界。
+- [Compactor](./src/kama_claude/core/compact/compactor.py)：分层候选生成与最终摘要。
+- [程序处理](./src/kama_claude/core/compact/pruning.py)：精确去重与旧结果归档。
+- [预算与全文归档](./src/kama_claude/core/compact/budget.py)。
+- [S8 恢复基线](./docs/S8-中断与恢复链路速查.md)、[运行说明](./RUNBOOK.md)、[通信协议](./WIRE_PROTOCOL.md)。
 
-- **断点恢复**：已支持主 Agent 的逐模型/逐工具检查点、TUI 重连和 Core 重启后的手动恢复；不恢复外部进程，不自动重放结果未知的操作，不恢复未完成子任务树。
-- **上下文保存**：自动/手动压缩后的工作历史由检查点保存，不再按旧下标追加；自动压缩默认仍关闭，请求前预算和摘要质量仍可改进。
-- **后台子任务**：任务注册表属于每个 Runner，而会话每次输入都会创建新 Runner，跨 Run 查询和生命周期管理仍需完善；子 Agent 共享进程和工作区，不提供进程级隔离。
-- **权限与 MCP**：审批是应用层控制，尚无操作系统沙箱；MCP 当前支持 stdio 和自定义 TCP NDJSON 连接，未实现 Streamable HTTP，工具结果的 `isError` 等语义仍需完善。
-
-## 开发与文档
+## 验证
 
 ```text
-uv run python -X utf8 -m pytest tests/unit tests/integration/test_s8_recovery.py tests/integration/test_s5_permission_flow.py tests/integration/test_s4_session_ipc.py tests/integration/test_s2_dual_process.py tests/integration/test_ping_roundtrip.py -q
-uv run ruff check src tests scripts
+uv run python -X utf8 -m pytest tests/unit tests/integration/test_s9_memory.py tests/integration/test_s9_compaction.py tests/integration/test_s8_recovery.py tests/integration/test_s5_permission_flow.py tests/integration/test_s4_session_ipc.py tests/integration/test_s2_dual_process.py tests/integration/test_ping_roundtrip.py -q
 uv run mypy src
 uv run python -X utf8 scripts/gen_protocol_doc.py --check
 ```
 
-测试命令验证代码行为，真实模型端到端测试还需对应 API key 和模型配置。当前非付费验证为 340 项通过；mypy 和协议检查通过。全仓仍有 19 条既有 Ruff 问题，S8 改动文件检查通过；Windows 下协议文档检查使用 `-X utf8` 避免默认编码差异。
+在 26 份相同只读结果的假模型对比中，摘要调用由 1 次变为 0 次，程序层读取了 13 次归档全文。详细的前后输入量见学习文档。此结果不代表真实模型质量或账单收益：程序保留的历史可能更长，后续请求、缓存与重新读取的代价也需考虑。
 
-- [S8 中断与恢复链路速查](./docs/S8-中断与恢复链路速查.md)：从选择历史会话到恢复执行，以及中断前后的状态变化。
-- [S8 断点恢复使用与实现](./docs/S8-断点恢复使用与实现.md)：使用方法、提交边界、恢复接口和验证。
-- [二次开发改进大纲](./docs/S8-二次开发改进大纲.md)：S0–S7 的改进选题记录，按改进前的基线阅读。
-- [RUNBOOK.md](./RUNBOOK.md)：配置、运行与故障排查。
-- [WIRE_PROTOCOL.md](./WIRE_PROTOCOL.md)：根据协议模型生成的 IPC 说明。
+验证结果：**443 项非付费测试通过**；mypy（94 个源码文件）、协议一致性和改动文件 Ruff 通过。覆盖 Markdown 文件保护、注入预算、工具维护、冻结提示、TUI 和真实 TCP/Core 重启。全仓 Ruff 仍有 6 条既有问题，位于未修改的 MCP、Skill loader 和旧权限测试中。
 
-本分支新增文档限于 `docs/S8-*.md`；面试文档更新放在 `dev`。`dev` 独立维护项目总览，不合入 S8 学习说明与链路速查。本地 `workspace/` 练习、运行数据和密钥不上传；忽略规则不影响已跟踪文件，合并时仍需核对文档范围。
+本轮不做旧完整对话删除、语义去重、向量检索或子 Agent 自动压缩。新增学习文档限于 `docs/S9-*.md`；本地练习、运行数据和密钥不上传。

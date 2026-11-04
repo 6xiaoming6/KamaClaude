@@ -5,10 +5,14 @@ import logging
 import uuid
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from kama_claude.core.bus.envelope import HandlerError
 from kama_claude.core.bus.events import (
+    ContextCompactedEvent,
+    ContextCompactionFailedEvent,
+    ContextCompactionStartedEvent,
     RunFinishedEvent,
     RunInterruptedEvent,
     SessionClosedEvent,
@@ -20,7 +24,12 @@ from kama_claude.core.bus.events import (
 )
 from kama_claude.core.checkpoint.checkpoint import Checkpoint, CheckpointError
 from kama_claude.core.checkpoint.recovery import RECOVERY_REQUIRED, SessionRecovery
+from kama_claude.core.compact.budget import estimate_tokens
+from kama_claude.core.compact.compactor import Compactor, write_summary
+from kama_claude.core.config import CompactionConfig
 from kama_claude.core.events.bus import EventBus
+from kama_claude.core.memory.model import SCOPES, MemoryError, MemoryScope
+from kama_claude.core.memory.store import MemoryStore
 from kama_claude.core.runs import new_run_id
 from kama_claude.core.session.model import Session, SessionMode
 from kama_claude.core.session.store import SessionStore
@@ -52,6 +61,7 @@ class SessionManager:
         provider: LLMProvider | None = None,
         provider_factory: Callable[[], LLMProvider] | None = None,
         permission_manager: PermissionManager | None = None,
+        compaction: CompactionConfig | None = None,
     ) -> None:
         self._store = store
         self._recovery = SessionRecovery(store)
@@ -60,6 +70,7 @@ class SessionManager:
         self._provider = provider
         self._provider_factory = provider_factory
         self._permissions = permission_manager
+        self._compaction = compaction or CompactionConfig()
         self._sessions: dict[str, Session] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._tasks: dict[str, asyncio.Task[str]] = {}
@@ -270,7 +281,7 @@ class SessionManager:
             rows.append({"id": sid, "title": sid, "status": "unavailable", "error": error})
         return sorted(rows, key=lambda row: row.get("updated_at", ""), reverse=True)
 
-    # 返回已提交历史、执行位置以及当前仍有效的审批请求
+    # 完整对话来自 thread，执行位置和恢复状态来自检查点
     async def open(self, sid: str) -> dict[str, Any]:
         self._get_session(sid)
         cp = self._recovery.recover_orphaned_run(sid, running=self.is_running(sid))
@@ -281,10 +292,40 @@ class SessionManager:
         return {
             "session": cp.session,
             "revision": cp.revision,
-            "messages": cp.messages,
+            "messages": self._store.read_history(sid),
             "run": cp.run.model_dump(mode="json") if cp.run else None,
             "running": self.is_running(sid),
             "pending_permissions": pending,
+        }
+
+    # 只读查看当前 Markdown 和最近 Run 注入快照，不触发恢复、模型或文件写入
+    def inspect_memory(
+        self, sid: str, *, scope: MemoryScope | None = None, key: str | None = None,
+        query: str = "", offset: int = 0, limit: int = 20,
+    ) -> dict[str, Any]:
+        self._get_session(sid)
+        if key is not None and scope is None:
+            raise HandlerError(-32602, "reading a memory key requires scope")
+        cp = self._store.checkpoints.load(sid)
+        memory = MemoryStore(Path.cwd(), self._store.session_dir(sid))
+        try:
+            if key is not None:
+                assert scope is not None
+                entry = memory.read(scope, key, offset=offset)
+                layers = []
+            else:
+                entry = None
+                layers = [
+                    memory.list(item, query=query, offset=offset, limit=limit)
+                    for item in ((scope,) if scope is not None else SCOPES)
+                ]
+        except MemoryError as exc:
+            raise HandlerError(-32040, str(exc)) from exc
+        return {
+            "workspace": str(Path.cwd().resolve()), "layers": layers, "entry": entry,
+            "run_id": cp.run.run_id if cp.run else None,
+            "snapshot": cp.run.memory_snapshot.model_dump(mode="json")
+            if cp.run and cp.run.memory_snapshot is not None else None,
         }
 
     # 在会话锁内应用恢复决定，保存成功后才启动原 Run
@@ -301,7 +342,7 @@ class SessionManager:
             cp = self._store.checkpoints.load(sid)
             # 检查这次恢复是否合法，然后把检查点改成用户选择的状态
             run = self._recovery.prepare_resume(cp, expected_revision, action)
-            self._store.checkpoints.save(cp)
+            self._store.save_checkpoint(cp)
             self._sessions[sid] = Session.from_dict(cp.session)
             if action == "abort":
                 await self._bus.publish_safe(
@@ -341,40 +382,66 @@ class SessionManager:
             raise HandlerError(SESSION_BUSY, "session busy")
         if session.status in ("closed", "interrupted"):
             raise HandlerError(RECOVERY_REQUIRED, "open an idle session before compaction")
+        async with self._locks[sid]:
+            from kama_claude.core.bus.commands import SessionCompactResult
+            cp = self._store.ensure_checkpoint(sid)
+            run_id = cp.run.run_id if cp.run else ""
+            run_path = self._store.runs_dir(sid) / (run_id or "manual")
+            config = self._compaction
+
+            await self._bus.publish_safe(ContextCompactionStartedEvent(
+                session_id=sid, run_id=run_id,
+                original_tokens=estimate_tokens(cp.messages), ts=_now(),
+            ))
+            result = await Compactor(config).prepare_context(
+                cp.messages, self._provider, focus=focus, manual=True,
+                outputs_dir=run_path / "outputs",
+                system=cp.run.system_prompt if cp.run else "",
+                tool_schemas=cp.run.tool_schemas if cp.run else [],
+                provider_factory=self._get_compaction_provider,
+            )
+            # 程序缩减也要提交；摘要失败不丢弃已经完成的程序处理
+            if result.compacted:
+                self._store.write_compacted(sid, result.messages)
+            if result.summary_text:
+                write_summary(run_path, result.summary_text)
+            if result.compacted and result.reason in ("", "below_threshold", "auto_disabled"):
+                await self._bus.publish_safe(ContextCompactedEvent(
+                    session_id=sid, run_id=run_id,
+                    original_tokens=result.original_token_estimate,
+                    summary_tokens=result.summary_tokens,
+                    remaining_tokens=result.remaining_token_estimate,
+                    applied_stages=result.applied_stages, llm_used=result.llm_used, ts=_now(),
+                ))
+            else:
+                await self._bus.publish_safe(ContextCompactionFailedEvent(
+                    session_id=sid, run_id=run_id, reason=result.reason,
+                    applied_stages=result.applied_stages, llm_used=result.llm_used, ts=_now(),
+                ))
+            return SessionCompactResult(
+                summary_tokens=result.summary_tokens,
+                saved_tokens=max(
+                    0, result.original_token_estimate - result.remaining_token_estimate,
+                ),
+                compacted=result.compacted,
+                original_tokens=result.original_token_estimate,
+                remaining_tokens=result.remaining_token_estimate,
+                reason=result.reason,
+                applied_stages=result.applied_stages, llm_used=result.llm_used,
+            )
+
+    # 仅在程序层不足时取得摘要 Provider，已有实例继续复用
+    def _get_compaction_provider(self) -> LLMProvider:
         if self._provider is None and self._provider_factory is not None:
             self._provider = self._provider_factory()
         if self._provider is None:
-            raise HandlerError(-32020, "provider not available for compaction")
-        async with self._locks[sid]:
-            from kama_claude.core.bus.commands import SessionCompactResult
-            from kama_claude.core.compact.compactor import Compactor
+            raise RuntimeError("provider not available for compaction")
+        return self._provider
 
-            result = await Compactor(
-                self._bus,
-                self._store.session_dir(sid),
-                sid,
-            ).compact_messages(self._store.read_messages(sid), self._provider, focus=focus)
-            if result is None:
-                raise HandlerError(-32021, "compaction failed")
-            self._store.write_compacted(
-                sid,
-                [
-                    {"role": "user", "content": result.summary_text},
-                    {
-                        "role": "assistant",
-                        "content": "Understood, I'll continue from this summary.",
-                    },
-                ],
-            )
-            return SessionCompactResult(
-                summary_tokens=result.summary_tokens,
-                saved_tokens=max(0, result.original_token_estimate - result.summary_tokens),
-            )
-
-    # 读取权威工作历史
+    # 查询界面用的完整对话，不能返回压缩后的模型工作历史
     async def get_history(self, sid: str) -> list[dict[str, Any]]:
         self._get_session(sid)
-        return self._store.read_messages(sid)
+        return self._store.read_history(sid)
 
     # Core 关闭时等待所有受管任务完成检查点收尾
     async def shutdown(self) -> None:

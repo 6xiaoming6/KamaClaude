@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Discriminator
+from pydantic import BaseModel, Discriminator, Field
 
 
 # 描述 Core 启动后的监听地址和版本信息
@@ -178,13 +178,36 @@ class SessionClosedEvent(BaseModel):
     ts: str
 
 
-# 上下文压缩完成，记录原历史估算和摘要的 Token 数
+# 正在生成压缩候选，尚未替换或提交历史
+class ContextCompactionStartedEvent(BaseModel):
+    type: Literal["context.compaction_started"] = "context.compaction_started"
+    session_id: str
+    run_id: str
+    original_tokens: int
+    ts: str
+
+
+# 分层处理未全部完成，说明原因及已提交的程序层
+class ContextCompactionFailedEvent(BaseModel):
+    type: Literal["context.compaction_failed"] = "context.compaction_failed"
+    session_id: str
+    run_id: str
+    reason: str
+    applied_stages: list[str] = Field(default_factory=list)
+    llm_used: bool = False
+    ts: str
+
+
+# 上下文压缩已提交，所有 Token 数为估算值
 class ContextCompactedEvent(BaseModel):
     type: Literal["context.compacted"] = "context.compacted"
     session_id: str
     run_id: str
     original_tokens: int
     summary_tokens: int
+    remaining_tokens: int = 0
+    applied_stages: list[str] = Field(default_factory=list)
+    llm_used: bool = False
     ts: str
 
 
@@ -269,6 +292,8 @@ Event = Annotated[
     | SessionResumedEvent
     | SessionClosedEvent
     | ContextCompactedEvent
+    | ContextCompactionStartedEvent
+    | ContextCompactionFailedEvent
     | PermissionRequestedEvent
     | PermissionGrantedEvent
     | PermissionDeniedEvent

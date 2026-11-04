@@ -23,7 +23,9 @@ def _binding(tmp_path: Path) -> RunPersistence:
             run_id="run-one", goal="goal", max_steps=5, model="fake", workspace=str(tmp_path),
         ),
     )
-    return RunPersistence(context, store.checkpoints.load(session.id), session, store)
+    persistence = RunPersistence(context, store.checkpoints.load(session.id), session, store)
+    persistence.record_message("user", "goal")
+    return persistence
 
 
 # 功能：验证执行状态没有第二份副本，状态方法直接更新原 Run 并保留中断阶段
@@ -51,12 +53,15 @@ def test_save_uses_current_run_and_preserves_history_files(tmp_path: Path) -> No
     context.run.result = "done"
     context.mark_success()
     persistence.save()
-    persistence.export_history()
+    persistence.export_metadata()
     assert persistence.checkpoint.run is context.run
     restored = persistence.store.checkpoints.load("sess-one")
     assert restored.run.step == 2 and restored.run.status == "success"
     raw = json.loads(persistence.store.checkpoints.path("sess-one").read_text(encoding="utf-8"))
-    assert set(raw) == {"schema_version", "revision", "updated_at", "session", "messages", "run"}
+    assert set(raw) == {
+        "schema_version", "revision", "updated_at", "session", "messages", "run",
+        "history_pending", "history_initialized",
+    }
     assert raw["schema_version"] == 1
     folder = persistence.store.session_dir("sess-one")
     assert (folder / "meta.json").exists()
@@ -76,6 +81,7 @@ def test_save_follows_replaced_working_history(tmp_path: Path) -> None:
     restored = SessionStore(tmp_path).checkpoints.load("sess-one")
     assert restored.messages == persistence.context.messages
     assert restored.run.run_id == "run-one"
+    assert persistence.store.read_history("sess-one") == [{"role": "user", "content": "goal"}]
 
 
 # 功能：验证提交失败直接传播，旧快照与修订号保持已提交版本

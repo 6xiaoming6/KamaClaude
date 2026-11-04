@@ -526,6 +526,105 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
 }
 ```
 
+### SessionCompactCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+| `focus` | `string` | no |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "session.compact",
+      "default": "session.compact",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "focus": {
+      "default": "",
+      "title": "Focus",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id"
+  ],
+  "title": "SessionCompactCommand",
+  "type": "object"
+}
+```
+### SessionCompactResult
+
+| Field | Type | Required |
+|---|---|---|
+| `summary_tokens` | `integer` | yes |
+| `saved_tokens` | `integer` | yes |
+| `compacted` | `boolean` | no |
+| `original_tokens` | `integer` | no |
+| `remaining_tokens` | `integer` | no |
+| `reason` | `string` | no |
+| `applied_stages` | `array` | no |
+| `llm_used` | `boolean` | no |
+
+```json
+{
+  "properties": {
+    "summary_tokens": {
+      "title": "Summary Tokens",
+      "type": "integer"
+    },
+    "saved_tokens": {
+      "title": "Saved Tokens",
+      "type": "integer"
+    },
+    "compacted": {
+      "default": true,
+      "title": "Compacted",
+      "type": "boolean"
+    },
+    "original_tokens": {
+      "default": 0,
+      "title": "Original Tokens",
+      "type": "integer"
+    },
+    "remaining_tokens": {
+      "default": 0,
+      "title": "Remaining Tokens",
+      "type": "integer"
+    },
+    "reason": {
+      "default": "",
+      "title": "Reason",
+      "type": "string"
+    },
+    "applied_stages": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Applied Stages",
+      "type": "array"
+    },
+    "llm_used": {
+      "default": false,
+      "title": "Llm Used",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "summary_tokens",
+    "saved_tokens"
+  ],
+  "title": "SessionCompactResult",
+  "type": "object"
+}
+```
 ### SessionCloseCommand
 
 | Field | Type | Required |
@@ -680,6 +779,7 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
       "type": "integer"
     },
     "messages": {
+      "description": "Full original conversation from thread.jsonl, not compacted model context.",
       "items": {
         "additionalProperties": true,
         "type": "object"
@@ -807,6 +907,241 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
   "type": "object"
 }
 ```
+### MemoryInspectCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+| `scope` | `? | null` | no |
+| `key` | `string | null` | no |
+| `query` | `string` | no |
+| `offset` | `integer` | no |
+| `limit` | `integer` | no |
+
+```json
+{
+  "$defs": {
+    "MemoryScope": {
+      "enum": [
+        "global",
+        "project",
+        "session"
+      ],
+      "type": "string"
+    }
+  },
+  "properties": {
+    "type": {
+      "const": "memory.inspect",
+      "default": "memory.inspect",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "scope": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MemoryScope"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "key": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Key"
+    },
+    "query": {
+      "default": "",
+      "title": "Query",
+      "type": "string"
+    },
+    "offset": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Offset",
+      "type": "integer"
+    },
+    "limit": {
+      "default": 20,
+      "maximum": 50,
+      "minimum": 1,
+      "title": "Limit",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "session_id"
+  ],
+  "title": "MemoryInspectCommand",
+  "type": "object"
+}
+```
+### MemoryInspectResult
+
+| Field | Type | Required |
+|---|---|---|
+| `workspace` | `string` | yes |
+| `layers` | `array` | yes |
+| `entry` | `object | null` | yes |
+| `run_id` | `string | null` | yes |
+| `snapshot` | `? | null` | yes |
+
+```json
+{
+  "$defs": {
+    "MemoryLayerSnapshot": {
+      "properties": {
+        "scope": {
+          "$ref": "#/$defs/MemoryScope"
+        },
+        "budget": {
+          "title": "Budget",
+          "type": "integer"
+        },
+        "estimated_tokens": {
+          "default": 0,
+          "title": "Estimated Tokens",
+          "type": "integer"
+        },
+        "included": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Included",
+          "type": "array"
+        },
+        "summarized": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Summarized",
+          "type": "array"
+        },
+        "omitted": {
+          "default": 0,
+          "title": "Omitted",
+          "type": "integer"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Warnings",
+          "type": "array"
+        }
+      },
+      "required": [
+        "scope",
+        "budget"
+      ],
+      "title": "MemoryLayerSnapshot",
+      "type": "object"
+    },
+    "MemoryScope": {
+      "enum": [
+        "global",
+        "project",
+        "session"
+      ],
+      "type": "string"
+    },
+    "MemorySnapshot": {
+      "properties": {
+        "text": {
+          "default": "",
+          "title": "Text",
+          "type": "string"
+        },
+        "estimated_tokens": {
+          "default": 0,
+          "title": "Estimated Tokens",
+          "type": "integer"
+        },
+        "layers": {
+          "items": {
+            "$ref": "#/$defs/MemoryLayerSnapshot"
+          },
+          "title": "Layers",
+          "type": "array"
+        }
+      },
+      "title": "MemorySnapshot",
+      "type": "object"
+    }
+  },
+  "properties": {
+    "workspace": {
+      "title": "Workspace",
+      "type": "string"
+    },
+    "layers": {
+      "items": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "title": "Layers",
+      "type": "array"
+    },
+    "entry": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Entry"
+    },
+    "run_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Run Id"
+    },
+    "snapshot": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MemorySnapshot"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "workspace",
+    "layers",
+    "entry",
+    "run_id",
+    "snapshot"
+  ],
+  "title": "MemoryInspectResult",
+  "type": "object"
+}
+```
 
 ## Server Push
 
@@ -862,6 +1197,184 @@ Session-scoped pushes include session_id and event_seq inside event. SessionOpen
 
 Events sent over the IPC socket (daemon → client).
 
+### ContextCompactionStartedEvent
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+| `run_id` | `string` | yes |
+| `original_tokens` | `integer` | yes |
+| `ts` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "context.compaction_started",
+      "default": "context.compaction_started",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "original_tokens": {
+      "title": "Original Tokens",
+      "type": "integer"
+    },
+    "ts": {
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "run_id",
+    "original_tokens",
+    "ts"
+  ],
+  "title": "ContextCompactionStartedEvent",
+  "type": "object"
+}
+```
+### ContextCompactionFailedEvent
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+| `run_id` | `string` | yes |
+| `reason` | `string` | yes |
+| `applied_stages` | `array` | no |
+| `llm_used` | `boolean` | no |
+| `ts` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "context.compaction_failed",
+      "default": "context.compaction_failed",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "reason": {
+      "title": "Reason",
+      "type": "string"
+    },
+    "applied_stages": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Applied Stages",
+      "type": "array"
+    },
+    "llm_used": {
+      "default": false,
+      "title": "Llm Used",
+      "type": "boolean"
+    },
+    "ts": {
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "run_id",
+    "reason",
+    "ts"
+  ],
+  "title": "ContextCompactionFailedEvent",
+  "type": "object"
+}
+```
+### ContextCompactedEvent
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+| `run_id` | `string` | yes |
+| `original_tokens` | `integer` | yes |
+| `summary_tokens` | `integer` | yes |
+| `remaining_tokens` | `integer` | no |
+| `applied_stages` | `array` | no |
+| `llm_used` | `boolean` | no |
+| `ts` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "context.compacted",
+      "default": "context.compacted",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "original_tokens": {
+      "title": "Original Tokens",
+      "type": "integer"
+    },
+    "summary_tokens": {
+      "title": "Summary Tokens",
+      "type": "integer"
+    },
+    "remaining_tokens": {
+      "default": 0,
+      "title": "Remaining Tokens",
+      "type": "integer"
+    },
+    "applied_stages": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Applied Stages",
+      "type": "array"
+    },
+    "llm_used": {
+      "default": false,
+      "title": "Llm Used",
+      "type": "boolean"
+    },
+    "ts": {
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "run_id",
+    "original_tokens",
+    "summary_tokens",
+    "ts"
+  ],
+  "title": "ContextCompactedEvent",
+  "type": "object"
+}
+```
 ### CoreStartedEvent
 
 | Field | Type | Required |

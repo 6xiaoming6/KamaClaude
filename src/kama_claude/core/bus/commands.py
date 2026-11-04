@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Discriminator
+from pydantic import BaseModel, Discriminator, Field
 
+from kama_claude.core.memory.model import MemoryScope, MemorySnapshot
 from kama_claude.core.session.model import SessionMode, SessionStatus
 
 
@@ -98,6 +99,12 @@ class SessionCompactCommand(BaseModel):
 class SessionCompactResult(BaseModel):
     summary_tokens: int
     saved_tokens: int
+    compacted: bool = True
+    original_tokens: int = 0
+    remaining_tokens: int = 0
+    reason: str = ""
+    applied_stages: list[str] = Field(default_factory=list)
+    llm_used: bool = False
 
 
 class SessionListCommand(BaseModel):
@@ -116,7 +123,9 @@ class SessionOpenCommand(BaseModel):
 class SessionOpenResult(BaseModel):
     session: dict[str, Any]
     revision: int
-    messages: list[dict[str, Any]]
+    messages: list[dict[str, Any]] = Field(
+        description="Full original conversation from thread.jsonl, not compacted model context.",
+    )
     run: dict[str, Any] | None
     running: bool
     pending_permissions: list[dict[str, Any]]
@@ -136,6 +145,24 @@ class SessionResumeResult(BaseModel):
     revision: int
 
 
+class MemoryInspectCommand(BaseModel):
+    type: Literal["memory.inspect"] = "memory.inspect"
+    session_id: str
+    scope: MemoryScope | None = None
+    key: str | None = None
+    query: str = ""
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=20, ge=1, le=50)
+
+
+class MemoryInspectResult(BaseModel):
+    workspace: str
+    layers: list[dict[str, Any]]
+    entry: dict[str, Any] | None
+    run_id: str | None
+    snapshot: MemorySnapshot | None
+
+
 # 根据 type 字段决定命令类型的判别联合
 Command = Annotated[
     PingCommand
@@ -149,6 +176,7 @@ Command = Annotated[
     | SessionCompactCommand
     | SessionListCommand
     | SessionOpenCommand
-    | SessionResumeCommand,
+    | SessionResumeCommand
+    | MemoryInspectCommand,
     Discriminator("type"),
 ]

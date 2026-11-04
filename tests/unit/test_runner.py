@@ -11,6 +11,7 @@ from kama_claude.core.bus.events import RunStartedEvent
 from kama_claude.core.config import KamaConfig
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock
+from kama_claude.core.memory.store import MemoryStore
 from kama_claude.core.runner import AgentRunner
 from kama_claude.core.session.model import Session
 from kama_claude.core.session.store import SessionStore
@@ -30,6 +31,7 @@ class _EndTurnProvider:
         *,
         step: int = 0,
         system: str | None = None,
+        max_output_tokens: int = 8_192,
     ) -> LlmResponse:
         return LlmResponse(stop_reason="end_turn", text="done")
 
@@ -49,6 +51,7 @@ class _LoopingProvider:
         *,
         step: int = 0,
         system: str | None = None,
+        max_output_tokens: int = 8_192,
     ) -> LlmResponse:
         self._call += 1
         tc = ToolCallBlock(id=f"t{self._call}", name="unknown_tool", input={})
@@ -72,6 +75,7 @@ class _CapturingProvider:
         *,
         step: int = 0,
         system: str | None = None,
+        max_output_tokens: int = 8_192,
     ) -> LlmResponse:
         self.messages = [dict(m) for m in messages]
         self.system = system
@@ -232,9 +236,9 @@ async def test_injected_bus_receives_events(tmp_path: Path) -> None:
     assert "run.finished" in types
 
 
-# 功能：验证 session run 会从 thread.jsonl 预填 messages，并把 notes 注入 system prompt
+# 功能：验证 session run 读取检查点工作历史，并把 Markdown 会话记忆注入 system prompt
 # 设计：用 CapturingProvider 截获 LLM 入参，不触发真实 API；同时断言 run 目录写到 session/runs 下
-async def test_session_history_and_notes_injected(tmp_path: Path) -> None:
+async def test_session_history_and_memory_injected(tmp_path: Path) -> None:
     from kama_claude.core.session.model import Session
     from kama_claude.core.session.store import SessionStore
 
@@ -249,7 +253,9 @@ async def test_session_history_and_notes_injected(tmp_path: Path) -> None:
     )
     store.write_meta(session)
     store.append_message("sess-1", "user", "remember python")
-    store.append_note("sess-1", "Python 3.12", "run-old")
+    MemoryStore(tmp_path, store.session_dir("sess-1")).upsert(
+        "session", "python", summary="Python", content="Python 3.12", source="test",
+    )
 
     provider = _CapturingProvider(LlmResponse(stop_reason="end_turn", text="done"))
     runner = AgentRunner(_config(), provider=provider, runs_dir=tmp_path / "runs")
@@ -263,18 +269,18 @@ async def test_session_history_and_notes_injected(tmp_path: Path) -> None:
     assert not (tmp_path / "runs" / "run-new").exists()
 
 
-# 功能：验证 session run 中注册了 note_save，工具调用会写入 notes.md
-# 设计：mock provider 第一步请求 note_save、第二步 end_turn，覆盖 runner→registry→tool invocation 的完整路径
-async def test_session_registers_note_save_tool(tmp_path: Path) -> None:
+# 功能：验证 session run 注册 memory_write，工具调用写入会话 Markdown
+# 设计：mock provider 第一步请求 memory_write、第二步 end_turn，覆盖 runner→registry→tool invocation 的完整路径
+async def test_session_registers_memory_write_tool(tmp_path: Path) -> None:
     from kama_claude.core.session.model import Session
     from kama_claude.core.session.store import SessionStore
 
-    class _NoteProvider:
+    class _MemoryProvider:
         # 初始化调用计数器，用于返回两步响应
         def __init__(self) -> None:
             self.calls = 0
 
-        # 第一步请求 note_save，第二步返回 end_turn
+        # 第一步请求 memory_write，第二步返回 end_turn
         async def chat(
             self,
             messages: list[dict[str, object]],
@@ -284,6 +290,7 @@ async def test_session_registers_note_save_tool(tmp_path: Path) -> None:
             *,
             step: int = 0,
             system: str | None = None,
+            max_output_tokens: int = 8_192,
         ) -> LlmResponse:
             self.calls += 1
             if self.calls == 1:
@@ -292,8 +299,9 @@ async def test_session_registers_note_save_tool(tmp_path: Path) -> None:
                     tool_calls=[
                         ToolCallBlock(
                             id="note-1",
-                            name="note_save",
-                            input={"content": "Use Python 3.12"},
+                            name="memory_write",
+                            input={"scope": "session", "key": "python", "summary": "Python",
+                                   "content": "Use Python 3.12"},
                         )
                     ],
                 )
@@ -310,10 +318,12 @@ async def test_session_registers_note_save_tool(tmp_path: Path) -> None:
     )
     store.append_message("sess-1", "user", "remember")
 
-    runner = AgentRunner(_config(max_steps=3), provider=_NoteProvider(), runs_dir=tmp_path)
+    runner = AgentRunner(_config(max_steps=3), provider=_MemoryProvider(), runs_dir=tmp_path)
     await runner.run_and_capture("remember", run_id="run-1", session=session, store=store)
 
-    assert "Use Python 3.12" in store.read_notes("sess-1")
+    assert MemoryStore(tmp_path, store.session_dir("sess-1")).get(
+        "session", "python",
+    ).content == "Use Python 3.12"
 
 
 # 功能：验证模型客户端初始化退出时记录中断，并释放本轮订阅和事件写入器

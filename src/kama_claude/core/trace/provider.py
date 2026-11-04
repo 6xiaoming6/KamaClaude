@@ -39,6 +39,7 @@ class TracingProvider:
         *,
         step: int = 0,
         system: str | None = None,
+        max_output_tokens: int = 8_192,
     ) -> LlmResponse:
         call_data: dict[str, Any]
         if self._include_payload:
@@ -49,6 +50,7 @@ class TracingProvider:
                 "tool_count": len(tool_schemas),
             }
 
+        call_data["max_output_tokens"] = max_output_tokens
         self._trace.emit(
             TraceRecord(
                 ts=_now(),
@@ -63,7 +65,8 @@ class TracingProvider:
 
         t0 = time.monotonic()
         result = await self._inner.chat(
-            messages, tool_schemas, bus, run_id, step=step, system=system
+            messages, tool_schemas, bus, run_id, step=step, system=system,
+            max_output_tokens=max_output_tokens,
         )
         latency_ms = int((time.monotonic() - t0) * 1000)
 

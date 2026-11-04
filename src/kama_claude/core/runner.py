@@ -27,7 +27,8 @@ from kama_claude.core.llm.base import LLMProvider
 from kama_claude.core.llm.provider import AnthropicProvider, DeepseekProvider, OpenaiProvider
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.mcp.server import McpServerManager
-from kama_claude.core.memory.loader import load_context_file
+from kama_claude.core.memory.context import build_memory_context
+from kama_claude.core.memory.store import MemoryStore
 from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.runs import RUNS_DIR, new_run_id
 from kama_claude.core.session.model import Session
@@ -38,7 +39,8 @@ from kama_claude.core.task.manager import TaskManager
 from kama_claude.core.tools.builtin import (
     BashTool,
     ListDirTool,
-    NoteSaveTool,
+    MemoryReadTool,
+    MemoryWriteTool,
     ReadFileTool,
     TaskCreateTool,
     TaskGetTool,
@@ -122,10 +124,14 @@ class AgentRunner:
         ]:
             if _ok(t.name):
                 registry.register(t)
-        if session is not None and store is not None and run_id is not None:
-            note_tool = NoteSaveTool(store, session.id, run_id)
-            if _ok(note_tool.name):
-                registry.register(note_tool)
+        memory = MemoryStore(
+            Path.cwd(), store.session_dir(session.id) if session and store else None,
+        )
+        for memory_tool in (
+            MemoryReadTool(memory), MemoryWriteTool(memory, session_id, run_id or ""),
+        ):
+            if _ok(memory_tool.name):
+                registry.register(memory_tool)
 
         # 创建子agent的工具是否注册
         if provider is not None and bus is not None and run_id is not None:
@@ -181,10 +187,14 @@ class AgentRunner:
         context = self._create_context(
             self._new_run_state(goal, run_id, tools),
             cp.messages,
-            notes=store.read_notes(session.id),
+            memory_store=MemoryStore(Path.cwd(), store.session_dir(session.id)),
             system_prompt_override=system_prompt,
         )
-        RunPersistence(context, cp, session, store).save()
+        persistence = RunPersistence(context, cp, session, store)
+        # Manager 已加入真实输入；Skill 展开的 goal 不能冒充用户原文
+        message = cp.messages[-1] if cp.messages else context.messages[0]
+        persistence.record_message(message["role"], message["content"])
+        persistence.save()
 
     # 执行一次完整 Run，忽略返回的文字结果
     async def run(self, goal: str, *, run_id: str | None = None) -> None:
@@ -309,7 +319,9 @@ class AgentRunner:
         context = self._create_context(
             run,
             cp.messages if cp else [],
-            notes=store.read_notes(session.id) if session and store else "",
+            memory_store=MemoryStore(
+                Path(run.workspace), store.session_dir(session.id) if session and store else None,
+            ),
             system_prompt_override=system_prompt_override,
         )
         run.status = "running"
@@ -319,6 +331,8 @@ class AgentRunner:
             if cp is not None and session is not None and store is not None
             else None
         )
+        if persistence is not None and cp is not None and not cp.messages:
+            persistence.record_message("user", goal)
         return context, persistence
 
     # 统一构建新 Run，模型、工作目录与预算只记录在这一份状态中
@@ -339,19 +353,22 @@ class AgentRunner:
         run: RunCheckpoint,
         messages: list[dict[str, Any]],
         *,
-        notes: str,
+        memory_store: MemoryStore,
         system_prompt_override: str | None,
     ) -> ExecutionContext:
         context = ExecutionContext(
             run=run,
             messages=messages,
-            session_notes=notes,
-            global_context=load_context_file(Path("~/.kama/context.md").expanduser()),
-            project_context=load_context_file(Path(".kama/context.md")),
             system_prompt_override=system_prompt_override,
         )
         # 没有冻结提示才重新构建，已有值不随记忆文件变化而覆盖
         if not run.system_prompt:
+            # 新 Run 读取一次；恢复和正式调度都复用已冻结提示，完全不碰记忆文件
+            run.memory_snapshot = build_memory_context(
+                memory_store, self._config.memory,
+                include_session=bool(memory_store.has_session),
+            )
+            context.memory_context = run.memory_snapshot.text
             run.system_prompt = context.system_prompt(
                 "You are a helpful AI assistant. "
                 "Use the available tools to complete the user's goal. "
@@ -401,16 +418,22 @@ class AgentRunner:
             session_id=session.id if session else "",
             tool_whitelist=context.run.tool_whitelist,
         )
+        if resuming and context.run.schemas_frozen:
+            # 恢复只暴露原清单，新工具不能悄悄改变旧 Run 的工具范围
+            frozen_registry = ToolRegistry()
+            for schema in context.run.tool_schemas:
+                tool = registry.get(str(schema["name"]))
+                if tool is not None:
+                    frozen_registry.register(tool)
+            registry = frozen_registry
         self._save_tool_schemas(context.run, registry, persistence, resuming=resuming)
-        compactor = Compactor(
-            bus, store.session_dir(session.id) if session and store else run_path,
-            session.id if session else "",
-        )
+        compactor = Compactor(self._config.compaction)
         return AgentLoop(
             provider, registry, bus, context=context,
             permission_manager=self._permission_manager,
             compactor=compactor,
-            compact_threshold=self._config.compaction.auto_threshold,
+            compaction=self._config.compaction,
+            run_path=run_path,
             session_id=session.id if session else "",
             persistence=persistence,
         )
@@ -448,7 +471,12 @@ class AgentRunner:
             resuming and run.schemas_frozen
             and json.dumps(schemas, sort_keys=True) != json.dumps(run.tool_schemas, sort_keys=True)
         ):
+            missing = {str(schema["name"]) for schema in run.tool_schemas} - {
+                str(schema["name"]) for schema in schemas
+            }
             run.reason = "tool schemas changed; restore compatible tools before resuming"
+            if missing:
+                run.reason += "; missing: " + ", ".join(sorted(missing))
             raise RuntimeError(run.reason)
         run.tool_schemas = schemas
         run.schemas_frozen = True
@@ -481,7 +509,7 @@ class AgentRunner:
             session.updated_at = _now()
             # 先提交终态再导出和通知，通知丢失也能从磁盘确认结果
             persistence.save()
-            persistence.export_history()
+            persistence.export_metadata()
 
         if run.status == "interrupted":
             await bus.publish_safe(

@@ -36,6 +36,7 @@ class _SingleBashProvider:
         *,
         step: int = 0,
         system: str | None = None,
+        max_output_tokens: int = 8_192,
     ) -> LlmResponse:
         self._step += 1
         if self._step == 1:
@@ -59,6 +60,7 @@ class _TwoBashProvider:
         *,
         step: int = 0,
         system: str | None = None,
+        max_output_tokens: int = 8_192,
     ) -> LlmResponse:
         self._step += 1
         if self._step == 1:

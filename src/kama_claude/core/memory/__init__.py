@@ -1,3 +1,4 @@
-from kama_claude.core.memory.loader import load_context_file
+from kama_claude.core.memory.model import MemoryEntry, MemoryError, MemoryScope, MemorySnapshot
+from kama_claude.core.memory.store import MemoryStore
 
-__all__ = ["load_context_file"]
+__all__ = ["MemoryEntry", "MemoryError", "MemoryScope", "MemorySnapshot", "MemoryStore"]

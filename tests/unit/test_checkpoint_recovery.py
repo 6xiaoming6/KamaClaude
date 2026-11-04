@@ -15,6 +15,7 @@ from kama_claude.core.checkpoint.checkpoint import CheckpointError
 from kama_claude.core.config import KamaConfig
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock, UsageStats
+from kama_claude.core.memory.model import MemorySnapshot
 from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.permissions.policy import PermissionDecision, ToolPolicy
 from kama_claude.core.runner import AgentRunner
@@ -336,50 +337,69 @@ async def test_disconnect_keeps_run_and_live_permission(tmp_path: Path) -> None:
     assert tool.calls == 1 and not permissions._pending
 
 
-# 功能：验证压缩后的工作上下文跨重启仍生效，后续消息不依赖旧下标
-# 设计：在压缩快照提交后硬中断，检查恢复模型实际收到摘要而非原长历史
+# 功能：验证压缩工作历史跨重启和后续 Run 生效，恢复不重置原 Step
+# 设计：在候选摘要提交后模拟硬崩溃，使用真实存储恢复并继续工具与后续输入
 async def test_compacted_snapshot_survives_restart(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from kama_claude.core.compact.compactor import SUMMARY_MARKER
+    from tests.unit.test_compactor import history
+
+    class CompactProvider(Provider):
+        # 摘要调用不消耗正式模型响应，便于验证两条调用链独立
+        async def chat(self, **kwargs: Any) -> LlmResponse:
+            if kwargs.get("run_id") == "compact":
+                return LlmResponse("end_turn", text="handoff summary")
+            return await super().chat(**kwargs)
+
     store = SessionStore(tmp_path)
-    provider = Provider(
-        [
-            tool_response("a", pct=0.9),
-            LlmResponse("end_turn", text="handoff summary"),
-            LlmResponse("end_turn", text="done"),
-        ]
-    )
+    model = CompactProvider([
+        tool_response("a"), LlmResponse("end_turn", text="done"),
+        LlmResponse("end_turn", text="followed"),
+    ])
     a = ProbeTool("a")
-    mgr = manager(store, provider, [a])
+    mgr = manager(store, model, [a])
     original_factory = mgr._runner_factory
 
-    # 显式启用自动压缩，不改变项目默认关闭的行为
+    # 调小软阈值，让实际长历史触发压缩，而不是伪造上一次 API 的占比
     def factory() -> AgentRunner:
         runner = original_factory()
-        runner._config.compaction.auto_threshold = 0.8
+        runner._config.compaction.auto_threshold = 0.1
+        runner._config.compaction.prune_target_ratio = 0.05
         return runner
 
     mgr._runner_factory = factory
     session = await mgr.create("chat")
+    for message in history(30):
+        store.append_message(session.id, message["role"], message["content"])
     original_save = store.checkpoints.save
 
-    # 在压缩后的工作历史提交后停止
+    # 在请求前的摘要检查点提交后停止，正式模型尚未执行
     def crash_after_compaction(cp: Any) -> None:
         original_save(cp)
-        if cp.run and cp.run.phase == "ready" and cp.messages[0]["content"] == "handoff summary":
+        if (
+            cp.run and cp.run.phase == "llm"
+            and str(cp.messages[0]["content"]).startswith(SUMMARY_MARKER)
+        ):
             raise Crash()
 
     monkeypatch.setattr(store.checkpoints, "save", crash_after_compaction)
     with pytest.raises(Crash):
         await mgr.send_message(session.id, "long original goal")
+    assert a.calls == 0
+    saved = store.checkpoints.load(session.id)
+    assert saved.run.step == 1
     monkeypatch.setattr(store.checkpoints, "save", original_save)
-    restored = manager(store, provider, [a])
+    restored = manager(store, model, [a])
     opened = await restored.open(session.id)
     await restored.resume(session.id, opened["revision"])
     await finish(restored, session.id)
-    assert provider.calls[-1]["messages"][0]["content"] == "handoff summary"
-    assert a.calls == 1
+    assert model.calls[0]["messages"][0]["content"].startswith(SUMMARY_MARKER)
+    assert model.calls[0]["step"] == 1 and a.calls == 1
     assert store.read_messages(session.id)[-1]["content"][0]["text"] == "done"
+    await restored.send_message(session.id, "followup")
+    assert model.calls[-1]["messages"][0]["content"].startswith(SUMMARY_MARKER)
+    assert store.read_messages(session.id)[-1]["content"][0]["text"] == "followed"
 
 
 # 功能：验证未完成子任务阻止续跑，但仍允许用户结束原 Run
@@ -607,13 +627,13 @@ async def test_resume_uses_frozen_system_prompt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = SessionStore(tmp_path)
-    monkeypatch.setattr("kama_claude.core.runner.load_context_file", lambda path: "original memory")
+    monkeypatch.setattr("kama_claude.core.runner.build_memory_context", lambda *a, **k: MemorySnapshot(text="original memory"))
     provider = Provider([Crash(), LlmResponse("end_turn", text="done")])
     mgr = manager(store, provider, [])
     session = await mgr.create("chat")
     with pytest.raises(Crash):
         await mgr.send_message(session.id, "goal")
-    monkeypatch.setattr("kama_claude.core.runner.load_context_file", lambda path: "changed memory")
+    monkeypatch.setattr("kama_claude.core.runner.build_memory_context", lambda *a, **k: MemorySnapshot(text="changed memory"))
     restored = manager(store, provider, [])
     opened = await restored.open(session.id)
     await restored.resume(session.id, opened["revision"])

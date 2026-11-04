@@ -120,6 +120,7 @@ class SessionRecovery:
                     else "Run aborted by user before this tool produced a result."
                 ),
             }
+            self._store.record_message(cp, "user", [block], run.run_id)
             last = cp.messages[-1] if cp.messages else None
             if (
                 last and last["role"] == "user"
