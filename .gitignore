@@ -15,4 +15,11 @@ uv.lock
 .idea/
 .DS_Store
 *.log
-docs/learning/
+
+# Local practice files
+/workspace/
+
+# dev keeps its overview, interviews and improvement outline
+/docs/*
+!/docs/interview/
+!/docs/S8-二次开发改进大纲.md
