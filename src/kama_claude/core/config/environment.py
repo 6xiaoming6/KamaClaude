@@ -1,0 +1,194 @@
+from __future__ import annotations
+
+import os
+
+from kama_claude.core.config.models import KamaConfig
+
+
+def apply_env(config: KamaConfig) -> None:
+    _apply_core(config)
+    _apply_logging(config)
+    _apply_agent(config)
+    _apply_llm(config)
+    _apply_trace(config)
+    _apply_permission(config)
+    _apply_compaction(config)
+    _apply_memory(config)
+
+
+def _apply_core(config: KamaConfig) -> None:
+    host = os.environ.get("KAMA_HOST")
+    if host is not None:
+        config.host = host
+
+    port_str = os.environ.get("KAMA_PORT")
+    if port_str is not None:
+        try:
+            config.port = int(port_str)
+        except ValueError:
+            raise SystemExit(f"Config error: KAMA_PORT must be an integer, got: {port_str!r}")
+
+
+def _apply_logging(config: KamaConfig) -> None:
+    log_level = os.environ.get("KAMA_LOG_LEVEL")
+    if log_level is not None:
+        config.logging.level = log_level
+
+    log_file = os.environ.get("KAMA_LOG_FILE")
+    if log_file is not None:
+        config.logging.file = log_file
+
+    log_format = os.environ.get("KAMA_LOG_FORMAT")
+    if log_format is not None:
+        config.logging.format = log_format
+
+
+def _apply_agent(config: KamaConfig) -> None:
+    max_steps_str = os.environ.get("KAMA_MAX_STEPS")
+    if max_steps_str is not None:
+        try:
+            val = int(max_steps_str)
+            if val <= 0:
+                raise SystemExit(
+                    "Config error: KAMA_MAX_STEPS must be a positive integer,"
+                    f" got: {max_steps_str!r}"
+                )
+            config.agent.max_steps = val
+        except ValueError:
+            raise SystemExit(
+                f"Config error: KAMA_MAX_STEPS must be an integer, got: {max_steps_str!r}"
+            )
+    for key in ("max_run_seconds", "max_total_tokens", "repeat_failure_limit"):
+        name = "KAMA_AGENT_" + key.upper()
+        raw = os.environ.get(name)
+        if raw is not None:
+            try:
+                amount = int(raw)
+            except ValueError as exc:
+                raise SystemExit(f"Config error: {name} must be a nonnegative integer") from exc
+            if amount < 0:
+                raise SystemExit(f"Config error: {name} must be a nonnegative integer")
+            setattr(config.agent, key, amount)
+
+
+def _apply_llm(config: KamaConfig) -> None:
+    default_model = os.environ.get("KAMA_LLM_DEFAULT_MODEL")
+    if default_model is not None:
+        config.llm.default_model = default_model
+
+
+def _apply_trace(config: KamaConfig) -> None:
+    trace_enabled = os.environ.get("KAMA_TRACE_ENABLED")
+    if trace_enabled is not None:
+        config.trace.enabled = trace_enabled.lower() not in ("0", "false", "no")
+
+    trace_file = os.environ.get("KAMA_TRACE_FILE")
+    if trace_file is not None:
+        config.trace.file = trace_file
+
+    trace_payload = os.environ.get("KAMA_TRACE_INCLUDE_LLM_PAYLOAD")
+    if trace_payload is not None:
+        config.trace.include_llm_payload = trace_payload.lower() not in ("0", "false", "no")
+
+
+def _apply_permission(config: KamaConfig) -> None:
+    perm_timeout = os.environ.get("KAMA_PERMISSION_TIMEOUT_S")
+    if perm_timeout is not None:
+        try:
+            perm_timeout_val = float(perm_timeout)
+            if perm_timeout_val < 0:
+                raise SystemExit(
+                    f"Config error: KAMA_PERMISSION_TIMEOUT_S must be >= 0, got: {perm_timeout!r}"
+                )
+            config.permission.timeout_s = perm_timeout_val
+        except ValueError:
+            raise SystemExit(
+                f"Config error: KAMA_PERMISSION_TIMEOUT_S must be a number, got: {perm_timeout!r}"
+            )
+
+
+def _apply_compaction(config: KamaConfig) -> None:
+    compact_threshold = os.environ.get("KAMA_COMPACT_THRESHOLD")
+    if compact_threshold is not None:
+        try:
+            compact_threshold_val = float(compact_threshold)
+            if not (0.0 <= compact_threshold_val <= 1.0):
+                raise SystemExit(
+                    "Config error: KAMA_COMPACT_THRESHOLD must be between 0 and 1, "
+                    f"got: {compact_threshold!r}"
+                )
+            config.compaction.auto_threshold = compact_threshold_val
+        except ValueError:
+            raise SystemExit(
+                f"Config error: KAMA_COMPACT_THRESHOLD must be a number, got: {compact_threshold!r}"
+            )
+
+    compact_tool_limit = os.environ.get("KAMA_COMPACT_TOOL_LIMIT")
+    if compact_tool_limit is not None:
+        try:
+            compact_tool_limit_val = int(compact_tool_limit)
+            if compact_tool_limit_val <= 0:
+                raise SystemExit(
+                    "Config error: KAMA_COMPACT_TOOL_LIMIT must be a positive integer, "
+                    f"got: {compact_tool_limit!r}"
+                )
+            config.compaction.tool_result_limit = compact_tool_limit_val
+        except ValueError:
+            raise SystemExit(
+                "Config error: KAMA_COMPACT_TOOL_LIMIT must be an integer, "
+                f"got: {compact_tool_limit!r}"
+            )
+
+    compact_tool_keep = os.environ.get("KAMA_COMPACT_TOOL_KEEP")
+    if compact_tool_keep is not None:
+        try:
+            compact_tool_keep_val = int(compact_tool_keep)
+            if compact_tool_keep_val <= 0:
+                raise SystemExit(
+                    "Config error: KAMA_COMPACT_TOOL_KEEP must be a positive integer, "
+                    f"got: {compact_tool_keep!r}"
+                )
+            config.compaction.tool_result_keep = compact_tool_keep_val
+        except ValueError:
+            raise SystemExit(
+                "Config error: KAMA_COMPACT_TOOL_KEEP must be an integer, "
+                f"got: {compact_tool_keep!r}"
+            )
+    for suffix, key in {
+        "WINDOW_TOKENS": "context_window_tokens",
+        "OUTPUT_TOKENS": "output_reserve_tokens",
+        "KEEP_GROUPS": "keep_recent_groups",
+        "SUMMARY_TOKENS": "summary_max_tokens",
+    }.items():
+        name = "KAMA_COMPACT_" + suffix
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        try:
+            parsed = int(value)
+        except ValueError as exc:
+            raise SystemExit(f"Config error: {name} must be a positive integer") from exc
+        if parsed <= 0:
+            raise SystemExit(f"Config error: {name} must be a positive integer")
+        setattr(config.compaction, key, parsed)
+    prune_target = os.environ.get("KAMA_COMPACT_PRUNE_TARGET")
+    if prune_target is not None:
+        try:
+            config.compaction.prune_target_ratio = float(prune_target)
+        except ValueError as exc:
+            raise SystemExit("Config error: KAMA_COMPACT_PRUNE_TARGET must be a number") from exc
+
+
+def _apply_memory(config: KamaConfig) -> None:
+    for scope in ("global", "project", "session"):
+        name = f"KAMA_MEMORY_{scope.upper()}_TOKENS"
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        try:
+            memory_amount = int(raw)
+        except ValueError as exc:
+            raise SystemExit(f"Config error: {name} must be a nonnegative integer") from exc
+        if memory_amount < 0:
+            raise SystemExit(f"Config error: {name} must be a nonnegative integer")
+        setattr(config.memory, scope + "_tokens", memory_amount)

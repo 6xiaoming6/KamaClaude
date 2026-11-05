@@ -184,9 +184,13 @@ class SessionStore:
             raise CheckpointError(f"cannot append full history for {sid}: {exc}") from exc
 
     # 前端读取完整原文，不做摘要、裁剪或孤立工具调用过滤
-    def read_history(self, sid: str) -> list[dict[str, Any]]:
+    def read_history(self, sid: str, *, include_metadata: bool = False) -> list[dict[str, Any]]:
         return [
-            {"role": row["role"], "content": row.get("content", "")}
+            {
+                "role": row["role"], "content": row.get("content", ""),
+                **({key: row[key] for key in ("id", "run_id") if key in row}
+                   if include_metadata else {}),
+            }
             for row in self._read_history_rows(sid)
             if row.get("role") in ("user", "assistant")
         ]

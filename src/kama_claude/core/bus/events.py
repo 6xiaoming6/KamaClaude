@@ -222,11 +222,11 @@ class PermissionRequestedEvent(BaseModel):
     params: dict[str, Any]
     param_preview: str
     reason: str = ""  # 为什么要求审批
-    approval_scope: str = "仅本次操作"  # 持续允许的具体范围
+    approval_scope: str = "仅本次操作"  # 文件会话授权只针对当前工具与后端实际路径
     workspace: str | None = None  # 文件工具绑定的根目录
     resolved_path: str | None = None  # 实际访问目标，包含链接解析结果
     outside_workspace: bool = False  # 外部路径必须单次审批
-    allowed_decisions: list[str] | None = None  # 未提供时沿用普通审批四选项
+    allowed_decisions: list[str] | None = None  # Core 始终提供；缺失时前端只展示单次选项
     session_id: str
     ts: str
 

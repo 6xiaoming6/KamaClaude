@@ -3,7 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
+
+from kama_claude.core.bus.events import RunBudgetEvent
+from kama_claude.core.events.bus import EventBus
 
 if TYPE_CHECKING:
     from kama_claude.core.checkpoint.checkpoint import RunCheckpoint
@@ -12,6 +16,22 @@ if TYPE_CHECKING:
 
 class BudgetExceeded(RuntimeError):
     pass
+
+
+# 预算事件不依赖具体 Provider；Loop 终止和模型请求共用此入口。
+async def publish_budget(
+    bus: EventBus, budget: RunBudget, method: str = "", estimated_input: int = 0,
+    reason: str = "", *, trigger_tokens: int = 0, underestimate_factor: float = 1.0,
+) -> None:
+    run = budget.run
+    await bus.publish_safe(RunBudgetEvent(
+        run_id=run.run_id, method=method, estimated_input_tokens=estimated_input,
+        actual_tokens=run.actual_tokens, estimated_tokens=run.estimated_tokens,
+        elapsed_seconds=run.elapsed_seconds, max_total_tokens=run.max_total_tokens,
+        max_run_seconds=run.max_run_seconds, usage_complete=run.usage_complete,
+        reason=reason, trigger_tokens=trigger_tokens,
+        underestimate_factor=underestimate_factor, ts=datetime.now(UTC).isoformat(),
+    ))
 
 
 class RunBudget:

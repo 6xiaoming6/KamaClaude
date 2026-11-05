@@ -39,12 +39,21 @@ class ChatPrinter:
             print(f"  command: {(event.get('params') or {}).get('command', '')}")
             print(f"  cwd: {event.get('workspace', '')} (local shell, not sandboxed)")
         if event.get("resolved_path"):
+            print(f"  requested: {(event.get('params') or {}).get('path', '.')}")
             print(f"  target: {event['resolved_path']}")
         print(f"  reason: {event.get('reason', '')}")
         print(f"  scope: {event.get('approval_scope', '仅本次操作')}")
         allowed = event.get("allowed_decisions") or ["allow_once", "deny_once"]
+        labels = {
+            "allow_once": "允许本次", "deny_once": "拒绝本次",
+            "always_allow": (
+                f"本会话允许使用 {tool_name} 操作此文件"
+                if tool_name in {"write_file", "edit_file"} else "本会话允许相同操作"
+            ),
+            "always_deny": "本会话拒绝相同操作",
+        }
         print("  " + "  ".join(
-            f"{key}={value}" for key, value in _DECISION_MAP.items() if value in allowed
+            f"{key}={labels[value]}" for key, value in _DECISION_MAP.items() if value in allowed
         ))
 
     def resolve_permission(self, request_id: str) -> None:

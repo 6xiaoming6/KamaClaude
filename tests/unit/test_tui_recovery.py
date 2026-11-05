@@ -7,8 +7,10 @@ from typing import Any
 import pytest
 from textual.widgets import Button
 
-from kama_claude.tui.app import ChatTextArea, KamaTuiApp, ToolCallBlock
+from kama_claude.tui.app import KamaTuiApp
 from kama_claude.tui.recovery import RecoveryActions, SessionPicker
+from kama_claude.tui.widgets.conversation import ToolCallBlock
+from kama_claude.tui.widgets.input import ChatTextArea
 
 
 # 构造真实快照形状的假后端，不调用模型
@@ -235,5 +237,5 @@ async def test_open_snapshot_buffers_and_deduplicates_events(
         }
         app._handle_event(token)
         app._handle_event(token)
-        assert app._current_llm._text == "once"
+        assert app._view.current_llm._text == "once"
         await pilot.pause()

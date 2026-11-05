@@ -2,20 +2,18 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
-from datetime import UTC, datetime
 
 import anthropic
 import httpx
 from pydantic import BaseModel
 
-from kama_claude.core.bus.events import RunBudgetEvent
 from kama_claude.core.checkpoint.persistence import RunPersistence
 from kama_claude.core.compact.estimator import TokenEstimator
 from kama_claude.core.config import CompactionConfig
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.base import LLMProvider
 from kama_claude.core.llm.types import LlmResponse
-from kama_claude.core.run_budget import RunBudget
+from kama_claude.core.run_budget import RunBudget, publish_budget
 
 
 # 仅对明确的传输故障、限流和服务端错误做有限重试
@@ -58,17 +56,11 @@ class ManagedProvider:
         self, method: str = "", estimated_input: int = 0, reason: str = "",
         *, trigger_tokens: int = 0, underestimate_factor: float = 1.0,
     ) -> None:
-        if self._bus is None or self._budget is None:
-            return
-        run = self._budget.run
-        await self._bus.publish_safe(RunBudgetEvent(
-            run_id=run.run_id, method=method, estimated_input_tokens=estimated_input,
-            actual_tokens=run.actual_tokens, estimated_tokens=run.estimated_tokens,
-            elapsed_seconds=run.elapsed_seconds, max_total_tokens=run.max_total_tokens,
-            max_run_seconds=run.max_run_seconds, usage_complete=run.usage_complete,
-            reason=reason, trigger_tokens=trigger_tokens,
-            underestimate_factor=underestimate_factor, ts=datetime.now(UTC).isoformat(),
-        ))
+        if self._bus is not None and self._budget is not None:
+            await publish_budget(
+                self._bus, self._budget, method, estimated_input, reason,
+                trigger_tokens=trigger_tokens, underestimate_factor=underestimate_factor,
+            )
 
     # 每次实际重试分别预留并记账，完整响应和当前请求估算严格配对
     async def chat(

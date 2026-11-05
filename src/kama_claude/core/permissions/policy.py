@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from kama_claude.core.permissions.bash import CommandRule, command_decision
 from kama_claude.core.workspace import PathAccess
 
 
@@ -14,29 +14,10 @@ class PermissionDecision(StrEnum):
     ASK = "ask"
 
 
-# 检测 bash 命令是否操作 cwd 之外路径的正则规则列表（强制触发 ASK，不可被 allow_patterns 绕过）
-OUTSIDE_CWD_HEURISTICS: list[str] = [
-    r"(^|\s)/[^\s]",              # absolute path
-    r"(^|\s)~",                   # tilde home
-    r"(^|\s)\.\.(/|$|\s)",        # parent traversal
-    r"\$\{?HOME\b",               # $HOME variable
-    r"\$\{?PWD\b",                # $PWD variable
-    r"(^|\s|;|&&|\|\|)cd(\s|$)",  # explicit cd
-]
-
-_OUTSIDE_CWD_RE: list[re.Pattern[str]] = [re.compile(p) for p in OUTSIDE_CWD_HEURISTICS]
-
-
-# 判断 bash 命令是否命中 outside-cwd 启发式规则
-def matches_outside_cwd(command: str) -> bool:
-    return any(pat.search(command) for pat in _OUTSIDE_CWD_RE)
-
-
 @dataclass
 class ToolPolicy:
     default: PermissionDecision
-    allow_patterns: list[str] = field(default_factory=list)
-    deny_patterns: list[str] = field(default_factory=list)
+    command_rules: list[CommandRule] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -88,7 +69,7 @@ def param_preview(tool_name: str, params: dict[str, Any]) -> str:
     return snippet[:_PREVIEW_MAX] if len(snippet) > _PREVIEW_MAX else snippet
 
 
-# 对工具 + 参数执行 4 层静态策略评估，返回 ALLOW/DENY/ASK
+# 查询工具静态策略，不创建审批请求或修改会话授权
 def evaluate(
     tool_name: str,
     params: dict[str, Any],
@@ -105,22 +86,14 @@ def assess(
     policy = policy or DEFAULT_POLICIES.get(tool_name)
     if policy is not None and policy.default == PermissionDecision.DENY:
         return PermissionAssessment(PermissionDecision.DENY, "工具已被明确禁止")
-    command = str(params.get("command", "")) if tool_name == "bash" else ""
-    if command and policy:
-        for pattern in policy.deny_patterns:
-            if re.search(pattern, command):
-                return PermissionAssessment(PermissionDecision.DENY, "命中命令禁止规则")
+    if tool_name == "bash":
+        decision, reason = command_decision(
+            str(params.get("command", "")), rules=policy.command_rules if policy else [],
+        )
+        return PermissionAssessment(PermissionDecision(decision), reason, reusable=False)
     if path_access is not None and path_access.outside_workspace:
         return PermissionAssessment(PermissionDecision.ASK, "访问工作区外路径", reusable=False)
-    if command and matches_outside_cwd(command):
-        return PermissionAssessment(
-            PermissionDecision.ASK, "命令可能访问工作区外路径（启发式检查）", reusable=False,
-        )
     if tool_name == "memory_write" and params.get("scope", "project") == "global":
         return PermissionAssessment(PermissionDecision.ASK, "写入全局记忆")
-    if command and policy:
-        for pattern in policy.allow_patterns:
-            if re.search(pattern, command):
-                return PermissionAssessment(PermissionDecision.ALLOW, "命中命令允许规则")
     default = policy.default if policy is not None else _UNKNOWN_TOOL_DEFAULT
     return PermissionAssessment(default, "工具默认策略")

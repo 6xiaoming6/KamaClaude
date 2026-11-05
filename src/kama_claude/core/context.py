@@ -36,7 +36,7 @@ class ExecutionContext:
     # 将工具调用结果追加为 user 消息；同一步的多个结果共享同一条消息
     def add_tool_result(
         self, tool_use_id: str, content: str, is_error: bool = False
-    ) -> None:
+    ) -> dict[str, Any]:
         block: dict[str, Any] = {
             "type": "tool_result",
             "tool_use_id": tool_use_id,
@@ -57,6 +57,7 @@ class ExecutionContext:
             last["content"].append(block)
         else:
             self.messages.append({"role": "user", "content": [block]})
+        return block
 
     # 返回 True 表示 loop 应停止（状态不再是 running）
     def is_done(self) -> bool:

@@ -6,7 +6,7 @@
 
 - TCP loopback `127.0.0.1:7437` (override via `KAMA_HOST` / `KAMA_PORT`)
 - Each message is one `\n`-terminated JSON line (NDJSON)
-- Commands use JSON-RPC 2.0 (client ¡ú server); Events use `kind=event` envelope (server ¡ú client)
+- Commands use JSON-RPC 2.0 (client â†’ server); Events use `kind=event` envelope (server â†’ client)
 
 ## Commands
 
@@ -779,7 +779,7 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
       "type": "integer"
     },
     "messages": {
-      "description": "Full original conversation from thread.jsonl, not compacted model context.",
+      "description": "Full original conversation from thread.jsonl, not compacted model context. Rows may include id and run_id for display correlation; these are not model input.",
       "items": {
         "additionalProperties": true,
         "type": "object"
@@ -1266,7 +1266,7 @@ Session-scoped pushes include session_id and event_seq inside event. SessionOpen
 
 ## IPC Events
 
-Events sent over the IPC socket (daemon ¡ú client).
+Events sent over the IPC socket (daemon â†’ client).
 
 ### ContextCompactionStartedEvent
 

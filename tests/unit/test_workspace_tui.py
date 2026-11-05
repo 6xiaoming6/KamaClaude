@@ -7,7 +7,8 @@ import pytest
 from textual import events
 from textual.widgets import Button
 
-from kama_claude.tui.app import KamaTuiApp, PermissionBlock, PermissionSelect
+from kama_claude.tui.app import KamaTuiApp
+from kama_claude.tui.widgets.permissions import PermissionBlock, PermissionSelect
 
 
 # 保留 Textual 生命周期，避免测试建立外部连接
@@ -79,7 +80,7 @@ async def test_external_options_and_reconnect(monkeypatch: pytest.MonkeyPatch) -
         )
 
 
-# 功能：验证外部审批按钮允许一次，普通审批仍有四个选项
+# 功能：验证外部审批按钮允许本次，内部文件写入提供三项精确文件决定
 # 设计：使用真实按钮点击确认消息路由，而非只检查按钮标签
 async def test_approval_buttons_and_ordinary_options(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(KamaTuiApp, "_socket_loop", idle_socket)
@@ -97,14 +98,26 @@ async def test_approval_buttons_and_ordinary_options(monkeypatch: pytest.MonkeyP
         await pilot.pause()
         assert client.calls[-1][1]["decision"] == "allow_once"
         app._handle_event_inner({
-            "type": "permission.requested", "tool_use_id": "ordinary", "tool_name": "bash",
+            "type": "permission.requested", "tool_use_id": "ordinary", "tool_name": "edit_file",
             "request_id": "approval-ordinary", "session_id": "sess-one", "run_id": "run-two",
-            "params": {"command": "echo hello"}, "param_preview": "echo hello",
+            "params": {"path": "src/a.py", "old_text": "old", "new_text": "new"},
+            "param_preview": "src/a.py", "resolved_path": "C:/repo/src/a.py",
+            "workspace": "C:/repo",
+            "allowed_decisions": ["allow_once", "deny_once", "always_allow"],
         })
         await pilot.pause()
         select = app.query_one(PermissionSelect)
-        assert len(select._choices) == 4
-        assert len(select.query(Button)) == 4
+        assert len(select._choices) == 3
+        assert len(select.query(Button)) == 3
+        assert not select.query("#permission-always_deny")
+        assert any(
+            "本会话允许使用 edit_file 编辑此文件" in label for _, label, _ in select._choices
+        )
+        details = str(app._pending_permission_blocks["approval-ordinary"].render())
+        assert "src/a.py" in details and "C:/repo/src/a.py" in details
+        await pilot.press("d", "4")
+        await pilot.pause()
+        assert client.calls[-1][1]["decision"] == "allow_once"
         await pilot.press("a")
         await pilot.pause()
         assert client.calls[-1][1] == {

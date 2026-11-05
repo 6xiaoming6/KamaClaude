@@ -53,7 +53,8 @@ from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.permissions.storage import load_policy_file
 from kama_claude.core.runner import AgentRunner
 from kama_claude.core.runs import events_file, new_run_id
-from kama_claude.core.session import SessionManager, SessionStore
+from kama_claude.core.session.manager import SessionManager
+from kama_claude.core.session.store import SessionStore
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
 from kama_claude.core.trace.record import TraceRecord
 from kama_claude.core.trace.writer import TraceWriter
@@ -195,7 +196,7 @@ class CoreApp:
         assert self._sessions is not None
         cmd = SessionCompactCommand.model_validate(params)
         result = await self._sessions.compact(cmd.session_id, cmd.focus)
-        return result  # type: ignore[no-any-return]
+        return result
 
     # 直接查看记忆文件与冻结快照，不占用 Agent 步数或生成对话消息
     async def _memory_inspect_handler(self, params: dict[str, Any]) -> MemoryInspectResult:

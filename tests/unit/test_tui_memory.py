@@ -8,8 +8,9 @@ import pytest
 from textual.widgets import Button, ListView, TextArea
 
 from kama_claude.core.memory.store import MemoryStore
-from kama_claude.tui.app import ChatTextArea, KamaTuiApp
+from kama_claude.tui.app import KamaTuiApp
 from kama_claude.tui.memory import MemoryScreen
+from kama_claude.tui.widgets.input import ChatTextArea
 from tests.unit.test_checkpoint_recovery import Provider
 from tests.unit.test_memory_workflow import isolate, setup_manager
 from tests.unit.test_tui_recovery import idle_socket

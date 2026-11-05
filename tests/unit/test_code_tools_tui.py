@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from kama_claude.tui.app import KamaTuiApp, PermissionBlock, PermissionSelect
+from kama_claude.tui.app import KamaTuiApp
+from kama_claude.tui.widgets.permissions import PermissionBlock, PermissionSelect
 from tests.unit.test_workspace_tui import Client, idle_socket
 
 

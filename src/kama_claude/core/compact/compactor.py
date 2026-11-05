@@ -153,7 +153,6 @@ class Compactor:
     ) -> None:
         self._config = config or CompactionConfig()
         self._estimator = estimator or TokenEstimator()
-        self._counter = TokenCounter()
 
     # 程序层逐层尝试，只有处理后仍达软阈值才取得模型并生成摘要
     async def prepare_context(
@@ -170,33 +169,33 @@ class Compactor:
     ) -> CompactionResult:
         config = self._config
         schemas = tool_schemas or []
-        self._counter = self._estimator.select(system, messages, schemas)
+        counter = self._estimator.select(system, messages, schemas)
         working = deepcopy(messages)
-        before = self._counter.count(messages)
+        before = counter.count(messages)
         # 第一层总是可用；全文归档失败时不会修改调用方的历史
         if outputs_dir is not None:
             working = truncate_tool_results(
                 working, config.tool_result_limit, config.tool_result_keep,
                 outputs_dir=outputs_dir,
             )
-        result = CompactionResult(working, before, self._counter.count(working))
+        result = CompactionResult(working, before, counter.count(working))
         if working != messages:
             result.compacted = True
             result.applied_stages.append("tool_preview")
             logger.info(
                 "context stage=tool_preview input_before=%d input_after=%d",
-                self._counter.request(system, messages, schemas),
-                self._counter.request(system, working, schemas),
+                counter.request(system, messages, schemas),
+                counter.request(system, working, schemas),
             )
         # 第一层可能改写旧结果，此时旧锚点失效，阈值按整理后的请求重算
-        self._counter = self._estimator.select(system, working, schemas)
+        counter = self._estimator.select(system, working, schemas)
         threshold = config.auto_threshold or (0.8 if manual else 0.0)
         if not threshold:
             result.reason = "auto_disabled"
             return result
         # Cline 式缩小整个预算，触发阈值与程序整理目标使用同一个系数
-        soft_limit = self._counter.trigger(config.input_limit, threshold)
-        if self._counter.request(system, working, schemas) < soft_limit:
+        soft_limit = counter.trigger(config.input_limit, threshold)
+        if counter.request(system, working, schemas) < soft_limit:
             result.reason = "below_threshold"
             return result
         if not _validate_pairs(working):
@@ -210,21 +209,21 @@ class Compactor:
             for stage, reduce in (
                 ("deduplicate", deduplicate_results), ("tool_archive", prune_results),
             ):
-                input_before = self._counter.request(system, working, schemas)
+                input_before = counter.request(system, working, schemas)
                 changes = reduce(
                     working, outputs_dir, protected_start, system, schemas,
-                    self._counter.trigger(config.input_limit, config.prune_target_ratio),
-                    counter=self._counter,
+                    counter.trigger(config.input_limit, config.prune_target_ratio),
+                    counter=counter,
                 )
                 if changes:
                     result.compacted = True
                     result.applied_stages.append(stage)
-                    result.remaining_token_estimate = self._counter.count(working)
+                    result.remaining_token_estimate = counter.count(working)
                 logger.info(
                     "context stage=%s input_before=%d input_after=%d",
-                    stage, input_before, self._counter.request(system, working, schemas),
+                    stage, input_before, counter.request(system, working, schemas),
                 )
-                if self._counter.request(system, working, schemas) < soft_limit:
+                if counter.request(system, working, schemas) < soft_limit:
                     result.reason = "below_threshold"
                     return result
 
@@ -242,7 +241,7 @@ class Compactor:
             result.reason = "provider_unavailable"
             return result
         summary = await self.compact_messages(
-            working, provider, focus, system=system, tool_schemas=schemas, counter=self._counter,
+            working, provider, focus, system=system, tool_schemas=schemas, counter=counter,
         )
         result.messages = summary.messages
         result.remaining_token_estimate = summary.remaining_token_estimate
@@ -254,8 +253,8 @@ class Compactor:
         result.reason = summary.reason
         logger.info(
             "context stage=llm_summary input_before=%d input_after=%d llm_used=%s",
-            self._counter.request(system, working, schemas),
-            self._counter.request(system, result.messages, schemas), result.llm_used,
+            counter.request(system, working, schemas),
+            counter.request(system, result.messages, schemas), result.llm_used,
         )
         return result
 
@@ -270,17 +269,17 @@ class Compactor:
         tool_schemas: list[dict[str, Any]] | None = None,
         counter: TokenCounter | None = None,
     ) -> CompactionResult:
-        self._counter = counter or self._estimator.select(
+        counter = counter or self._estimator.select(
             system, messages, tool_schemas or [],
         )
-        before = self._counter.count(messages)
+        before = counter.count(messages)
         unchanged = CompactionResult(messages, before, before)
         if not _validate_pairs(messages):
             unchanged.reason = "incomplete_tool_batch"
             return unchanged
         try:
             old, recent = _split_history(
-                messages, self._config.keep_recent_groups, self._counter.count,
+                messages, self._config.keep_recent_groups, counter.count,
             )
         except ValueError as exc:
             unchanged.reason = str(exc)
@@ -288,8 +287,8 @@ class Compactor:
         if not old:
             unchanged.reason = "no_old_history"
             return unchanged
-        effective_limit = self._counter.effective_limit(self._config.input_limit)
-        if self._counter.request(system, recent, tool_schemas or []) >= effective_limit:
+        effective_limit = counter.effective_limit(self._config.input_limit)
+        if counter.request(system, recent, tool_schemas or []) >= effective_limit:
             unchanged.reason = "required_context_too_large"
             return unchanged
 
@@ -332,7 +331,7 @@ class Compactor:
 
         summary = response.text.strip()
         tokens = max(
-            self._counter.count(summary), response.usage.output_tokens if response.usage else 0,
+            counter.count(summary), response.usage.output_tokens if response.usage else 0,
         )
         if response.stop_reason != "end_turn" or response.tool_calls:
             unchanged.reason = "summary_incomplete"
@@ -346,13 +345,13 @@ class Compactor:
                 {"role": "assistant", "content": SUMMARY_ACK},
                 *recent,
             ]
-            after = self._counter.count(candidate)
+            after = counter.count(candidate)
             if not _validate_pairs(candidate):
                 unchanged.reason = "incomplete_tool_batch"
             elif after > before * 0.9:
                 unchanged.reason = "insufficient_reduction"
             elif (
-                self._counter.request(system, candidate, tool_schemas or [])
+                counter.request(system, candidate, tool_schemas or [])
                 > effective_limit
             ):
                 unchanged.reason = "context_budget_exceeded"

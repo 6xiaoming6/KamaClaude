@@ -3,7 +3,8 @@ from __future__ import annotations
 import pytest
 
 from kama_claude.core.transport.socket_client import IpcError
-from kama_claude.tui.app import KamaTuiApp, PermissionBlock, PermissionSelect
+from kama_claude.tui.app import KamaTuiApp
+from kama_claude.tui.widgets.permissions import PermissionBlock, PermissionSelect
 from tests.unit.test_workspace_tui import Client, idle_socket
 
 
@@ -14,8 +15,8 @@ def approval(request_id: str = "approval-1", run_id: str = "child-a") -> dict:
         "tool_use_id": "same-model-id", "tool_name": "bash",
         "params": {"command": "echo " + "x" * 120 + " && echo [last-command]"},
         "param_preview": "short", "workspace": "C:/repo",
-        "reason": "工具默认策略", "approval_scope": "本会话 · 完全相同的命令",
-        "allowed_decisions": ["allow_once", "always_allow", "deny_once", "always_deny"],
+        "reason": "存在未匹配允许规则的命令段", "approval_scope": "仅本次操作",
+        "allowed_decisions": ["allow_once", "deny_once"],
     }
 
 
@@ -44,9 +45,12 @@ async def test_full_command_and_concurrent_approval_ids(monkeypatch: pytest.Monk
         assert remaining._request_id == "approval-1"
         remaining._pick("always_allow")
         await pilot.pause()
+        assert client.calls[-1][0] == "session.open"
+        remaining._pick("allow_once")
+        await pilot.pause()
         assert client.calls[-1][1] == {
             "request_id": "approval-1", "session_id": "sess-one", "run_id": "child-a",
-            "decision": "always_allow",
+            "decision": "allow_once",
         }
 
 

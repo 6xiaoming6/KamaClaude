@@ -11,32 +11,19 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel, Field
 
 from kama_claude.core.agents.loader import AgentProfile, AgentProfileError, AgentProfileLoader
+from kama_claude.core.assembly import create_agent_loop
 from kama_claude.core.bus.events import SubagentFinishedEvent, SubagentStartedEvent
 from kama_claude.core.checkpoint.checkpoint import RunCheckpoint
-from kama_claude.core.compact.compactor import Compactor
-from kama_claude.core.compact.estimator import TokenEstimator
 from kama_claude.core.config import AgentConfig, CompactionConfig, ExecutionConfig
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.events.writer import EventWriter
-from kama_claude.core.llm.managed import ManagedProvider
 from kama_claude.core.loop import AgentLoop
-from kama_claude.core.run_budget import RunBudget
 from kama_claude.core.runs import new_run_id
 from kama_claude.core.subagent.registry import ActiveSubagent, BackgroundTaskRegistry
 from kama_claude.core.subagent.result import SubagentResult
 from kama_claude.core.tools.base import BaseTool, ToolParams, ToolResult
-from kama_claude.core.tools.builtin.bash import BashTool
-from kama_claude.core.tools.builtin.edit_file import EditFileTool
-from kama_claude.core.tools.builtin.find_files import FindFilesTool
-from kama_claude.core.tools.builtin.list_dir import ListDirTool
-from kama_claude.core.tools.builtin.read_file import ReadFileTool
-from kama_claude.core.tools.builtin.search_text import SearchTextTool
-from kama_claude.core.tools.builtin.task_create import TaskCreateTool
-from kama_claude.core.tools.builtin.task_get import TaskGetTool
-from kama_claude.core.tools.builtin.task_list import TaskListTool
-from kama_claude.core.tools.builtin.task_update import TaskUpdateTool
-from kama_claude.core.tools.builtin.write_file import WriteFileTool
+from kama_claude.core.tools.factory import builtin_tools
 from kama_claude.core.tools.registry import ToolRegistry
 
 if TYPE_CHECKING:
@@ -163,22 +150,10 @@ class SpawnAgentTool(BaseTool):
         child_run_path = self._runs_dir / child_run_id
         child_run_path.mkdir(parents=True, exist_ok=True)
         # 每个子任务独立记账，普通请求、摘要与重试共用同一预算
-        estimator = TokenEstimator(self._provider_name, model)
-        budget = RunBudget(child_context.run)
-        managed = ManagedProvider(
-            provider, estimator, self._compaction, budget=budget, event_bus=child_bus,
-        )
-        # 复用 S9 的请求前四层整理，归档保存在子 Run 的 outputs 中
-        child_loop = AgentLoop(
-            managed,
-            child_registry,
-            child_bus,
-            context=child_context,
-            permission_manager=self._permission_manager,
-            session_id=self._session_id,
-            compactor=Compactor(self._compaction, estimator),
-            compaction=self._compaction, run_path=child_run_path,
-            budget=budget, estimator=estimator,
+        child_loop = create_agent_loop(
+            provider, child_registry, child_bus, context=child_context,
+            compaction=self._compaction, permission_manager=self._permission_manager,
+            session_id=self._session_id, run_path=child_run_path,
         )
 
         await self._parent_bus.publish_safe(
@@ -266,28 +241,10 @@ class SpawnAgentTool(BaseTool):
             return allowed is None or name in allowed
 
         registry = ToolRegistry()
-        _all_tools = [
-            ReadFileTool(self._workspace),
-            BashTool(self._workspace, self._execution),
-            WriteFileTool(self._workspace),
-            ListDirTool(self._workspace),
-            FindFilesTool(self._workspace),
-            SearchTextTool(self._workspace),
-            EditFileTool(self._workspace),
-        ]
-        for t in _all_tools:
-            if _allowed(t.name):
-                registry.register(t)
-
         child_task_manager = TaskManager(self._runs_dir / child_run_id / ".tasks")
-        for t in [
-            TaskCreateTool(child_task_manager),
-            TaskUpdateTool(child_task_manager),
-            TaskListTool(child_task_manager),
-            TaskGetTool(child_task_manager),
-        ]:
-            if _allowed(t.name):
-                registry.register(t)
+        for tool in builtin_tools(self._workspace, self._execution, child_task_manager):
+            if _allowed(tool.name):
+                registry.register(tool)
 
         if self._depth < 1:
             nested = SpawnAgentTool(

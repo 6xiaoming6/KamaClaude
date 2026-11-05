@@ -19,11 +19,11 @@ from kama_claude.core.bus.events import (
 )
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import ToolCallBlock
-from kama_claude.core.tools.base import FileTool, ToolResult
+from kama_claude.core.tools.base import BaseTool, FileTool, ToolResult
 from kama_claude.core.tools.builtin.bash import BashTool
 from kama_claude.core.tools.errors import RateLimitedError, ToolError
 from kama_claude.core.tools.registry import ToolRegistry
-from kama_claude.core.workspace import WorkspacePathError
+from kama_claude.core.workspace import PathAccess, WorkspacePathError
 
 if TYPE_CHECKING:
     from kama_claude.core.permissions.manager import PermissionManager
@@ -140,21 +140,42 @@ async def invoke_tool(
         return await finish(ToolResult(
             content=str(exc), is_error=True, error_type="permission_denied",
         ))
+    denied = await _authorize(
+        tool, tool_call, params, path_access, bus, run_id,
+        permission_manager=permission_manager, session_id=session_id,
+        workspace=workspace, checkpoint_hook=checkpoint_hook,
+    )
+    if denied is not None:
+        return await finish(denied)
+    result, attempt = await _execute_with_retry(
+        tool, tool_call, params, path_access, bus, run_id, timeout,
+        checkpoint_hook=checkpoint_hook, started_at=t0,
+    )
+    return await finish(result, attempt)
+
+
+# 审批是独立步骤；真正执行前仍会重新核对已批准的实际路径。
+async def _authorize(
+    tool: BaseTool, tool_call: ToolCallBlock, params: dict[str, object],
+    path_access: PathAccess | None, bus: EventBus, run_id: str, *,
+    permission_manager: PermissionManager | None, session_id: str,
+    workspace: Path | None, checkpoint_hook: ToolCheckpointHook | None,
+) -> ToolResult | None:
     if path_access is not None and path_access.outside_workspace and permission_manager is None:
-        return await finish(ToolResult(
+        return ToolResult(
             content=f"outside workspace; approval unavailable: {path_access.target}",
             is_error=True, error_type="permission_denied",
-        ))
+        )
     if permission_manager is not None:
-        if checkpoint_hook:
-            checkpoint_hook("awaiting_approval")
-
         # 将审批事件安全交给观察者，Future 的生命周期仍由权限管理器负责
         request_id = ""
 
         async def emit_permission(raw: dict[str, Any]) -> None:
             nonlocal request_id
             request_id = raw["request_id"]
+            # 只有确实需要询问时才提交等待状态，保存失败不能发出审批或执行工具。
+            if checkpoint_hook:
+                checkpoint_hook("awaiting_approval")
             await bus.publish_safe(PermissionRequestedEvent(**raw))
 
         path_options = {"path_access": path_access} if path_access is not None else {}
@@ -180,13 +201,11 @@ async def invoke_tool(
                         ts=_now(),
                     )
                 )
-            return await finish(
-                ToolResult(
+            return ToolResult(
                     content="Permission denied. Do not execute this operation.",
                     is_error=True,
                     error_type="permission_denied",
                 )
-            )
         if decision != "auto_allow":
             await bus.publish_safe(
                 PermissionGrantedEvent(
@@ -198,64 +217,81 @@ async def invoke_tool(
                 )
             )
 
+    return None
+
+
+async def _execute_attempt(
+    tool: BaseTool, params: dict[str, object], path_access: PathAccess | None,
+    timeout: float,
+) -> ToolResult:
+    try:
+        # 可信批准路径作为 Python 关键字传入，不读取模型提供的同名参数
+        operation = (
+            tool.invoke(params, approved_path=path_access.target)
+            if isinstance(tool, FileTool) and path_access is not None
+            else tool.invoke(params)
+        )
+        result = await asyncio.wait_for(
+            operation,
+            timeout=timeout,
+        )
+    except WorkspacePathError as exc:
+        result = ToolResult(content=str(exc), is_error=True, error_type="permission_denied")
+    except ToolError as exc:
+        result = ToolResult(content=str(exc), is_error=True, error_type=exc.error_type)
+    except PermissionError as exc:
+        result = ToolResult(
+            content=str(exc), is_error=True,
+            error_type="permission_denied" if tool.retry_safe else "runtime_error",
+            outcome_unknown=not tool.retry_safe,
+        )
+    except (FileNotFoundError, NotADirectoryError, IsADirectoryError, UnicodeError) as exc:
+        # 读取失败是明确错误；修改类工具未经明确分类的异常仍按未知副作用处理
+        known = tool.retry_safe
+        result = ToolResult(
+            content=str(exc), is_error=True,
+            error_type=("not_found" if isinstance(exc, FileNotFoundError)
+                        else "invalid_operation") if known else "runtime_error",
+            outcome_unknown=not known,
+        )
+    except RateLimitedError as exc:
+        result = ToolResult(content=str(exc), is_error=True, error_type="rate_limited")
+    # 超时不代表操作未发生，非安全工具要保守记录结果未知
+    except TimeoutError:
+        result = ToolResult(
+            content=f"tool timed out after {timeout}s",
+            is_error=True,
+            error_type="timeout",
+            outcome_unknown=not tool.retry_safe,
+        )
+    except Exception as exc:
+        result = ToolResult(
+            content=str(exc),
+            is_error=True,
+            error_type="runtime_error",
+            outcome_unknown=not tool.retry_safe,
+        )
+
+    return result
+
+
+async def _execute_with_retry(
+    tool: BaseTool, tool_call: ToolCallBlock, params: dict[str, object],
+    path_access: PathAccess | None, bus: EventBus, run_id: str, timeout: float, *,
+    checkpoint_hook: ToolCheckpointHook | None, started_at: float,
+) -> tuple[ToolResult, int]:
     for attempt in range(1, _MAX_RETRIES + 2):
         if isinstance(tool, FileTool) and path_access is not None:
             try:
                 tool.paths.resolve(path_access.requested_path, approved_path=path_access.target)
             except WorkspacePathError as exc:
-                return await finish(ToolResult(
+                return ToolResult(
                     content=str(exc), is_error=True, error_type="permission_denied",
-                ))
+                ), attempt
         # 执行意图提交成功后，才允许进入可能产生副作用的工具函数
         if checkpoint_hook:
             checkpoint_hook("executing")
-        try:
-            # 可信批准路径作为 Python 关键字传入，不读取模型提供的同名参数
-            operation = (
-                tool.invoke(params, approved_path=path_access.target)
-                if isinstance(tool, FileTool) and path_access is not None
-                else tool.invoke(params)
-            )
-            result = await asyncio.wait_for(
-                operation,
-                timeout=timeout,
-            )
-        except WorkspacePathError as exc:
-            result = ToolResult(content=str(exc), is_error=True, error_type="permission_denied")
-        except ToolError as exc:
-            result = ToolResult(content=str(exc), is_error=True, error_type=exc.error_type)
-        except PermissionError as exc:
-            result = ToolResult(
-                content=str(exc), is_error=True,
-                error_type="permission_denied" if tool.retry_safe else "runtime_error",
-                outcome_unknown=not tool.retry_safe,
-            )
-        except (FileNotFoundError, NotADirectoryError, IsADirectoryError, UnicodeError) as exc:
-            # 读取失败是明确错误；修改类工具未经明确分类的异常仍按未知副作用处理
-            known = tool.retry_safe
-            result = ToolResult(
-                content=str(exc), is_error=True,
-                error_type=("not_found" if isinstance(exc, FileNotFoundError)
-                            else "invalid_operation") if known else "runtime_error",
-                outcome_unknown=not known,
-            )
-        except RateLimitedError as exc:
-            result = ToolResult(content=str(exc), is_error=True, error_type="rate_limited")
-        # 超时不代表操作未发生，非安全工具要保守记录结果未知
-        except TimeoutError:
-            result = ToolResult(
-                content=f"tool timed out after {timeout}s",
-                is_error=True,
-                error_type="timeout",
-                outcome_unknown=not tool.retry_safe,
-            )
-        except Exception as exc:
-            result = ToolResult(
-                content=str(exc),
-                is_error=True,
-                error_type="runtime_error",
-                outcome_unknown=not tool.retry_safe,
-            )
+        result = await _execute_attempt(tool, params, path_access, timeout)
 
         retry = (
             result.is_error
@@ -265,7 +301,7 @@ async def invoke_tool(
         )
         # 成功、不可重试或次数耗尽时，返回本次调用的最终结果
         if not retry:
-            return await finish(result, attempt)
+            return result, attempt
         await bus.publish_safe(
             ToolCallFailedEvent(
                 run_id=run_id,
@@ -273,7 +309,7 @@ async def invoke_tool(
                 tool_name=tool_call.name,
                 error_class=result.error_type or "runtime_error",
                 error_message=result.content,
-                elapsed_ms=int((time.monotonic() - t0) * 1000),
+                elapsed_ms=int((time.monotonic() - started_at) * 1000),
                 attempt=attempt,
                 retrying=True,
                 ts=_now(),

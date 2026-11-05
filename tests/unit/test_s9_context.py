@@ -17,6 +17,7 @@ from kama_claude.core.llm.types import LlmResponse, ToolCallBlock
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.tools.base import BaseTool, ToolResult
 from kama_claude.core.tools.registry import ToolRegistry
+from tests.unit.loop_support import make_loop as build_test_loop
 from tests.unit.test_compactor import history, provider
 
 
@@ -43,7 +44,7 @@ def make_loop(
         events.append(event)
 
     bus.subscribe(collect)
-    loop = AgentLoop(
+    loop = build_test_loop(
         model, ToolRegistry(), bus, context=context, compactor=Compactor(config),
         compaction=config, run_path=tmp_path, persistence=persistence, session_id="sess-s9",
     )
@@ -87,7 +88,7 @@ async def test_hard_budget_applies_with_auto_disabled(tmp_path: Path, large_part
     if large_part == "system":
         context.run.system_prompt = "中" * 1_000
     if large_part == "tools":
-        loop._registry = Mock(tool_schemas=Mock(return_value=[{"description": "中" * 1_000}]))
+        loop._tools.registry = Mock(tool_schemas=Mock(return_value=[{"description": "中" * 1_000}]))
     await loop.run()
     assert context.run.status == "interrupted"
     assert context.run.phase == "llm" and context.run.step == 3
@@ -177,7 +178,7 @@ async def test_archive_failure_preserves_completed_tool(
     context.run.phase = "ready"
     context.run.step = 0
     tool = LargeTool()
-    loop._registry.register(tool)
+    loop._tools.registry.register(tool)
     original_archive = budget._archive_output
     monkeypatch.setattr(budget, "_archive_output", Mock(side_effect=OSError("disk full")))
     with pytest.raises(OSError):
@@ -295,7 +296,7 @@ def test_tui_compaction_feedback_is_session_scoped(monkeypatch: pytest.MonkeyPat
     app = KamaTuiApp("127.0.0.1", 1)
     app._session_id = "sess-s9"
     content = []
-    monkeypatch.setattr(app, "_append", lambda widget: content.append(str(widget.content)))
+    monkeypatch.setattr(app._view, "append", lambda widget: content.append(str(widget.content)))
     base = {"session_id": "sess-s9", "run_id": "r"}
     app._handle_event({"type": "context.compaction_started", **base})
     app._handle_event({
@@ -320,7 +321,7 @@ def test_compaction_configuration(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
 
     from kama_claude.core.config import get_config
 
-    monkeypatch.setattr("kama_claude.core.config.load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr("kama_claude.core.config.loader.load_dotenv", lambda *args, **kwargs: None)
     for name in os.environ:
         if name.startswith("KAMA_"):
             monkeypatch.delenv(name)

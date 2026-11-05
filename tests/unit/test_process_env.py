@@ -7,7 +7,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from kama_claude.core.config import ExecutionConfig, KamaConfig, _apply_toml
+from kama_claude.core.config import ExecutionConfig, KamaConfig
+from kama_claude.core.config.toml import apply_toml
 from kama_claude.core.mcp.client import McpClient
 from kama_claude.core.process_env import build_process_env
 from kama_claude.core.tools.command import CommandExecutor
@@ -60,7 +61,7 @@ async def test_mcp_uses_same_filter(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_execution_and_per_server_configuration() -> None:
     config = KamaConfig()
-    _apply_toml(config, {
+    apply_toml(config, {
         "execution": {"forward_env": ["BUILD_FLAG"], "env": {"MODE": "test"}},
         "mcp": {"servers": [{"name": "local", "command": "python", "forward_env": ["MCP_KEY"]}]},
     })
@@ -75,7 +76,7 @@ def test_execution_and_per_server_configuration() -> None:
 ])
 def test_invalid_environment_configuration(settings: dict[str, Any]) -> None:
     with pytest.raises(SystemExit):
-        _apply_toml(KamaConfig(), {"execution": settings})
+        apply_toml(KamaConfig(), {"execution": settings})
 
 
 async def test_main_and_nested_agents_share_environment_config(tmp_path: Path) -> None:

@@ -126,7 +126,10 @@ class SessionOpenResult(BaseModel):
     session: dict[str, Any]
     revision: int
     messages: list[dict[str, Any]] = Field(
-        description="Full original conversation from thread.jsonl, not compacted model context.",
+        description=(
+            "Full original conversation from thread.jsonl, not compacted model context. "
+            "Rows may include id and run_id for display correlation; these are not model input."
+        ),
     )
     run: dict[str, Any] | None
     running: bool

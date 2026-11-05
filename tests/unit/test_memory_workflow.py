@@ -6,7 +6,9 @@ from unittest.mock import Mock
 
 import pytest
 
-from kama_claude.core.config import KamaConfig, _apply_env, _apply_toml
+from kama_claude.core.config import KamaConfig
+from kama_claude.core.config.environment import apply_env
+from kama_claude.core.config.toml import apply_toml
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock
 from kama_claude.core.memory.store import MemoryStore
@@ -191,17 +193,17 @@ async def test_memory_tools_read_write_delete(tmp_path: Path) -> None:
 # 设计：对独立配置对象使用现有解析入口，避免依赖本机配置文件
 def test_memory_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
     config = KamaConfig()
-    _apply_toml(config, {"memory": {"project_tokens": 100, "session_tokens": 0}})
+    apply_toml(config, {"memory": {"project_tokens": 100, "session_tokens": 0}})
     monkeypatch.setenv("KAMA_MEMORY_PROJECT_TOKENS", "200")
-    _apply_env(config)
+    apply_env(config)
     assert config.memory.project_tokens == 200 and config.memory.session_tokens == 0
     with pytest.raises(SystemExit):
-        _apply_toml(config, {"memory": {"global_tokens": -1}})
+        apply_toml(config, {"memory": {"global_tokens": -1}})
     with pytest.raises(SystemExit):
-        _apply_toml(config, {"memory": {"unknown": 5}})
+        apply_toml(config, {"memory": {"unknown": 5}})
     monkeypatch.setenv("KAMA_MEMORY_GLOBAL_TOKENS", "-1")
     with pytest.raises(SystemExit):
-        _apply_env(config)
+        apply_env(config)
 
 
 # 功能：验证全局记忆授权只在原会话复用，不写权限文件。

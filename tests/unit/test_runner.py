@@ -350,7 +350,7 @@ async def test_provider_setup_failure_commits_interruption_and_cleans_observers(
     def unavailable_provider(model: str) -> None:
         raise SystemExit("missing API key")
 
-    monkeypatch.setattr("kama_claude.core.runner.DeepseekProvider", unavailable_provider)
+    monkeypatch.setattr("kama_claude.core.llm.factory.DeepseekProvider", unavailable_provider)
     bus.subscribe(collect_permanent)
     runner = AgentRunner(_config(), bus=bus, extra_handlers=[collect])
     outcome = await runner.run_and_capture(

@@ -11,7 +11,10 @@ from kama_claude.core.compact.estimator import (
     UsageAnchor,
     estimate_bytes,
 )
-from kama_claude.core.config import KamaConfig, _apply_env, _apply_toml
+from kama_claude.core.config import KamaConfig
+from kama_claude.core.config.environment import apply_env
+from kama_claude.core.config.toml import apply_toml
+from tests.unit.loop_support import make_loop as build_test_loop
 
 
 # 功能：验证 UTF-8 字节估算、向上取整和完整请求的结构字段
@@ -124,14 +127,14 @@ def test_compaction_counter_keeps_raw_comparison():
 def test_budget_config_and_removed_tokenizer_config(monkeypatch):
     config = KamaConfig()
     assert config.agent.max_total_tokens == config.agent.max_run_seconds == 0
-    _apply_toml(config, {"agent": {"max_run_seconds": 60, "repeat_failure_limit": 0}})
+    apply_toml(config, {"agent": {"max_run_seconds": 60, "repeat_failure_limit": 0}})
     monkeypatch.setenv("KAMA_AGENT_MAX_TOTAL_TOKENS", "20000")
-    _apply_env(config)
+    apply_env(config)
     assert config.agent.max_run_seconds == 60 and config.agent.max_total_tokens == 20000
     with pytest.raises(SystemExit):
-        _apply_toml(config, {"agent": {"max_run_seconds": -1}})
+        apply_toml(config, {"agent": {"max_run_seconds": -1}})
     with pytest.raises(SystemExit, match="Unknown top-level"):
-        _apply_toml(config, {"token_estimation": {"tokenizer_path": "unused"}})
+        apply_toml(config, {"token_estimation": {"tokenizer_path": "unused"}})
 
 
 # 功能：验证 Usage 锚点与动态阈值能触发单靠全文粗估不会触发的四层压缩
@@ -197,7 +200,6 @@ async def test_anchor_hard_limit_still_checked_when_auto_disabled():
     from kama_claude.core.config import CompactionConfig
     from kama_claude.core.context import ExecutionContext
     from kama_claude.core.events.bus import EventBus
-    from kama_claude.core.loop import AgentLoop
     from kama_claude.core.tools.registry import ToolRegistry
     from tests.unit.test_run_protection import provider, run_state
     messages = [{"role": "user", "content": "goal"}]
@@ -206,7 +208,7 @@ async def test_anchor_hard_limit_still_checked_when_auto_disabled():
     estimator.observe("system", messages, [], 40000)
     model = provider()
     context = ExecutionContext(run=run, messages=messages)
-    loop = AgentLoop(model, ToolRegistry(), EventBus(), context=context, estimator=estimator,
+    loop = build_test_loop(model, ToolRegistry(), EventBus(), context=context, estimator=estimator,
                      compaction=CompactionConfig(auto_threshold=0))
     await loop.run()
     assert run.status == "interrupted" and run.reason == "context_budget_exceeded"

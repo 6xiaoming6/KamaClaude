@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from kama_claude.core.permissions.bash import CommandRule
 from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.permissions.policy import PermissionDecision, ToolPolicy
 from kama_claude.core.workspace import WorkspacePaths
@@ -32,29 +34,31 @@ async def request(
     )
 
 
-# 同一会话的同一命令复用，换命令、会话、工作区或重启都不能复用。
+# 功能：验证相同 Bash 命令也必须逐次询问，不保留会话批准
+# 设计：跨 Run、目录和会话重复请求，并直接尝试所有不支持的持久选项
 async def test_command_grants_are_scoped(tmp_path: Path) -> None:
     manager = PermissionManager(timeout_s=0.1)
     events: list[dict[str, Any]] = []
-    assert await request(manager, events, decision="always_allow", workspace=tmp_path) == (
-        True, "always_allow",
-    )
-    assert await request(manager, events, workspace=tmp_path, run_id="r2") == (True, "auto_allow")
-    assert len(events) == 1
+    assert await request(manager, events, workspace=tmp_path) == (True, "allow_once")
+    assert await request(manager, events, workspace=tmp_path, run_id="r2") == (True, "allow_once")
+    assert len(events) == 2
     await request(manager, events, workspace=tmp_path, command="echo different")
     await request(manager, events, workspace=tmp_path, sid="s2")
     await request(manager, events, workspace=tmp_path / "another")
     await request(PermissionManager(), events, workspace=tmp_path)
-    assert len(events) == 5
-    assert len({event["request_id"] for event in events}) == 5
+    assert len(events) == 6
+    assert len({event["request_id"] for event in events}) == 6
+    assert all(e["allowed_decisions"] == ["allow_once", "deny_once"] for e in events)
+    assert not manager._session_grants and not manager._file_grants
 
 
+# 功能：验证本次拒绝不禁止后续相同命令
+# 设计：重复相同输入，断言第二次仍发布审批且可允许
 async def test_session_denial_does_not_ban_other_commands() -> None:
     manager = PermissionManager()
     events: list[dict[str, Any]] = []
-    assert (await request(manager, events, decision="always_deny"))[0] is False
-    assert await request(manager, events) == (False, "auto_deny")
-    assert (await request(manager, events, command="echo other"))[0] is True
+    assert (await request(manager, events, decision="deny_once"))[0] is False
+    assert await request(manager, events) == (True, "allow_once")
     assert len(events) == 2
 
 
@@ -62,10 +66,12 @@ async def test_session_denial_does_not_ban_other_commands() -> None:
 async def test_explicit_deny_wins_over_existing_grants(tool_name: str) -> None:
     manager = PermissionManager({tool_name: ToolPolicy(PermissionDecision.ASK)})
     async def emit(event: dict[str, Any]) -> None:
-        reply(manager, event, "always_allow")
+        reply(manager, event, "allow_once" if tool_name == "bash" else "always_allow")
     params = {"command": "echo hello"} if tool_name == "bash" else {}
     assert (await manager.check_and_wait("t", tool_name, params, "s", emit))[0]
-    manager._policies[tool_name] = ToolPolicy(PermissionDecision.DENY, allow_patterns=[".*"])
+    manager._policies[tool_name] = ToolPolicy(
+        PermissionDecision.DENY, command_rules=[CommandRule(("echo",), "allow")],
+    )
     assert manager.evaluate(tool_name, params) == PermissionDecision.DENY
     assert await manager.check_and_wait("t", tool_name, params, "s", emit) == (False, "auto_deny")
 
@@ -73,8 +79,10 @@ async def test_explicit_deny_wins_over_existing_grants(tool_name: str) -> None:
 async def test_deny_pattern_wins_over_grant() -> None:
     manager = PermissionManager()
     events: list[dict[str, Any]] = []
-    await request(manager, events, decision="always_allow")
-    manager._policies["bash"] = ToolPolicy(PermissionDecision.ASK, deny_patterns=["echo"])
+    await request(manager, events)
+    manager._policies["bash"] = ToolPolicy(
+        PermissionDecision.ASK, command_rules=[CommandRule(("echo",), "deny")],
+    )
     assert await request(manager, events) == (False, "auto_deny")
     assert len(events) == 1
 
@@ -93,7 +101,7 @@ async def test_legacy_allow_is_ignored_deny_is_preserved(tmp_path: Path) -> None
     path.write_text(content, encoding="utf-8")
     manager = PermissionManager(policy_file=path)
     events: list[dict[str, Any]] = []
-    await request(manager, events, decision="always_allow")
+    await request(manager, events)
     assert len(events) == 1
     assert path.read_text(encoding="utf-8") == content
     assert manager.evaluate("write_file", {}) == PermissionDecision.DENY
@@ -101,7 +109,9 @@ async def test_legacy_allow_is_ignored_deny_is_preserved(tmp_path: Path) -> None
     assert len(events) == 2
 
 
-async def test_file_grant_is_exact_directory_and_tool(tmp_path: Path) -> None:
+# 功能：验证授权仅匹配同一会话、同一工具和同一实际文件
+# 设计：改变路径写法、目标、工具、内容和会话，排除原目录级放行及原始路径匹配
+async def test_file_grant_is_exact_file_and_tool(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()
     paths = WorkspacePaths(root)
@@ -109,19 +119,62 @@ async def test_file_grant_is_exact_directory_and_tool(tmp_path: Path) -> None:
     events: list[dict[str, Any]] = []
     async def emit(event: dict[str, Any]) -> None:
         events.append(event)
+        with pytest.raises(ValueError, match="not allowed"):
+            reply(manager, event, "always_deny")
         reply(manager, event, "always_allow" if not event["outside_workspace"] else "allow_once")
-    async def write(path: str, tool: str = "write_file") -> tuple[bool, str]:
+    async def write(
+        path: str, tool: str = "write_file", *, sid: str = "s", content: str = "x",
+    ) -> tuple[bool, str]:
         return await manager.check_and_wait(
-            "t", tool, {"path": path, "content": "x"}, "s", emit, paths.inspect(path),
+            "t", tool, {"path": path, "content": content}, sid, emit, paths.inspect(path),
         )
     await write("a.txt")
-    assert await write("b.txt") == (True, "auto_allow")
+    assert events[0]["allowed_decisions"] == ["allow_once", "deny_once", "always_allow"]
+    assert str(root / "a.txt") in events[0]["approval_scope"]
+    assert await write("./a.txt", content="changed") == (True, "auto_allow")
+    assert await write(str(root / "a.txt")) == (True, "auto_allow")
+    await write("b.txt")
     await write("nested/c.txt")
     await write("a.txt", "edit_file")
+    await write("a.txt", sid="another")
     await write("../outside.txt")
     await write("../outside.txt")
-    assert len(events) == 5
+    assert len(events) == 7
     assert all(e["allowed_decisions"] == ["allow_once", "deny_once"] for e in events[-2:])
+    manager.cancel_session("s")
+    assert all(key[0] != "s" for key in manager._file_grants)
+    await write("a.txt")
+    assert len(events) == 8
+
+
+# 功能：验证授权使用后端实际路径而不是模型原始路径，且不跨重启保存
+# 设计：故意让原始参数与可信解析结果不同，随后分别访问两个目标
+async def test_file_grant_uses_only_backend_target(tmp_path: Path) -> None:
+    paths = WorkspacePaths(tmp_path)
+    manager = PermissionManager()
+    events: list[dict[str, Any]] = []
+    async def emit(event: dict[str, Any]) -> None:
+        events.append(event)
+        reply(manager, event, "always_allow")
+    async def write(raw: str, target: str) -> tuple[bool, str]:
+        return await manager.check_and_wait(
+            "t", "write_file", {"path": raw, "content": "x"}, "s", emit,
+            paths.inspect(target),
+        )
+    await write("model.txt", "actual.txt")
+    assert events[0]["resolved_path"] == str(tmp_path / "actual.txt")
+    assert await write("./actual.txt", "actual.txt") == (True, "auto_allow")
+    await write("model.txt", "model.txt")
+    assert len(events) == 2
+    await write("ACTUAL.txt", "ACTUAL.txt")
+    assert len(events) == (2 if os.name == "nt" else 3)
+    restarted = PermissionManager()
+    async def allow_once(event: dict[str, Any]) -> None:
+        events.append(event)
+        reply(restarted, event, "allow_once")
+    assert await restarted.check_and_wait(
+        "t", "write_file", {"path": "actual.txt"}, "s", allow_once, paths.inspect("actual.txt"),
+    ) == (True, "allow_once")
 
 
 @pytest.mark.parametrize("command", ["cat /etc/hosts", "cd .."])
@@ -151,6 +204,9 @@ async def test_concurrent_ids_binding_replay_and_invalid_decisions() -> None:
                 manager.respond(a["request_id"], "allow_once", session_id=sid, run_id=rid)
         with pytest.raises(ValueError, match="not allowed"):
             reply(manager, a, "invented")
+        for invalid in ("always_allow", "always_deny"):
+            with pytest.raises(ValueError, match="not allowed"):
+                reply(manager, a, invalid)
         assert len(manager.pending_for_session("s")) == 2
         reply(manager, b, "deny_once")
         assert await tasks[1] == (False, "deny_once")
@@ -234,7 +290,7 @@ async def test_open_preserves_child_approval_identity_and_close_revokes(tmp_path
     sessions = session_manager(SessionStore(tmp_path), Provider([]), [], permissions=permissions)
     session = await sessions.create("chat")
     events: list[dict[str, Any]] = []
-    await request(permissions, events, sid=session.id, decision="always_allow")
+    await request(permissions, events, sid=session.id)
     async def emit(event: dict[str, Any]) -> None:
         pass
     pending = asyncio.create_task(permissions.check_and_wait(
@@ -247,7 +303,7 @@ async def test_open_preserves_child_approval_identity_and_close_revokes(tmp_path
         assert first == second and first["run_id"] == "child-run"
         await sessions.close(session.id)
         assert await pending == (False, "deny_once")
-        assert not permissions._session_grants
+        assert not permissions._session_grants and not permissions._file_grants
         with pytest.raises(ValueError, match="expired"):
             reply(permissions, first, "allow_once")
     finally:
@@ -283,7 +339,7 @@ async def test_bash_approval_uses_actual_tool_directory(tmp_path: Path) -> None:
         if event.type == "permission.requested":
             directories.append(event.workspace)
             permissions.respond(
-                event.request_id, "always_allow", session_id=event.session_id, run_id=event.run_id,
+                event.request_id, "allow_once", session_id=event.session_id, run_id=event.run_id,
             )
     bus.subscribe(emit)
     for name in ("a", "b", "b"):
@@ -296,13 +352,13 @@ async def test_bash_approval_uses_actual_tool_directory(tmp_path: Path) -> None:
             session_id="s", permission_manager=permissions, workspace=tmp_path,
         )
         assert not result.is_error
-    assert directories == [str(tmp_path / "a"), str(tmp_path / "b")]
+    assert directories == [str(tmp_path / "a"), str(tmp_path / "b"), str(tmp_path / "b")]
 
 
 async def test_session_close_wins_over_answer_not_yet_consumed() -> None:
     manager = PermissionManager()
     async def emit(event: dict[str, Any]) -> None:
-        reply(manager, event, "always_allow")
+        reply(manager, event, "allow_once")
         manager.cancel_session("s", reason="session_closed")
     assert await manager.check_and_wait("t", "bash", {}, "s", emit) == (False, "deny_once")
     assert not manager._pending and not manager._session_grants

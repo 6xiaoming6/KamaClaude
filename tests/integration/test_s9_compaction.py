@@ -45,6 +45,7 @@ async def test_compaction_checkpoint_survives_real_process_restart(
         assert saved.run.step == 1 and saved.run.phase == "llm"
         full_history = store.read_history(sid)
         assert full_history == original + [{"role": "user", "content": "continue existing task"}]
+        display_history = store.read_history(sid, include_metadata=True)
         daemon.kill()
         with pytest.raises(ConnectionError):
             await asyncio.wait_for(waiter, 3)
@@ -54,7 +55,7 @@ async def test_compaction_checkpoint_survives_real_process_restart(
         client, receiver = await connect(free_port)
         opened = await client.send_command("session.open", {"session_id": sid})
         assert opened["run"]["status"] == "interrupted"
-        assert opened["messages"] == full_history
+        assert opened["messages"] == display_history
         assert opened["messages"] != saved.messages
         await client.send_command("session.resume", {
             "session_id": sid, "expected_revision": opened["revision"], "action": "continue",
@@ -62,8 +63,8 @@ async def test_compaction_checkpoint_survives_real_process_restart(
         final = await wait_status(client, sid, "success")
         assert final["run"]["step"] == 2
         assert final["run"]["run_id"] == saved.run.run_id
-        assert final["messages"][:len(full_history)] == full_history
-        assert final["messages"] == store.read_history(sid)
+        assert final["messages"][:len(display_history)] == display_history
+        assert final["messages"] == store.read_history(sid, include_metadata=True)
         working = store.checkpoints.load(sid).messages
         if mode == "llm":
             assert working[0]["content"].startswith(SUMMARY_MARKER)

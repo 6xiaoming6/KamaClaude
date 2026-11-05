@@ -85,3 +85,35 @@ def test_priority_chain_full(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     cfg = get_config()
 
     assert cfg.port == 8000
+
+
+# 覆盖全局→项目→dotenv→系统环境的合并，确保拆模块没有改变各层优先级。
+def test_global_project_and_environment_priority(tmp_path: Path, monkeypatch) -> None:
+    import os
+
+    from kama_claude.core.config import loader
+
+    for name in list(os.environ):
+        if name.startswith("KAMA_"):
+            monkeypatch.delenv(name)
+    global_path = tmp_path / "global.toml"
+    global_path.write_text(
+        '[core]\nport = 5000\n[logging]\nformat = "json"\n', encoding="utf-8",
+    )
+    project = tmp_path / "repo"
+    (project / ".kama").mkdir(parents=True)
+    (project / ".kama" / "config.toml").write_text(
+        '[core]\nport = 6000\n[agent]\nmax_steps = 7\n', encoding="utf-8",
+    )
+    (project / ".env").write_text("KAMA_PORT=7000\n", encoding="utf-8")
+    monkeypatch.chdir(project)
+    monkeypatch.setattr(loader, "_DEFAULT_CONFIG_PATH", str(global_path))
+    monkeypatch.setenv("KAMA_PORT", "8000")
+    config = get_config()
+    assert config.port == 8000 and config.agent.max_steps == 7
+    assert config.logging.format == "json"
+    monkeypatch.delenv("KAMA_PORT")
+    assert get_config().port == 7000
+    monkeypatch.delenv("KAMA_PORT")
+    monkeypatch.setattr(loader, "load_dotenv", lambda *args, **kwargs: None)
+    assert get_config().port == 6000
