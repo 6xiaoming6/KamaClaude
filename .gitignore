@@ -19,7 +19,6 @@ uv.lock
 # Local practice files
 /workspace/
 
-# dev keeps its overview, interviews and improvement outline
+# Only publish this stage's new documentation
 /docs/*
-!/docs/interview/
-!/docs/S8-二次开发改进大纲.md
+!/docs/S11-*.md
