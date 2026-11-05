@@ -9,11 +9,28 @@ def apply_env(config: KamaConfig) -> None:
     _apply_core(config)
     _apply_logging(config)
     _apply_agent(config)
+    _apply_subagent(config)
     _apply_llm(config)
     _apply_trace(config)
     _apply_permission(config)
     _apply_compaction(config)
     _apply_memory(config)
+
+
+# 环境变量覆盖 TOML，零、负数和非整数都不能成为有效子任务限额。
+def _apply_subagent(config: KamaConfig) -> None:
+    for key in ("max_active", "max_total"):
+        name = f"KAMA_SUBAGENT_{key.upper()}"
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        try:
+            amount = int(raw)
+        except ValueError as exc:
+            raise SystemExit(f"Config error: {name} must be a positive integer") from exc
+        if amount <= 0:
+            raise SystemExit(f"Config error: {name} must be a positive integer")
+        setattr(config.subagent, key, amount)
 
 
 def _apply_core(config: KamaConfig) -> None:
@@ -180,15 +197,15 @@ def _apply_compaction(config: KamaConfig) -> None:
 
 
 def _apply_memory(config: KamaConfig) -> None:
-    for scope in ("global", "project", "session"):
-        name = f"KAMA_MEMORY_{scope.upper()}_TOKENS"
+    for key in ("global_auto_tokens", "project_index_tokens"):
+        name = f"KAMA_MEMORY_{key.upper()}"
         raw = os.environ.get(name)
         if raw is None:
             continue
         try:
             memory_amount = int(raw)
         except ValueError as exc:
-            raise SystemExit(f"Config error: {name} must be a nonnegative integer") from exc
-        if memory_amount < 0:
-            raise SystemExit(f"Config error: {name} must be a nonnegative integer")
-        setattr(config.memory, scope + "_tokens", memory_amount)
+            raise SystemExit(f"Config error: {name} must be a positive integer") from exc
+        if memory_amount <= 0:
+            raise SystemExit(f"Config error: {name} must be a positive integer")
+        setattr(config.memory, key, memory_amount)

@@ -34,3 +34,14 @@ class LlmResponse:
     usage: UsageStats | None = None
     # thinking blocks from extended thinking — must be preserved verbatim in conversation history
     thinking_blocks: list[dict[str, object]] = field(default_factory=list)
+
+    # 锚点和 Loop 共用相同消息格式，避免上次输出被重复估算或误判为历史改写。
+    def content_blocks(self) -> list[dict[str, object]]:
+        blocks = list(self.thinking_blocks)
+        if self.text:
+            blocks.append({"type": "text", "text": self.text})
+        for call in self.tool_calls:
+            blocks.append({
+                "type": "tool_use", "id": call.id, "name": call.name, "input": call.input,
+            })
+        return blocks

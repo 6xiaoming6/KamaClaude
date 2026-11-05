@@ -21,8 +21,6 @@ from kama_claude.core.bus.commands import (
     AgentRunResult,
     EventSubscribeCommand,
     EventSubscribeResult,
-    MemoryInspectCommand,
-    MemoryInspectResult,
     PermissionRespondCommand,
     PermissionRespondResult,
     PongResult,
@@ -198,16 +196,6 @@ class CoreApp:
         result = await self._sessions.compact(cmd.session_id, cmd.focus)
         return result
 
-    # 直接查看记忆文件与冻结快照，不占用 Agent 步数或生成对话消息
-    async def _memory_inspect_handler(self, params: dict[str, Any]) -> MemoryInspectResult:
-        assert self._sessions is not None
-        cmd = MemoryInspectCommand.model_validate(params)
-        result = self._sessions.inspect_memory(
-            cmd.session_id, scope=cmd.scope, key=cmd.key,
-            query=cmd.query, offset=cmd.offset, limit=cmd.limit,
-        )
-        return MemoryInspectResult(**result)
-
     # 关闭 session 并返回 closed 状态
     async def _session_close_handler(self, params: dict[str, Any]) -> SessionCloseResult:
         assert self._sessions is not None
@@ -316,6 +304,7 @@ class CoreApp:
             bus=self._bus,
             provider_factory=lambda: DeepseekProvider(config.llm.default_model),
             compaction=config.compaction,
+            memory=config.memory,
             task_registry=self._task_registry,
             permission_manager=self._permission_manager,
         )
@@ -338,7 +327,6 @@ class CoreApp:
         server.register("session.close", self._session_close_handler)
         server.register("permission.respond", self._permission_respond_handler)
         server.register("session.compact", self._session_compact_handler)
-        server.register("memory.inspect", self._memory_inspect_handler)
 
         addr = await server.start()
         logger.info("kama-core %s listening addr=%s", kama_claude.__version__, addr)

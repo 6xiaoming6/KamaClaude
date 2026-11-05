@@ -26,7 +26,8 @@ from kama_claude.core.llm.base import LLMProvider
 from kama_claude.core.llm.factory import ProviderFactory
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.mcp.server import McpServerManager
-from kama_claude.core.memory.context import build_memory_context
+from kama_claude.core.memory.context import DEFAULT_SYSTEM, build_memory_context, compose_system
+from kama_claude.core.memory.paths import project_root
 from kama_claude.core.memory.store import MemoryStore
 from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.runs import RUNS_DIR, new_run_id
@@ -117,7 +118,8 @@ class AgentRunner:
             if _ok(tool.name):
                 registry.register(tool)
         memory = MemoryStore(
-            workspace, store.session_dir(session.id) if session and store else None,
+            workspace, self._config.memory,
+            project=Path(run.memory_project_root) if run and run.memory_project_root else None,
         )
         for memory_tool in (
             MemoryReadTool(memory), MemoryWriteTool(memory, session_id, run_id or ""),
@@ -128,6 +130,10 @@ class AgentRunner:
         # 创建子agent的工具是否注册
         if provider is not None and bus is not None and run_id is not None:
             runs_dir = child_runs_dir or self._runs_dir
+            self._task_registry.bind_root(
+                run_id, session_id, self._config.subagent,
+                known_ids=run.subagents if run is not None else (),
+            )
             # 恢复后派生的子任务也沿用父 Run 冻结的限制，而非重启时的新配置
             limits = replace(
                 self._config.agent, max_steps=run.max_steps,
@@ -154,8 +160,11 @@ class AgentRunner:
                         workspace=workspace,
                         execution=self._config.execution,
                         agent_config=limits, compaction=self._config.compaction,
+                        memory_config=self._config.memory,
+                        memory_project_root=memory.project_root,
                         provider_name=provider_name, model=model,
                         provider_factory=self._providers.for_model, tool_whitelist=child_tools,
+                        root_run_id=run_id, subagent_config=self._config.subagent,
                     )
                 )
             if _ok("agent_result"):
@@ -182,7 +191,7 @@ class AgentRunner:
         context = self._create_context(
             self._new_run_state(goal, run_id, tools),
             cp.messages,
-            memory_store=MemoryStore(Path.cwd(), store.session_dir(session.id)),
+            memory_store=MemoryStore(Path.cwd(), self._config.memory),
             system_prompt_override=system_prompt,
         )
         persistence = RunPersistence(context, cp, session, store)
@@ -316,7 +325,8 @@ class AgentRunner:
             run,
             cp.messages if cp else [],
             memory_store=MemoryStore(
-                Path(run.workspace), store.session_dir(session.id) if session and store else None,
+                Path(run.workspace), self._config.memory,
+                project=Path(run.memory_project_root) if run.memory_project_root else None,
             ),
             system_prompt_override=system_prompt_override,
         )
@@ -339,6 +349,7 @@ class AgentRunner:
         return RunCheckpoint(
             run_id=run_id, goal=goal, provider=provider, model=model,
             workspace=str(Path.cwd().resolve()),
+            memory_project_root=str(project_root(Path.cwd())),
             max_steps=self._config.agent.max_steps,
             max_run_seconds=self._config.agent.max_run_seconds,
             max_total_tokens=self._config.agent.max_total_tokens,
@@ -362,18 +373,10 @@ class AgentRunner:
         )
         # 没有冻结提示才重新构建，已有值不随记忆文件变化而覆盖
         if not run.system_prompt:
-            # 新 Run 读取一次；恢复和正式调度都复用已冻结提示，完全不碰记忆文件
-            run.memory_snapshot = build_memory_context(
-                memory_store, self._config.memory,
-                include_session=bool(memory_store.has_session),
-            )
-            context.memory_context = run.memory_snapshot.text
-            run.system_prompt = context.system_prompt(
-                "You are a helpful AI assistant. "
-                "Use the available tools to complete the user's goal. "
-                "When the goal is fully achieved, respond with a final answer "
-                "and do not call any more tools."
-            )
+            run.memory_project_root = str(memory_store.project_root)
+            run.base_system_prompt = system_prompt_override or DEFAULT_SYSTEM
+            run.memory_snapshot = build_memory_context(memory_store)
+            run.system_prompt = compose_system(run.base_system_prompt, run.memory_snapshot)
         return context
 
 
@@ -419,6 +422,7 @@ class AgentRunner:
             provider, registry, bus, context=context, compaction=self._config.compaction,
             permission_manager=self._permission_manager, persistence=persistence,
             session_id=session.id if session else "", run_path=run_path, subagents=subagents,
+            memory_config=self._config.memory,
         )
 
 

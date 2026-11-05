@@ -21,7 +21,7 @@ class BudgetExceeded(RuntimeError):
 # 预算事件不依赖具体 Provider；Loop 终止和模型请求共用此入口。
 async def publish_budget(
     bus: EventBus, budget: RunBudget, method: str = "", estimated_input: int = 0,
-    reason: str = "", *, trigger_tokens: int = 0, underestimate_factor: float = 1.0,
+    reason: str = "", *, trigger_tokens: int = 0,
 ) -> None:
     run = budget.run
     await bus.publish_safe(RunBudgetEvent(
@@ -30,7 +30,7 @@ async def publish_budget(
         elapsed_seconds=run.elapsed_seconds, max_total_tokens=run.max_total_tokens,
         max_run_seconds=run.max_run_seconds, usage_complete=run.usage_complete,
         reason=reason, trigger_tokens=trigger_tokens,
-        underestimate_factor=underestimate_factor, ts=datetime.now(UTC).isoformat(),
+        ts=datetime.now(UTC).isoformat(),
     ))
 
 

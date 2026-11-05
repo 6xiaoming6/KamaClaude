@@ -2,7 +2,7 @@
 
 一个 Python 本地 AI Agent：TUI 展示对话、工具进度和审批，Core 调用模型与工具。前后端使用 TCP / JSON-RPC / NDJSON 通信。
 
-S10 在 S9 上完善**工具审批与子进程环境控制**，保留已有运行保护、上下文压缩、Markdown 记忆和检查点恢复。
+S10 在 S9 上完善**工具审批、子进程环境控制与轻量多 Agent 协作**，保留已有运行保护、上下文压缩、Markdown 记忆和检查点恢复。
 
 ## 从这里看运行主线
 
@@ -71,11 +71,24 @@ find_files 找文件 → search_text 搜索符号 → read_file 按行阅读
 
 - Core 共享子任务注册表，同一会话的新 Run 可以查询之前的任务；查询隔离会话，关闭会话和 Core 时清理对应任务。
 - 前后台共用运行、取消和异常收尾；查询会检查业务状态，步数耗尽等失败不再显示为空成功。完成后释放 Context，只保留最近 100 条结果。
+- `agent_result(run_id, wait_s=10)` 最多等待 0～30 秒。等待超时或查询者取消不会取消后台子任务；超时提示稍后继续查询，完成后立即返回。
+- 同一根 Run 的子、孙任务共享数量限制：默认最多同时活跃 3 个、累计派生 8 个；前后台都计数，超过直接返回 `resource_limit`。结果缓存淘汰或更换 Runner 不重置累计数，恢复会补入检查点中已提交的派生记录。
+- 子任务提示统一要求“结论、证据、已完成、验证、遗留事项”五个 Markdown 章节。结束后先原子保存 `runs/<子Run ID>/report.md`，再通知与缓存；前台返回和后台查询均提供真实状态、最多 4,000 字符的回答摘要及全文路径。模型陈述与后端执行记录分开，不从模型回答推断测试通过或退出码。
 - 角色缺失、损坏直接报错；省略白名单表示继承父范围，`allowed_tools=[]` 表示没有工具。planner、reviewer 默认不提供写文件和 shell。
 - 子任务使用相同的运行保护、Usage 锚点估算和四层上下文整理。时间、Token 与重复失败限制继承父 Run 的冻结值；TUI 单独展示子任务用量和停止原因。
 - 内建角色默认继承父模型；自定义角色的 `model` 可切换当前供应商的模型。子任务消耗暂不汇总进父 Run Token 上限，仍不支持子任务树断点恢复。
 
-详见 [子 Agent 生命周期与运行保护](./docs/S9-子Agent生命周期与运行保护.md)。
+```toml
+[subagent]
+max_active = 3
+max_total = 8
+```
+
+也可使用 `KAMA_SUBAGENT_MAX_ACTIVE`、`KAMA_SUBAGENT_MAX_TOTAL`；两项都必须为正整数。关闭会话清理对应内存额度，重启 Core 不恢复未完成的子任务树。
+
+`agent_result` 新增参数改变了工具 Schema。升级前先完成或终止相关旧 Run；冻结 Schema 不兼容时仍拒绝续跑，不静默替换工具定义。RPC 和检查点版本均未改变。
+
+流程与阅读顺序见 [S10 轻量多 Agent 协作](./docs/S10-轻量多Agent协作.md)。
 
 ## 工作区路径与单次审批
 
@@ -93,8 +106,8 @@ find_files 找文件 → search_text 搜索符号 → read_file 按行阅读
 - 运行限制：原有 Step 上限，加上可选累计时间与 Token 上限；恢复不重置累计值。
 - 连续相同工具失败第 3 次提醒模型改变方法，默认第 5 次停止。
 - 命令分块读取、最多保留 64 KiB 输出，超时和取消时清理受管进程。未知副作用仍由用户确认。
-- 请求估算：上次真实总输入 Usage＋新增消息的 UTF-8 字节数 ÷ 4；历史改变时全文重估。
-- 动态阈值：低估系数 `min(4, max(1, 上次真实输入 / 本次全文粗估))`；用原输入上限除以系数，再乘压缩比例。
+- 请求估算：最近一次请求的真实输入＋输出 Usage，再加其后新增消息的 UTF-8 字节数 ÷ 4（向上取整）；上次 assistant 回复不重复估算，历史改变时全文重估。
+- 固定阈值：输入硬预算为“上下文窗口－输出预留－1,024”，默认达到其 80% 时触发压缩；不再按实际量与粗估量的比例修正阈值或硬预算。
 - 普通请求、自动摘要和模型重试共用预算。失败或缺少 Usage 的请求保留估算占用，不当成零消耗。
 - TUI 分开显示实际已知 Token、估算占用和执行时间；缓存输入计入上下文占用。
 
@@ -108,7 +121,7 @@ repeat_failure_limit = 5  # 0关闭
 
 已移除 tokenizer 依赖和配置。锚点按 Provider、模型与请求用途隔离，随检查点保存；system、工具定义或旧消息变化时失效。主 Run Token 上限不包含子 Agent 的模型请求；未知用量保留估算占用，不是精确账单。
 
-详见 [运行保护与 Usage 锚点估算](./docs/S9-运行保护与Usage锚点估算.md)，包含新旧对照、配置、保存链路和阅读顺序。
+S10 的当前计算方式见 [Usage 锚点与固定压缩阈值](./docs/S10-Usage锚点与固定压缩阈值.md)；运行保护基础见 [S9 运行保护](./docs/S9-运行保护与Usage锚点估算.md)。
 
 ## 四层处理顺序
 
@@ -116,7 +129,7 @@ repeat_failure_limit = 5  # 0关闭
 flowchart TD
     PREP[Loop 准备本次模型请求] --> L1[第一层：长结果归档，保留头尾预览]
     L1 --> C1{仍达到软阈值？}
-    C1 -->|否| SAVE[有变化则提交检查点]
+    C1 -->|否| SAVE[有历史变化则刷新规则和索引]
     C1 -->|是| L2[第二层：精确去重旧只读结果]
     L2 --> C2{仍达到软阈值？}
     C2 -->|否| SAVE
@@ -126,8 +139,8 @@ flowchart TD
     C3 -->|是| L4[第四层：尝试一次 LLM 旧历史摘要]
     L4 --> SAVE
     SAVE --> HARD{输入是否在硬预算内？}
-    HARD -->|是| MODEL[调用普通任务模型]
-    HARD -->|否| STOP[中断，保留 llm 阶段与 Step]
+    HARD -->|是| MODEL[提交检查点后调用普通任务模型]
+    HARD -->|否| STOP[保存中断，保留 llm 阶段与 Step]
     MODEL -->|工具调用| TOOL[执行工具并保存完整结果]
     TOOL --> PREP
 ```
@@ -143,32 +156,34 @@ flowchart TD
 
 核心主线仍是 **SessionManager → AgentRunner → AgentLoop**。分层协调在 Compactor，候选提交仍走原检查点入口。
 
-## Markdown 记忆与注入
+## 用户规则与索引式记忆
 
-每条记忆一个 Markdown 文件，可按 key 新增、更新、删除，文件可直接阅读：
+新 Run 默认加载四个精简入口，详细主题通过 `memory_read` 按需读取：
 
-| 层级 | 目录 | 默认自动注入预算 |
-| --- | --- | --- |
-| 全局偏好 | `~/.kama/memory/<key>.md` | 512 估算 token |
-| 项目事实 | `<项目>/.kama/memory/<key>.md` | 1,024 估算 token |
-| 会话决定 | `<会话目录>/memory/<key>.md` | 512 估算 token |
+| 入口 | 维护者与内容 |
+| --- | --- |
+| `~/.kama/AGENTS.md` | 用户维护，全局规则，Agent 只读 |
+| `~/.kama/AGENTS.auto.md` | Agent 维护的少量全局信息，默认最多 512 估算 token |
+| `<项目根>/AGENTS.md` | 用户维护的项目规则，Agent 只读 |
+| `~/.kama/projects/<project-id>/memory/MEMORY.md` | 项目主题索引，默认最多 1,024 估算 token |
 
-新 Run 读取一次，固定条目优先，再按更新时间排序；全文放不下用 key 与摘要，再不足则省略。详情通过 `memory_read` 获取，维护通过 `memory_write`；不额外调用 LLM 提炼记忆。
+项目根优先识别 Git 根，非 Git 目录使用固定 workspace；ID 包含规范路径哈希，同名项目和不同 worktree 分开。主题分为 `user / feedback / project / reference`，使用 Markdown 保存摘要、正文和来源，索引由后端维护。
+
+`memory_write` 默认允许更新项目主题或全局自动信息，明确禁止策略仍生效。更新全局自动文件须携带 `memory_read(scope="global")` 返回的 `expected_hash`，避免覆盖并发更新。内置文件写入、编辑和记忆接口不能修改用户规则；获批本机 Shell 和远程 MCP 仍受各自能力边界限制，不提供系统级只读隔离。
 
 ```toml
 [memory]
-global_tokens = 512
-project_tokens = 1024
-session_tokens = 512
+global_auto_tokens = 512
+project_index_tokens = 1024
 ```
 
-环境变量为 `KAMA_MEMORY_GLOBAL_TOKENS`、`KAMA_MEMORY_PROJECT_TOKENS`、`KAMA_MEMORY_SESSION_TOKENS`；0 关闭对应层的自动注入。完整请求仍受 S9 总预算控制。
+环境变量为 `KAMA_MEMORY_GLOBAL_AUTO_TOKENS`、`KAMA_MEMORY_PROJECT_INDEX_TOKENS`，两项均为正整数。写入超预算时明确要求精简，不截断用户规则。完整请求还需通过统一输入预算检查。
 
-TUI 空闲时输入 **`/memory`**，只读查看当前条目、正文和最近 Run 实际注入的快照，支持作用域切换与分页。查看不调用模型、不创建 Run。恢复旧 Run 沿用冻结提示，不重新加载记忆。
+普通步骤沿用已提交的提示；任一压缩层实际改变工作历史后，重新读取四个入口，替换旧注入块，再把新历史与快照一起保存。下一次模型调用使用刷新后的提示；恢复中断 Run 使用最近已提交的快照。
 
-旧 `note_save`、旧 loader 和笔记读写接口已移除；旧 `context.md`、`notes.md` 留在原处，不迁移、不再自动读取。旧 Run 冻结了已删除工具时会明确拒绝恢复，可终止后开始新任务。
+已删除前端 `/memory` 页面及后端 `memory.inspect` RPC。记忆通过自然语言调用工具维护，也可在磁盘查看 Markdown。旧三层记忆文件保留但不读取、不迁移，旧 scope、pinned 和配置项不再支持；旧中断 Run 遇到工具 Schema 变化仍拒绝续跑，应先完成或终止旧 Run。
 
-会话和项目写入默认允许；全局写入默认审批，并与项目许可分开缓存。记忆文件使用原子替换；删除记忆不删除完整对话。
+完整设计、工具示例、压缩刷新和阅读入口见 [S10 规则与索引式记忆](./docs/S10-规则与索引式记忆.md)。
 
 ## MCP 标准远程连接
 

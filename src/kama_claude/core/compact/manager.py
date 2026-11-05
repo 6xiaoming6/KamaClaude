@@ -14,9 +14,12 @@ from kama_claude.core.bus.events import (
 )
 from kama_claude.core.compact.compactor import CompactionResult, Compactor, write_summary
 from kama_claude.core.compact.estimator import TokenEstimator, estimate_bytes
-from kama_claude.core.config import CompactionConfig
+from kama_claude.core.config import CompactionConfig, MemoryConfig
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.managed import ManagedProvider
+from kama_claude.core.memory.context import refresh_prompt
+from kama_claude.core.memory.model import MemoryError
+from kama_claude.core.memory.store import MemoryStore
 
 if TYPE_CHECKING:
     from kama_claude.core.checkpoint.persistence import RunPersistence
@@ -85,6 +88,7 @@ class ContextManager:
         persistence: RunPersistence | None = None,
         session_id: str = "",
         run_path: Path | None = None,
+        memory: MemoryStore | None = None,
     ) -> None:
         self.context = context
         self.config = config
@@ -96,15 +100,18 @@ class ContextManager:
         self._persistence = persistence
         self._session_id = session_id
         self._run_path = run_path
+        self._memory = memory
 
     # 每次请求前整理、提交，再检查硬预算；恢复模型调用也走同一入口。
     async def prepare(self, system: str, schemas: list[dict[str, Any]]) -> bool:
         context, run, config = self.context, self.context.run, self.config
         counter = self._estimator.select(system, context.messages, schemas)
+        result: CompactionResult | None = None
+        report_failure = False
         if self._compactor is not None:
             pressure = config.auto_threshold > 0 and counter.request(
                 system, context.messages, schemas
-            ) >= counter.trigger(config.input_limit, config.auto_threshold)
+            ) >= int(config.input_limit * config.auto_threshold)
             if pressure:
                 await self._bus.publish_safe(
                     ContextCompactionStartedEvent(
@@ -122,26 +129,43 @@ class ContextManager:
                 outputs_dir=self._run_path / "outputs" if self._run_path else None,
             )
             if result.compacted:
+                if self._memory is not None:
+                    try:
+                        snapshot, system = refresh_prompt(run, self._memory)
+                    except (MemoryError, ValueError) as exc:
+                        context.mark_interrupted(f"memory_refresh_failed: {exc}")
+                        self._save()
+                        result.compacted = False
+                        result.applied_stages = []
+                        result.reason = run.reason or "memory_refresh_failed"
+                        await publish_compaction(
+                            self._bus, self._session_id, run.run_id, result, self._run_path,
+                            report_failure=True,
+                        )
+                        return False
+                    run.memory_snapshot = snapshot
+                    run.system_prompt = system
                 context.messages = result.messages
-                self._save()
-            await publish_compaction(
-                self._bus,
-                self._session_id,
-                run.run_id,
-                result,
-                self._run_path,
-                report_failure=(
-                    pressure or result.reason not in ("below_threshold", "auto_disabled")
-                ),
-            )
+            report_failure = pressure or result.reason not in ("below_threshold", "auto_disabled")
         # 旧前缀改变时重新选择估算方式，不能继续套用失效的 Usage 锚点。
         counter = self._estimator.select(system, context.messages, schemas)
-        if counter.request(system, context.messages, schemas) > counter.effective_limit(
-            config.input_limit,
-        ):
+        if counter.request(system, context.messages, schemas) > config.input_limit:
             context.mark_interrupted("context_budget_exceeded")
             self._save()
+            if result is not None:
+                result.reason = "context_budget_exceeded"
+                await publish_compaction(
+                    self._bus, self._session_id, run.run_id, result, self._run_path,
+                    report_failure=True,
+                )
             return False
+        if result is not None:
+            if result.compacted:
+                self._save()
+            await publish_compaction(
+                self._bus, self._session_id, run.run_id, result, self._run_path,
+                report_failure=report_failure,
+            )
         return True
 
     def _save(self) -> None:
@@ -158,6 +182,7 @@ async def compact_session(
     config: CompactionConfig,
     provider_factory: Callable[[], LLMProvider],
     focus: str,
+    *, memory_config: MemoryConfig | None = None,
 ) -> SessionCompactResult:
     cp = store.ensure_checkpoint(session_id)
     run_id = cp.run.run_id if cp.run else ""
@@ -192,7 +217,26 @@ async def compact_session(
         provider_factory=summary_provider,
     )
     if result.compacted:
-        cp.messages = result.messages
+        if cp.run is not None:
+            memory = MemoryStore(
+                Path(cp.run.workspace), memory_config,
+                project=Path(cp.run.memory_project_root) if cp.run.memory_project_root else None,
+            )
+            try:
+                snapshot, system = refresh_prompt(cp.run, memory)
+            except (MemoryError, ValueError) as exc:
+                result.compacted = False
+                result.applied_stages = []
+                result.reason = f"memory_refresh_failed: {exc}"
+            else:
+                cp.run.memory_snapshot = snapshot
+                cp.run.system_prompt = system
+                counter = estimator.select(system, result.messages, cp.run.tool_schemas)
+                required = counter.request(system, result.messages, cp.run.tool_schemas)
+                if required > config.input_limit:
+                    result.reason = "context_budget_exceeded"
+        if result.compacted:
+            cp.messages = result.messages
     # 摘要未被采用也可能取得有效 Usage，和工作历史在这里一起提交。
     if result.compacted or managed is not None:
         store.save_checkpoint(cp)

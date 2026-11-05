@@ -187,14 +187,14 @@ class Compactor:
                 counter.request(system, messages, schemas),
                 counter.request(system, working, schemas),
             )
-        # 第一层可能改写旧结果，此时旧锚点失效，阈值按整理后的请求重算
+        # 第一层改写旧结果会使锚点失效；使用整理后的输入重新判断压力。
         counter = self._estimator.select(system, working, schemas)
         threshold = config.auto_threshold or (0.8 if manual else 0.0)
         if not threshold:
             result.reason = "auto_disabled"
             return result
-        # Cline 式缩小整个预算，触发阈值与程序整理目标使用同一个系数
-        soft_limit = counter.trigger(config.input_limit, threshold)
+        # 压缩阈值和程序整理目标只由固定预算与配置比例决定。
+        soft_limit = int(config.input_limit * threshold)
         if counter.request(system, working, schemas) < soft_limit:
             result.reason = "below_threshold"
             return result
@@ -212,7 +212,7 @@ class Compactor:
                 input_before = counter.request(system, working, schemas)
                 changes = reduce(
                     working, outputs_dir, protected_start, system, schemas,
-                    counter.trigger(config.input_limit, config.prune_target_ratio),
+                    int(config.input_limit * config.prune_target_ratio),
                     counter=counter,
                 )
                 if changes:
@@ -287,8 +287,8 @@ class Compactor:
         if not old:
             unchanged.reason = "no_old_history"
             return unchanged
-        effective_limit = counter.effective_limit(self._config.input_limit)
-        if counter.request(system, recent, tool_schemas or []) >= effective_limit:
+        input_limit = self._config.input_limit
+        if counter.request(system, recent, tool_schemas or []) >= input_limit:
             unchanged.reason = "required_context_too_large"
             return unchanged
 
@@ -310,9 +310,7 @@ class Compactor:
         summary_counter = self._estimator.select(
             _SUMMARY_SYSTEM, request, [], kind="summary",
         )
-        if summary_counter.request(_SUMMARY_SYSTEM, request, []) > (
-            summary_counter.effective_limit(summary_limit)
-        ):
+        if summary_counter.request(_SUMMARY_SYSTEM, request, []) > summary_limit:
             unchanged.reason = "summary_input_too_large"
             return unchanged
         unchanged.llm_used = True
@@ -352,7 +350,7 @@ class Compactor:
                 unchanged.reason = "insufficient_reduction"
             elif (
                 counter.request(system, candidate, tool_schemas or [])
-                > effective_limit
+                > input_limit
             ):
                 unchanged.reason = "context_budget_exceeded"
             else:

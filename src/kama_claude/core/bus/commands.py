@@ -4,7 +4,6 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Discriminator, Field
 
-from kama_claude.core.memory.model import MemoryScope, MemorySnapshot
 from kama_claude.core.session.model import SessionMode, SessionStatus
 
 
@@ -150,24 +149,6 @@ class SessionResumeResult(BaseModel):
     revision: int
 
 
-class MemoryInspectCommand(BaseModel):
-    type: Literal["memory.inspect"] = "memory.inspect"
-    session_id: str
-    scope: MemoryScope | None = None
-    key: str | None = None
-    query: str = ""
-    offset: int = Field(default=0, ge=0)
-    limit: int = Field(default=20, ge=1, le=50)
-
-
-class MemoryInspectResult(BaseModel):
-    workspace: str
-    layers: list[dict[str, Any]]
-    entry: dict[str, Any] | None
-    run_id: str | None
-    snapshot: MemorySnapshot | None
-
-
 # 根据 type 字段决定命令类型的判别联合
 Command = Annotated[
     PingCommand
@@ -181,7 +162,6 @@ Command = Annotated[
     | SessionCompactCommand
     | SessionListCommand
     | SessionOpenCommand
-    | SessionResumeCommand
-    | MemoryInspectCommand,
+    | SessionResumeCommand,
     Discriminator("type"),
 ]

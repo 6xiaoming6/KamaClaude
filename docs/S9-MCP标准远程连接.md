@@ -74,7 +74,7 @@ flowchart TD
 
 推荐阅读顺序：
 
-1. [配置](../src/kama_claude/core/config.py)：McpServerConfig 和 MCP 小节解析，删除 host/port，增加 url/headers。
+1. [配置模型](../src/kama_claude/core/config/models.py)与 [MCP 小节解析](../src/kama_claude/core/config/toml.py)：删除 host/port，增加 url/headers；S10 将原 config.py 拆为配置包，导入入口保持不变。
 2. [管理器](../src/kama_claude/core/mcp/server.py)：连接、工具发现、缓存、注册和关闭；发现失败会关闭已经建立的连接。
 3. [客户端](../src/kama_claude/core/mcp/client.py)：两种连接入口、会话生命周期、分页和结果转换。
 4. [工具包装](../src/kama_claude/core/mcp/tool.py)：保持原 BaseTool 接口，区分确定错误与连接异常。

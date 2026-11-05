@@ -107,6 +107,8 @@ class AgentLoop:
         # 请求前准备
         if not await self._context_manager.prepare(system, schemas):
             return False
+        # 压缩可能刷新规则和索引，模型必须使用刚提交的完整提示。
+        system = run.system_prompt or system
         try:
             response = await self._provider.chat(
                 messages=context.messages,
@@ -141,11 +143,7 @@ class AgentLoop:
     def _record_response(self, response: LlmResponse) -> None:
         context = self._context
         run = context.run
-        blocks: list[dict[str, object]] = list(response.thinking_blocks)
-        if response.text:
-            blocks.append({"type": "text", "text": response.text})
-        for tc in response.tool_calls:
-            blocks.append({"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.input})
+        blocks = response.content_blocks()
         context.add_assistant_message(blocks)
         if self._persistence is not None:
             self._persistence.record_message("assistant", blocks)

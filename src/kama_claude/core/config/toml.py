@@ -9,7 +9,7 @@ from kama_claude.core.config.models import KamaConfig, McpServerConfig
 def apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
     unknown = set(data.keys()) - {
         "core", "logging", "agent", "llm", "trace", "permission", "execution",
-        "compaction", "memory", "mcp",
+        "compaction", "memory", "mcp", "subagent",
     }
     if unknown:
         raise SystemExit(f"Unknown top-level config keys: {', '.join(sorted(unknown))}")
@@ -20,6 +20,8 @@ def apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
         _apply_logging(config, data["logging"])
     if "agent" in data:
         _apply_agent(config, data["agent"])
+    if "subagent" in data:
+        _apply_subagent(config, data["subagent"])
     if "llm" in data:
         _apply_llm(config, data["llm"])
     if "trace" in data:
@@ -34,6 +36,19 @@ def apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
         _apply_memory(config, data["memory"])
     if "mcp" in data:
         _apply_mcp(config, data["mcp"])
+
+
+# 子任务只配置同一根 Run 的并发与总派生数量，不引入排队状态。
+def _apply_subagent(config: KamaConfig, value: Any) -> None:
+    if not isinstance(value, dict):
+        raise SystemExit("Config error: [subagent] must be a table")
+    unknown = set(value) - {"max_active", "max_total"}
+    if unknown:
+        raise SystemExit(f"Unknown [subagent] keys: {', '.join(sorted(unknown))}")
+    for key, amount in value.items():
+        if type(amount) is not int or amount <= 0:
+            raise SystemExit(f"Config error: subagent.{key} must be a positive integer")
+        setattr(config.subagent, key, amount)
 
 
 def _apply_core(config: KamaConfig, value: Any) -> None:
@@ -191,14 +206,14 @@ def _apply_compaction(config: KamaConfig, value: Any) -> None:
 
 def _apply_memory(config: KamaConfig, value: Any) -> None:
     memory = value
-    keys = {"global_tokens", "project_tokens", "session_tokens"}
+    keys = {"global_auto_tokens", "project_index_tokens"}
     if not isinstance(memory, dict):
         raise SystemExit("Config error: [memory] must be a table")
     if set(memory) - keys:
         raise SystemExit("Config error: unknown [memory] keys")
     for key, val in memory.items():
-        if type(val) is not int or val < 0:
-            raise SystemExit(f"Config error: memory.{key} must be a nonnegative integer")
+        if type(val) is not int or val <= 0:
+            raise SystemExit(f"Config error: memory.{key} must be a positive integer")
         setattr(config.memory, key, val)
 
 

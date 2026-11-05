@@ -18,7 +18,7 @@ def test_tool_defaults() -> None:
         assert evaluate(tool, {}) == PermissionDecision.ALLOW
     for tool in ("write_file", "edit_file", "some_future_tool", "bash"):
         assert evaluate(tool, {}) == PermissionDecision.ASK
-    assert evaluate("memory_write", {"scope": "global"}) == PermissionDecision.ASK
+    assert evaluate("memory_write", {"scope": "global"}) == PermissionDecision.ALLOW
 
 
 # 功能：验证工具明确禁止优先于参数允许规则

@@ -15,7 +15,6 @@ from kama_claude.core.skills.loader import SkillLoader
 from kama_claude.core.transport.socket_client import IpcError, SocketClient
 from kama_claude.tui.conversation import ConversationView
 from kama_claude.tui.formatting import _preview
-from kama_claude.tui.memory import MemoryScreen
 from kama_claude.tui.recovery import RecoveryActions, SessionPicker
 from kama_claude.tui.widgets.input import ChatTextArea, SlashCompleteWidget
 from kama_claude.tui.widgets.permissions import PermissionBlock, PermissionSelect
@@ -108,7 +107,6 @@ class KamaTuiApp(App[None]):
     def _build_slash_items(self) -> list[tuple[str, str]]:
         items: list[tuple[str, str]] = [
             ("compact", "compress context window"),
-            ("memory", "查看 Markdown 记忆与 Run 注入快照"),
         ]
         try:
             loader = SkillLoader()
@@ -124,7 +122,7 @@ class KamaTuiApp(App[None]):
     # 根据 / 前缀查询字符串挂载、更新或移除自动补全弹窗
     def on_chat_text_area_slash_changed(self, event: ChatTextArea.SlashChanged) -> None:
         # 模态查看窗口打开后，忽略旧聊天输入框迟到的补全事件
-        if self._prompt() is None or isinstance(self.screen, MemoryScreen):
+        if self._prompt() is None:
             return
         query = event.query
         if query is None:
@@ -207,11 +205,6 @@ class KamaTuiApp(App[None]):
         content = event.value.strip()
         if not content:
             return
-        if content == "/memory":
-            event.text_area.text = ""
-            if self._client is not None and self._session_id is not None:
-                self.run_worker(self._do_memory(), name="memory", exclusive=False)
-            return
         # 检测 /compact 指令
         if content == "/compact":
             event.text_area.text = ""
@@ -232,20 +225,6 @@ class KamaTuiApp(App[None]):
         self._view.append(Static(f"[bold]>[/bold] {content}", classes="user-turn"))
         self._update_header("running")
         self.run_worker(self._do_send_message(content), name="send_message", exclusive=False)
-
-    # 只读查看记忆，RPC 不产生用户消息或 Agent Run
-    async def _do_memory(self) -> None:
-        client, sid = self._client, self._session_id
-        if client is None or sid is None:
-            return
-        try:
-            data = await client.send_command("memory.inspect", {"session_id": sid, "limit": 50})
-            if self._client is client and self._session_id == sid:
-                await self.push_screen(MemoryScreen(client, sid, data))
-        except (IpcError, RuntimeError, OSError) as exc:
-            self._view.append(
-                Static("记忆读取失败：" + str(exc), markup=False, classes="run-err")
-            )
 
     # 在 worker 中执行手动压缩命令，完成后显示结果横幅
     async def _do_compact(self) -> None:

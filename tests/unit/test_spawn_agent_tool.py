@@ -10,6 +10,7 @@ import pytest
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse, UsageStats
 from kama_claude.core.subagent.registry import ActiveSubagent, BackgroundTaskRegistry
+from kama_claude.core.subagent.result import PENDING_RESULT
 from kama_claude.core.subagent.tool import AgentResultTool, SpawnAgentTool
 
 
@@ -83,8 +84,8 @@ async def test_background_returns_run_id(tmp_path: Path) -> None:
     assert registry.get(run_id, "sess-test") is not None
 
 
-# 功能：后台任务未完成时 agent_result 应返回 "still running"
-# 设计：用 Event 阻塞 provider.chat，在未等待任务完成时查询 agent_result
+# 功能：后台任务未完成时立即查询返回运行中，并提示稍后继续等待。
+# 设计：用 Event 阻塞模型，显式指定 wait_s=0 验证非阻塞查询语义。
 @pytest.mark.asyncio
 async def test_agent_result_pending(tmp_path: Path) -> None:
     event = asyncio.Event()
@@ -110,8 +111,8 @@ async def test_agent_result_pending(tmp_path: Path) -> None:
     run_id = spawn_result.content.split("run_id=")[1].split(".")[0]
 
     result_tool = AgentResultTool(registry, "sess-test")
-    result = await result_tool.invoke({"run_id": run_id})
-    assert result.content == "still running"
+    result = await result_tool.invoke({"run_id": run_id, "wait_s": 0})
+    assert result.content == PENDING_RESULT
     assert not result.is_error
 
     event.set()

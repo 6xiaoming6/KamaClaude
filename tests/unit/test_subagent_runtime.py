@@ -346,7 +346,7 @@ async def test_background_task_survives_new_runner(
     assert all(runner._task_registry is registry for runner in runners)
     assert checkpoint.run is not None and checkpoint.run.status == "success"
     assert any(
-        block.get("content") == "child answer"
+        "child answer" in block.get("content", "")
         for message in checkpoint.messages if isinstance(message["content"], list)
         for block in message["content"] if block.get("type") == "tool_result"
     )

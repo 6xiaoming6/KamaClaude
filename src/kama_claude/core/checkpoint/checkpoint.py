@@ -16,9 +16,10 @@ class CheckpointError(RuntimeError):
     pass
 
 
-# 最近一次请求的总输入用量和消息前缀，不保存另一份对话内容
+# 最近一次有效 Usage 的输入、输出及其覆盖前缀，不保存另一份对话内容。
 class UsageAnchor(BaseModel):
     input_tokens: int = Field(gt=0, strict=True)
+    output_tokens: int = Field(default=0, ge=0, strict=True)
     message_count: int = Field(ge=0, strict=True)
     prefix_hash: str
 
@@ -42,6 +43,9 @@ class RunCheckpoint(BaseModel):
     provider: str = "deepseek"
     workspace: str
     system_prompt: str = ""
+    # 与规则、记忆分开保存，压缩后可安全重建完整提示。
+    base_system_prompt: str = ""
+    memory_project_root: str = ""
     # 仅记录本轮真正注入的内容，长期记忆仍以 Markdown 为准
     memory_snapshot: MemorySnapshot | None = None
     tool_whitelist: list[str] | None = None
@@ -79,7 +83,7 @@ class Checkpoint(BaseModel):
     # 原始消息先随快照提交，再幂等追加到 thread；不是另一份模型工作历史
     history_pending: list[dict[str, Any]] = Field(default_factory=list)
     history_initialized: bool = False
-    # 输入 Usage 与对应消息前缀指纹；不保存 tokenizer 或滑动样本
+    # 最近输入、输出 Usage 与覆盖前缀指纹；不保存 tokenizer 或滑动样本。
     token_estimation: dict[str, UsageAnchor] = Field(default_factory=dict)
 
     @model_validator(mode="after")

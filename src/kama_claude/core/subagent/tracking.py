@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from kama_claude.core.checkpoint.checkpoint import RunCheckpoint, ToolCheckpoint
+from kama_claude.core.subagent.result import PENDING_RESULT
 from kama_claude.core.tools.base import ToolResult
 
 
@@ -30,7 +31,7 @@ class SubagentTracker:
         if (
             tool.name == "agent_result"
             and (not result.is_error or result.error_type == "subagent_failed")
-            and not result.outcome_unknown and result.content != "still running"
+            and not result.outcome_unknown and result.content != PENDING_RESULT
         ):
             child_id = str(tool.input.get("run_id", ""))
             if child_id in self.run.subagents:

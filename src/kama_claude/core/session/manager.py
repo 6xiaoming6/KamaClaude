@@ -5,7 +5,6 @@ import logging
 import uuid
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from kama_claude.core.bus.commands import SessionCompactResult
@@ -23,10 +22,9 @@ from kama_claude.core.bus.events import (
 from kama_claude.core.checkpoint.checkpoint import Checkpoint, CheckpointError
 from kama_claude.core.checkpoint.recovery import RECOVERY_REQUIRED, SessionRecovery
 from kama_claude.core.compact.manager import compact_session
-from kama_claude.core.config import CompactionConfig
+from kama_claude.core.config import CompactionConfig, MemoryConfig
 from kama_claude.core.events.bus import EventBus
-from kama_claude.core.memory.model import SCOPES, MemoryError, MemoryScope
-from kama_claude.core.memory.store import MemoryStore
+from kama_claude.core.memory.model import MemoryError
 from kama_claude.core.runs import new_run_id
 from kama_claude.core.session.model import Session, SessionMode
 from kama_claude.core.session.store import SessionStore
@@ -61,6 +59,7 @@ class SessionManager:
         permission_manager: PermissionManager | None = None,
         compaction: CompactionConfig | None = None,
         task_registry: BackgroundTaskRegistry | None = None,
+        memory: MemoryConfig | None = None,
     ) -> None:
         self._store = store
         self._recovery = SessionRecovery(store)
@@ -70,6 +69,7 @@ class SessionManager:
         self._provider_factory = provider_factory
         self._permissions = permission_manager
         self._compaction = compaction or CompactionConfig()
+        self._memory = memory or MemoryConfig()
         self._task_registry = task_registry
         self._sessions: dict[str, Session] = {}
         self._locks: dict[str, asyncio.Lock] = {}
@@ -150,9 +150,14 @@ class SessionManager:
             # 先保存目标和初始 Run，再登记后台执行，避免调度窗口丢任务
             runner = self._runner_factory()
             # 保存初始检查点，记录初始信息
-            runner.prepare_checkpoint(
-                cp, session, goal, run_id, system_prompt, tools, self._store,
-            )
+            try:
+                runner.prepare_checkpoint(
+                    cp, session, goal, run_id, system_prompt, tools, self._store,
+                )
+            except MemoryError as exc:
+                # 规则加载失败发生在任务登记前，回到磁盘中的原会话状态。
+                self._sessions[sid] = Session.from_dict(cp.session)
+                raise HandlerError(-32040, str(exc)) from exc
             # 先提交再启动；Core 持有任务，前端断线后仍可继续
             task = self._start(
                 sid, run_id,
@@ -300,36 +305,6 @@ class SessionManager:
             "pending_permissions": pending,
         }
 
-    # 只读查看当前 Markdown 和最近 Run 注入快照，不触发恢复、模型或文件写入
-    def inspect_memory(
-        self, sid: str, *, scope: MemoryScope | None = None, key: str | None = None,
-        query: str = "", offset: int = 0, limit: int = 20,
-    ) -> dict[str, Any]:
-        self._get_session(sid)
-        if key is not None and scope is None:
-            raise HandlerError(-32602, "reading a memory key requires scope")
-        cp = self._store.checkpoints.load(sid)
-        memory = MemoryStore(Path.cwd(), self._store.session_dir(sid))
-        try:
-            if key is not None:
-                assert scope is not None
-                entry = memory.read(scope, key, offset=offset)
-                layers = []
-            else:
-                entry = None
-                layers = [
-                    memory.list(item, query=query, offset=offset, limit=limit)
-                    for item in ((scope,) if scope is not None else SCOPES)
-                ]
-        except MemoryError as exc:
-            raise HandlerError(-32040, str(exc)) from exc
-        return {
-            "workspace": str(Path.cwd().resolve()), "layers": layers, "entry": entry,
-            "run_id": cp.run.run_id if cp.run else None,
-            "snapshot": cp.run.memory_snapshot.model_dump(mode="json")
-            if cp.run and cp.run.memory_snapshot is not None else None,
-        }
-
     # 在会话锁内应用恢复决定，保存成功后才启动原 Run
     async def resume(
         self,
@@ -391,6 +366,7 @@ class SessionManager:
         async with self._locks[sid]:
             return await compact_session(
                 self._store, sid, self._bus, self._compaction, self._get_compaction_provider, focus,
+                memory_config=self._memory,
             )
 
     # 仅在程序层不足时取得摘要 Provider，已有实例继续复用

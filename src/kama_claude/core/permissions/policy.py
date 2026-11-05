@@ -93,7 +93,5 @@ def assess(
         return PermissionAssessment(PermissionDecision(decision), reason, reusable=False)
     if path_access is not None and path_access.outside_workspace:
         return PermissionAssessment(PermissionDecision.ASK, "访问工作区外路径", reusable=False)
-    if tool_name == "memory_write" and params.get("scope", "project") == "global":
-        return PermissionAssessment(PermissionDecision.ASK, "写入全局记忆")
     default = policy.default if policy is not None else _UNKNOWN_TOOL_DEFAULT
     return PermissionAssessment(default, "工具默认策略")

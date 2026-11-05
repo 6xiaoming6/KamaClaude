@@ -238,7 +238,8 @@ async def test_injected_bus_receives_events(tmp_path: Path) -> None:
 
 # 功能：验证 session run 读取检查点工作历史，并把 Markdown 会话记忆注入 system prompt
 # 设计：用 CapturingProvider 截获 LLM 入参，不触发真实 API；同时断言 run 目录写到 session/runs 下
-async def test_session_history_and_memory_injected(tmp_path: Path) -> None:
+async def test_session_history_and_memory_injected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
     from kama_claude.core.session.model import Session
     from kama_claude.core.session.store import SessionStore
 
@@ -253,8 +254,8 @@ async def test_session_history_and_memory_injected(tmp_path: Path) -> None:
     )
     store.write_meta(session)
     store.append_message("sess-1", "user", "remember python")
-    MemoryStore(tmp_path, store.session_dir("sess-1")).upsert(
-        "session", "python", summary="Python", content="Python 3.12", source="test",
+    MemoryStore(tmp_path).upsert(
+        "python", summary="Python 3.12", content="Python 3.12", source="test",
     )
 
     provider = _CapturingProvider(LlmResponse(stop_reason="end_turn", text="done"))
@@ -271,7 +272,8 @@ async def test_session_history_and_memory_injected(tmp_path: Path) -> None:
 
 # 功能：验证 session run 注册 memory_write，工具调用写入会话 Markdown
 # 设计：mock provider 第一步请求 memory_write、第二步 end_turn，覆盖 runner→registry→tool invocation 的完整路径
-async def test_session_registers_memory_write_tool(tmp_path: Path) -> None:
+async def test_session_registers_memory_write_tool(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
     from kama_claude.core.session.model import Session
     from kama_claude.core.session.store import SessionStore
 
@@ -300,7 +302,7 @@ async def test_session_registers_memory_write_tool(tmp_path: Path) -> None:
                         ToolCallBlock(
                             id="note-1",
                             name="memory_write",
-                            input={"scope": "session", "key": "python", "summary": "Python",
+                            input={"scope": "project", "key": "python", "summary": "Python",
                                    "content": "Use Python 3.12"},
                         )
                     ],
@@ -321,8 +323,8 @@ async def test_session_registers_memory_write_tool(tmp_path: Path) -> None:
     runner = AgentRunner(_config(max_steps=3), provider=_MemoryProvider(), runs_dir=tmp_path)
     await runner.run_and_capture("remember", run_id="run-1", session=session, store=store)
 
-    assert MemoryStore(tmp_path, store.session_dir("sess-1")).get(
-        "session", "python",
+    assert MemoryStore(tmp_path).get(
+        "python",
     ).content == "Use Python 3.12"
 
 

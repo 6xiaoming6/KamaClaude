@@ -4,7 +4,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from kama_claude.core.checkpoint.checkpoint import RunCheckpoint
-from kama_claude.core.memory.context import MEMORY_GUIDANCE
+from kama_claude.core.memory.context import compose_system
+from kama_claude.core.memory.model import MemorySnapshot
 
 
 @dataclass
@@ -12,7 +13,6 @@ class ExecutionContext:
     # 所有运行字段共用这一份 run，messages 只保存模型工作历史
     run: RunCheckpoint
     messages: list[dict[str, Any]] = field(default_factory=list)
-    memory_context: str = ""
     # skill 或 subagent 角色可覆盖默认 system prompt
     system_prompt_override: str | None = None
 
@@ -27,7 +27,7 @@ class ExecutionContext:
         if self.run.system_prompt:
             return self.run.system_prompt
         prompt = self.system_prompt_override if self.system_prompt_override else base
-        return prompt + MEMORY_GUIDANCE + self.memory_context
+        return compose_system(prompt, self.run.memory_snapshot or MemorySnapshot())
 
     # 将 LLM 响应的 content blocks 追加为 assistant 消息
     def add_assistant_message(self, content: list[Any]) -> None:

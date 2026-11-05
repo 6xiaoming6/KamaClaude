@@ -29,6 +29,18 @@ class AgentConfig:
 
 
 @dataclass
+class SubagentConfig:
+    max_active: int = 3
+    max_total: int = 8
+
+    # 独立构造配置时同样检查正整数，避免绕过 TOML 和环境变量校验。
+    def __post_init__(self) -> None:
+        for value in (self.max_active, self.max_total):
+            if type(value) is not int or value <= 0:
+                raise ValueError("subagent limits must be positive integers")
+
+
+@dataclass
 class LlmConfig:
     default_model: str = _DEFAULT_MODEL
     router: str = "static"  # "static" | "rule_based" (S4) | "cost_budget" (S6)
@@ -71,9 +83,15 @@ class CompactionConfig:
 
 @dataclass
 class MemoryConfig:
-    global_tokens: int = 512
-    project_tokens: int = 1_024
-    session_tokens: int = 512
+    global_auto_tokens: int = 512
+    project_index_tokens: int = 1_024
+
+    # 自动入口必须保持有限预算，用户规则不受这两项裁剪。
+    def __post_init__(self) -> None:
+        if any(type(value) is not int or value <= 0 for value in (
+            self.global_auto_tokens, self.project_index_tokens,
+        )):
+            raise ValueError("memory budgets must be positive integers")
 
 
 @dataclass
@@ -99,6 +117,7 @@ class KamaConfig:
     port: int = _DEFAULT_PORT
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
+    subagent: SubagentConfig = field(default_factory=SubagentConfig)
     llm: LlmConfig = field(default_factory=LlmConfig)
     trace: TraceConfig = field(default_factory=TraceConfig)
     permission: PermissionConfig = field(default_factory=PermissionConfig)

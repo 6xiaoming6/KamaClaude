@@ -148,7 +148,7 @@ def test_tool_call_started_and_finished() -> None:
 # 功能：验证 memory_write 工具块显示作用域和 key
 # 设计：直接操作通用 ToolCallBlock，确认不需要专门的记忆显示分支
 def test_memory_write_tool_block_shows_key() -> None:
-    block = ToolCallBlock("memory_write", {"scope": "session", "key": "python"})
+    block = ToolCallBlock("memory_write", {"scope": "project", "key": "python"})
     block.set_result("saved", 3)
     assert "python" in block._summary()  # type: ignore[attr-defined]
 

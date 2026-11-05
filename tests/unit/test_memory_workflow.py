@@ -1,232 +1,325 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import Any
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from kama_claude.core.config import KamaConfig
+from kama_claude.core.bus.envelope import HandlerError
+from kama_claude.core.checkpoint.checkpoint import CheckpointError
+from kama_claude.core.compact.compactor import CompactionResult
+from kama_claude.core.config import CompactionConfig, KamaConfig, MemoryConfig
 from kama_claude.core.config.environment import apply_env
 from kama_claude.core.config.toml import apply_toml
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock
+from kama_claude.core.memory.context import build_memory_context, compose_system
 from kama_claude.core.memory.store import MemoryStore
-from kama_claude.core.permissions.manager import PermissionManager
-from kama_claude.core.permissions.policy import PermissionDecision, evaluate
+from kama_claude.core.permissions.policy import PermissionDecision, ToolPolicy, evaluate
 from kama_claude.core.runner import AgentRunner
 from kama_claude.core.session.manager import SessionManager
 from kama_claude.core.session.store import SessionStore
+from kama_claude.core.tools.builtin.edit_file import EditFileTool
 from kama_claude.core.tools.builtin.memory import MemoryReadTool, MemoryWriteTool
+from kama_claude.core.tools.builtin.write_file import WriteFileTool
+from kama_claude.core.tools.invocation import invoke_tool
+from kama_claude.core.tools.registry import ToolRegistry
+from kama_claude.core.workspace import WorkspacePathError
 from tests.unit.test_checkpoint_recovery import Crash, Provider, finish
+from tests.unit.test_s9_context import make_loop
 
 
-# 构建完整执行链路，仅模型替换为可观察的固定响应
-def setup_manager(tmp_path: Path, provider: Provider) -> tuple[SessionStore, SessionManager]:
-    store = SessionStore(tmp_path / "sessions")
-    bus = EventBus()
-    manager = SessionManager(
+# 构建真实协调层，只替换模型，保留检查点和完整历史提交路径。
+def setup_manager(path: Path, provider: Provider) -> tuple[SessionStore, SessionManager]:
+    store, bus = SessionStore(path / "sessions"), EventBus()
+    return store, SessionManager(
         store, lambda: AgentRunner(KamaConfig(), provider=provider, bus=bus), bus,
     )
-    return store, manager
 
 
-# 隔离真实用户目录与项目目录，避免用例读取用户自己的记忆
-def isolate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+# 功能：写入只影响下次新 Run，工具详情进入历史而自动索引不混入历史。
+# 设计：三次固定模型回复跨两个真实 Run，直接比较模型实际收到的 system。
+async def test_new_run_reads_new_index(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
-
-
-# 功能：验证本轮写入不改冻结提示，下一轮读取新记忆，全文历史不包含自动注入
-# 设计：真实 Manager/Runner/Loop 连续执行两轮并查看快照，固定模型只产生三次回复
-async def test_memory_write_refreshes_only_new_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    isolate(tmp_path, monkeypatch)
     model = Provider([
         LlmResponse("tool_use", tool_calls=[ToolCallBlock("m", "memory_write", {
-            "scope": "session", "key": "python", "summary": "Python", "content": "Python 3.12",
+            "key": "decision", "summary": "INDEX_ONLY_DECISION", "content": "DETAIL_ONLY_TEXT",
         })]),
-        LlmResponse("end_turn", text="saved"),
-        LlmResponse("end_turn", text="remembered"),
+        LlmResponse("end_turn", text="saved"), LlmResponse("end_turn", text="next"),
     ])
     store, manager = setup_manager(tmp_path, model)
     session = await manager.create("chat")
-    await manager.send_message(session.id, "remember the version")
+    await manager.send_message(session.id, "remember this decision")
+    assert "INDEX_ONLY_DECISION" not in model.calls[0]["system"]
     assert model.calls[0]["system"] == model.calls[1]["system"]
-    assert "Python 3.12" not in model.calls[0]["system"]
-    await manager.send_message(session.id, "what is the version")
-    assert "Python 3.12" in model.calls[2]["system"]
-    assert len(model.calls) == 3
-    inspection = manager.inspect_memory(session.id)
-    assert inspection["snapshot"]["layers"][2]["included"] == ["python"]
-    assert "Python 3.12" in inspection["snapshot"]["text"]
+    await manager.send_message(session.id, "continue")
+    assert "INDEX_ONLY_DECISION" in model.calls[2]["system"]
+    assert "DETAIL_ONLY_TEXT" not in model.calls[2]["system"]
+    assert "Project memory index" not in json.dumps(store.read_history(session.id))
     cp = store.checkpoints.load(session.id)
-    assert cp.run.memory_snapshot.text in cp.run.system_prompt
-    history = store.read_history(session.id)
-    assert len(history) == 6
-    assert not any("## Memory policy" in str(message["content"]) for message in history)
-    assert not (store.session_dir(session.id) / "notes.md").exists()
+    assert cp.run.base_system_prompt and cp.run.memory_snapshot.text in cp.run.system_prompt
 
 
-# 功能：验证恢复跳过记忆文件读取，当前文件变化也不替换旧 Run 的注入快照
-# 设计：先在模型请求处中断，再更新并损坏记忆文件，同时令构建函数调用必定失败
-async def test_resume_reuses_snapshot_without_reading_files(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    isolate(tmp_path, monkeypatch)
-    memory = MemoryStore(tmp_path)
-    memory.upsert("project", "version", summary="Version", content="original version", source="s / r")
+# 功能：恢复沿用已提交提示，不重新读取规则或记忆文件。
+# 设计：中断后把磁盘规则改成不同值并禁止重新构建快照，续跑仍应成功。
+async def test_resume_keeps_saved_snapshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "AGENTS.md").write_text("ORIGINAL_RULE", encoding="utf-8")
     model = Provider([Crash(), LlmResponse("end_turn", text="done")])
     store, manager = setup_manager(tmp_path, model)
     session = await manager.create("chat")
     with pytest.raises(Crash):
         await manager.send_message(session.id, "goal")
-    original = store.checkpoints.load(session.id).run.memory_snapshot
-    (memory.directory("project") / "version.md").write_text("broken new file", encoding="utf-8")
-    monkeypatch.setattr(
-        "kama_claude.core.runner.build_memory_context",
-        Mock(side_effect=AssertionError("resume must not load memory")),
-    )
+    (tmp_path / "AGENTS.md").write_text("CHANGED_RULE", encoding="utf-8")
     _, restored = setup_manager(tmp_path, model)
     opened = await restored.open(session.id)
-    await restored.resume(session.id, opened["revision"])
-    await finish(restored, session.id)
+    with patch("kama_claude.core.runner.build_memory_context", side_effect=AssertionError("reload")):
+        await restored.resume(session.id, opened["revision"])
+        await finish(restored, session.id)
     assert model.calls[0]["system"] == model.calls[1]["system"]
-    assert "original version" in model.calls[1]["system"]
-    inspection = restored.inspect_memory(session.id)
-    assert inspection["snapshot"] == original.model_dump(mode="json")
-    assert inspection["layers"][1]["warnings"]
+    assert "ORIGINAL_RULE" in store.checkpoints.load(session.id).run.system_prompt
 
 
-# 功能：验证只读检查不创建 Run、不读模型、不提交快照或修改文件
-# 设计：记录全部磁盘字节和修订号，重复查看及分页后要求完全不变
-async def test_inspect_is_read_only_and_old_files_are_ignored(
+# 功能：初始规则读取失败不登记任务、不保留假运行状态或丢失下次输入能力。
+# 设计：损坏用户规则后提交，再修复并提交，验证真实 Manager 可继续使用。
+async def test_initial_load_failure_rolls_back_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    isolate(tmp_path, monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    rules = tmp_path / "AGENTS.md"
+    rules.write_bytes(b"\xff")
     model = Provider([LlmResponse("end_turn", text="done")])
     store, manager = setup_manager(tmp_path, model)
     session = await manager.create("chat")
-    old = tmp_path / ".kama" / "context.md"
-    old.parent.mkdir()
-    old.write_text("DO NOT IMPORT OLD CONTEXT", encoding="utf-8")
-    notes = store.session_dir(session.id) / "notes.md"
-    notes.write_text("DO NOT IMPORT OLD NOTES", encoding="utf-8")
-    await manager.send_message(session.id, "goal")
-    assert "DO NOT IMPORT" not in model.calls[0]["system"]
-    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
-    for _ in range(2):
-        assert manager.inspect_memory(session.id)["snapshot"]["text"] == ""
-    after = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
-    assert before == after and len(model.calls) == 1
-
-
-# 功能：验证旧工具缺失时明确拒绝续跑，仍允许终止后开始新任务
-# 设计：仅把旧名字加入冻结工具清单，不创建兼容工具，检查模型没有被再次调用
-async def test_removed_tool_blocks_old_run_but_new_run_works(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    isolate(tmp_path, monkeypatch)
-    model = Provider([Crash(), LlmResponse("end_turn", text="new run")])
-    store, manager = setup_manager(tmp_path, model)
-    session = await manager.create("chat")
-    with pytest.raises(Crash):
-        await manager.send_message(session.id, "old goal")
-    cp = store.checkpoints.load(session.id)
-    cp.run.tool_schemas.append({
-        "name": "note_save", "description": "removed", "input_schema": {"type": "object"},
-    })
-    store.save_checkpoint(cp)
-    _, restored = setup_manager(tmp_path, model)
-    opened = await restored.open(session.id)
-    await restored.resume(session.id, opened["revision"])
-    await finish(restored, session.id)
-    cp = store.checkpoints.load(session.id)
-    assert cp.run.status == "interrupted" and "missing: note_save" in cp.run.reason
-    assert len(model.calls) == 1
-    await restored.resume(session.id, cp.revision, "abort")
-    await restored.send_message(session.id, "new goal")
+    before = store.checkpoints.load(session.id).model_dump()
+    with pytest.raises(HandlerError):
+        await manager.send_message(session.id, "bad initialization")
+    assert not manager.is_running(session.id) and not model.calls
+    assert store.checkpoints.load(session.id).model_dump() == before
+    rules.write_text("fixed", encoding="utf-8")
+    await manager.send_message(session.id, "retry as new input")
     assert store.checkpoints.load(session.id).run.status == "success"
 
 
-# 功能：验证全局写入不被项目层 always_allow 缓存放行，默认项目和会话仍允许
-# 设计：项目/会话正常放行，全局写入则由真实权限管理器挂起并等待回答。
-async def test_global_write_requires_scoped_approval() -> None:
-    permissions = PermissionManager(timeout_s=1)
+# 功能：全局更新默认允许，但静态禁止仍生效，工具不能操作用户区。
+# 设计：真实读写工具执行 hash 更新，参数模型拒绝旧作用域和伪造文件选择。
+async def test_global_tools_and_permissions(tmp_path: Path) -> None:
+    from pydantic import ValidationError
+
+    store = MemoryStore(tmp_path)
+    reader, writer = MemoryReadTool(store), MemoryWriteTool(store, "s", "r")
+    current = json.loads((await reader.invoke({"scope": "global"})).content)
+    result = await writer.invoke({
+        "scope": "global", "content": "Prefer concise answers", "expected_hash": current["expected_hash"],
+    })
+    assert not result.is_error
+    assert evaluate("memory_write", {"scope": "global"}) == PermissionDecision.ALLOW
+    assert evaluate("memory_write", {}, ToolPolicy(PermissionDecision.DENY)) == PermissionDecision.DENY
+    with pytest.raises(ValidationError):
+        await writer.invoke({"scope": "session", "key": "x", "summary": "x", "content": "x"})
+    with pytest.raises(ValidationError):
+        await writer.invoke({"scope": "global", "key": "AGENTS.md", "content": "replace"})
+
+
+# 功能：写文件与编辑工具直接调用也不能改用户规则或全局自动文件。
+# 设计：分别验证 workspace 内部和已批准外部目标，批准不能覆盖保护规则。
+@pytest.mark.parametrize("tool_type", [WriteFileTool, EditFileTool])
+@pytest.mark.parametrize("global_file", [False, True])
+async def test_protected_rule_files(
+    tmp_path: Path, tool_type, global_file: bool,
+) -> None:
+    target = Path.home() / ".kama" / "AGENTS.auto.md" if global_file else tmp_path / "AGENTS.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("USER_OWNED", encoding="utf-8")
+    tool = tool_type(tmp_path)
+    params = {"path": str(target), "content": "changed"} if tool_type is WriteFileTool else {
+        "path": str(target), "old_text": "USER_OWNED", "new_text": "changed",
+    }
+    with pytest.raises(WorkspacePathError, match="protected"):
+        await tool.invoke(params, approved_path=target)
+    assert target.read_text(encoding="utf-8") == "USER_OWNED"
+
+
+# 功能：真实路径别名及历史允许策略不能绕过规则保护，也不会进入执行意图。
+# 设计：通过目录链接访问全局用户规则，使用实际 invoke_tool 检查权限错误边界。
+async def test_protected_alias_rejected_before_execution(tmp_path: Path) -> None:
+    from kama_claude.core.permissions.manager import PermissionManager
+    from tests.unit.test_workspace import directory_link, unlink_directory
+
+    home = Path.home() / ".kama"
+    home.mkdir()
+    rules = home / "AGENTS.md"
+    rules.write_text("USER_RULE", encoding="utf-8")
+    alias = tmp_path / "alias"
+    directory_link(alias, home)
+    try:
+        registry, hook = ToolRegistry(), Mock()
+        registry.register(WriteFileTool(tmp_path))
+        result = await invoke_tool(
+            registry, ToolCallBlock("write", "write_file", {
+                "path": str(alias / "AGENTS.md"), "content": "overwrite",
+            }), EventBus(), "run", checkpoint_hook=hook,
+            permission_manager=PermissionManager({"write_file": ToolPolicy(PermissionDecision.ALLOW)}),
+        )
+        assert result.error_type == "permission_denied" and not result.outcome_unknown
+        hook.assert_not_called()
+        assert rules.read_text(encoding="utf-8") == "USER_RULE"
+    finally:
+        unlink_directory(alias)
+
+
+# 构造确定的程序压缩候选，隔离摘要质量，只验证刷新与提交链路。
+def refreshing_loop(path: Path, persistence=None):
+    model = Mock(chat=AsyncMock(return_value=LlmResponse("end_turn", text="done")))
+    original = [{"role": "user", "content": "original history"}]
+    loop, context, events = make_loop(path, original, model, persistence=persistence)
+    memory = MemoryStore(path)
+    context.run.base_system_prompt = "BASE"
+    context.run.memory_snapshot = build_memory_context(memory)
+    context.run.system_prompt = compose_system("BASE", context.run.memory_snapshot)
+    loop._context_manager._memory = memory
+    candidate = CompactionResult(
+        [{"role": "user", "content": "short history"}], 100, 10,
+        compacted=True, applied_stages=["prune_results"],
+    )
+    loop._context_manager._compactor = Mock(prepare_context=AsyncMock(return_value=candidate))
+    return loop, context, model, events
+
+
+# 功能：程序压缩后重新读取规则，实际模型请求使用新快照且只出现一份注入块。
+# 设计：Loop 装配后修改磁盘，再验证模型实参，覆盖局部旧 system 字符串问题。
+async def test_compaction_refreshes_actual_model_prompt(tmp_path: Path) -> None:
+    rule = tmp_path / "AGENTS.md"
+    rule.write_text("OLD_RULE", encoding="utf-8")
+    persistence = Mock()
+    loop, context, model, _ = refreshing_loop(tmp_path, persistence)
+    rule.write_text("NEW_RULE", encoding="utf-8")
+    await loop.run()
+    system = model.chat.call_args.kwargs["system"]
+    assert "NEW_RULE" in system and "OLD_RULE" not in system
+    assert system.count("Project user rules") == 1
+    assert context.run.system_prompt == system and persistence.save.called
+
+
+# 功能：刷新失败保留旧历史和快照并中断，保存失败不调用模型或通知成功。
+# 设计：分别注入磁盘读取错误和检查点保存错误，验证各自异常边界。
+@pytest.mark.parametrize("save_failure", [False, True])
+async def test_refresh_failures_stop_execution(tmp_path: Path, save_failure: bool) -> None:
+    rule = tmp_path / "AGENTS.md"
+    rule.write_text("OLD_RULE", encoding="utf-8")
+    persistence = Mock()
+    loop, context, model, events = refreshing_loop(tmp_path, persistence)
+    old_messages = context.messages.copy()
+    old_system = context.run.system_prompt
+    if save_failure:
+        persistence.save.side_effect = CheckpointError("disk full")
+        with pytest.raises(CheckpointError):
+            await loop.run()
+    else:
+        rule.write_bytes(b"\xff")
+        await loop.run()
+        assert context.run.status == "interrupted" and "memory_refresh_failed" in context.run.reason
+        assert context.messages == old_messages and context.run.system_prompt == old_system
+    model.chat.assert_not_called()
+    assert not any(event.type == "context.compacted" for event in events)
+
+
+# 功能：刷新后的用户规则撑满预算时中断，不调用模型或误发压缩成功。
+# 设计：先观察旧提示的 Usage 锚点，再只增加规则，验证整份新请求重新计量。
+async def test_refreshed_prompt_rechecks_budget_and_anchor(tmp_path: Path) -> None:
+    rule = tmp_path / "AGENTS.md"
+    rule.write_text("OLD_RULE", encoding="utf-8")
+    loop, context, model, events = refreshing_loop(tmp_path, Mock())
+    estimator = loop._context_manager._estimator
+    schemas = loop._tools.registry.tool_schemas()
+    estimator.observe(context.run.system_prompt, context.messages, schemas, 1)
+    assert estimator.select(context.run.system_prompt, context.messages, schemas).method == "usage_anchor"
+    rule.write_text("NEW_LARGE_RULE " * 10_000, encoding="utf-8")
+    await loop.run()
+    assert context.run.reason == "context_budget_exceeded" and context.run.step == 3
+    assert "NEW_LARGE_RULE" in context.run.system_prompt
+    assert estimator.select(context.run.system_prompt, context.messages, schemas).method == "bytes"
+    model.chat.assert_not_called()
+    assert not any(event.type == "context.compacted" for event in events)
+
+
+# 功能：没有实际改变历史的压缩尝试不重新读取规则。
+# 设计：磁盘文件变坏但压缩返回未改变，模型应沿用已提交的旧快照。
+async def test_noop_compaction_does_not_refresh(tmp_path: Path) -> None:
+    rule = tmp_path / "AGENTS.md"
+    rule.write_text("OLD_RULE", encoding="utf-8")
+    loop, context, model, _ = refreshing_loop(tmp_path)
+    loop._context_manager._compactor.prepare_context.return_value.compacted = False
+    rule.write_bytes(b"\xff")
+    await loop.run()
+    assert context.run.status == "success" and "OLD_RULE" in model.chat.call_args.kwargs["system"]
+
+
+# 功能：手动压缩与自动入口同样刷新，失败不提交半套历史，也不改变完整对话。
+# 设计：用真实会话存储加确定候选，分别覆盖读取、保存和硬预算边界。
+@pytest.mark.parametrize("mode", ["success", "read_failure", "save_failure", "hard_budget"])
+async def test_manual_compaction_refresh_and_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    rule = tmp_path / "AGENTS.md"
+    rule.write_text("OLD_RULE", encoding="utf-8")
+    model = Provider([LlmResponse("end_turn", text="done")])
+    store, manager = setup_manager(tmp_path, model)
+    session = await manager.create("chat")
+    await manager.send_message(session.id, "goal")
+    original = store.checkpoints.load(session.id)
+    original_history = store.read_history(session.id)
+    rule.write_text("NEW_RULE", encoding="utf-8")
+    if mode == "read_failure":
+        rule.write_bytes(b"\xff")
+    if mode == "hard_budget":
+        manager._compaction = CompactionConfig(
+            context_window_tokens=2_048, output_reserve_tokens=512, summary_max_tokens=256,
+        )
+        rule.write_text("NEW_RULE " * 1_000, encoding="utf-8")
+    candidate = CompactionResult(
+        [{"role": "user", "content": "short history"}], 100, 10,
+        compacted=True, applied_stages=["prune_results"],
+    )
     events = []
 
-    # 在事件抵达时模拟用户只批准这一次全局写入
-    async def approve(event: dict[str, Any]) -> None:
+    # 完成事件到达时读取磁盘，确认通知没有早于提交。
+    async def collect(event) -> None:
         events.append(event)
-        permissions.respond(event["request_id"], "allow_once", session_id=event["session_id"], run_id=event["run_id"])
+        if event.type == "context.compacted":
+            assert "NEW_RULE" in store.checkpoints.load(session.id).run.system_prompt
 
-    assert evaluate("memory_write", {"scope": "global"}) == PermissionDecision.ASK
-    assert evaluate("memory_write", {"scope": "project"}) == PermissionDecision.ALLOW
-    for scope in ("project", "session", "global"):
-        allowed, _ = await permissions.check_and_wait(
-            scope, "memory_write", {"scope": scope, "key": "x"}, "s", approve,
-        )
-        assert allowed
-    assert [event["params"]["scope"] for event in events] == ["global"]
-
-
-# 功能：验证两个工具的新增、读取、删除闭环，不依赖旧文件或专用接口
-# 设计：直接读取结构化工具响应，确认正文分页和幂等删除状态可供模型理解
-async def test_memory_tools_read_write_delete(tmp_path: Path) -> None:
-    import json
-
-    memory = MemoryStore(tmp_path, tmp_path / "s", global_dir=tmp_path / "g")
-    writer = MemoryWriteTool(memory, "s", "r")
-    reader = MemoryReadTool(memory)
-    params = {"scope": "session", "key": "decision", "summary": "Decision", "content": "Use TCP"}
-    assert not (await writer.invoke(params)).is_error
-    listed = json.loads((await reader.invoke({"scope": "session"})).content)
-    assert listed["entries"][0]["key"] == "decision"
-    result = json.loads((await reader.invoke({"scope": "session", "key": "decision"})).content)
-    assert result["content"] == "Use TCP" and result["source"] == "s / r"
-    assert not (await writer.invoke({"scope": "session", "key": "decision", "action": "delete"})).is_error
-    assert (await reader.invoke({"scope": "session", "key": "decision"})).is_error
+    manager._bus.subscribe(collect)
+    with patch("kama_claude.core.compact.manager.Compactor.prepare_context", AsyncMock(return_value=candidate)):
+        if mode == "save_failure":
+            with patch.object(store, "save_checkpoint", side_effect=CheckpointError("disk full")):
+                with pytest.raises(CheckpointError):
+                    await manager.compact(session.id)
+        else:
+            result = await manager.compact(session.id)
+            assert result.compacted == (mode != "read_failure")
+            if mode == "hard_budget":
+                assert result.reason == "context_budget_exceeded"
+    saved = store.checkpoints.load(session.id)
+    if mode in ("read_failure", "save_failure"):
+        assert saved.messages == original.messages and saved.run.system_prompt == original.run.system_prompt
+    else:
+        assert "NEW_RULE" in saved.run.system_prompt
+    if mode != "success":
+        assert not any(event.type == "context.compacted" for event in events)
+    assert store.read_history(session.id) == original_history and len(model.calls) == 1
 
 
-# 功能：验证配置接受 0，环境变量覆盖 TOML，并拒绝负数和未知配置
-# 设计：对独立配置对象使用现有解析入口，避免依赖本机配置文件
+# 功能：新预算配置支持环境覆盖，拒绝旧字段和非正整数。
+# 设计：直接调用解析入口，避免外部配置文件影响边界验证。
 def test_memory_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
     config = KamaConfig()
-    apply_toml(config, {"memory": {"project_tokens": 100, "session_tokens": 0}})
-    monkeypatch.setenv("KAMA_MEMORY_PROJECT_TOKENS", "200")
+    apply_toml(config, {"memory": {"global_auto_tokens": 256, "project_index_tokens": 512}})
+    monkeypatch.setenv("KAMA_MEMORY_PROJECT_INDEX_TOKENS", "768")
     apply_env(config)
-    assert config.memory.project_tokens == 200 and config.memory.session_tokens == 0
-    with pytest.raises(SystemExit):
-        apply_toml(config, {"memory": {"global_tokens": -1}})
-    with pytest.raises(SystemExit):
-        apply_toml(config, {"memory": {"unknown": 5}})
-    monkeypatch.setenv("KAMA_MEMORY_GLOBAL_TOKENS", "-1")
-    with pytest.raises(SystemExit):
-        apply_env(config)
-
-
-# 功能：验证全局记忆授权只在原会话复用，不写权限文件。
-# 设计：重复请求命中范围授权；新管理器与另一会话必须重新审批。
-async def test_explicit_global_always_permission_is_separate(tmp_path: Path) -> None:
-    path = tmp_path / "policy.toml"
-    permissions = PermissionManager(policy_file=path, timeout_s=1)
-    events = []
-
-    # 用户明确授权全局记忆，不借用之前项目层的许可
-    async def approve(event: dict[str, Any]) -> None:
-        events.append(event)
-        permissions.respond(event["request_id"], "always_allow", session_id=event["session_id"], run_id=event["run_id"])
-
-    assert (await permissions.check_and_wait(
-        "first", "memory_write", {"scope": "global"}, "s", approve,
-    ))[0]
-    assert not path.exists()
-    assert (await permissions.check_and_wait(
-        "same", "memory_write", {"scope": "global"}, "s", approve,
-    ))[0]
-    permissions = PermissionManager(policy_file=path, timeout_s=1)
-    assert (await permissions.check_and_wait(
-        "second", "memory_write", {"scope": "global"}, "another", approve,
-    ))[0]
-    assert len(events) == 2  # 同会话复用；重启和换会话都重新审批。
+    assert config.memory == MemoryConfig(global_auto_tokens=256, project_index_tokens=768)
+    for value in ({"global_tokens": 512}, {"project_index_tokens": 0}, {"global_auto_tokens": True}):
+        with pytest.raises(SystemExit):
+            apply_toml(config, {"memory": value})

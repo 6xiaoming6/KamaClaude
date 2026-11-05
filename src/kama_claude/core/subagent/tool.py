@@ -12,17 +12,30 @@ from pydantic import BaseModel, Field
 
 from kama_claude.core.agents.loader import AgentProfile, AgentProfileError, AgentProfileLoader
 from kama_claude.core.assembly import create_agent_loop
-from kama_claude.core.bus.events import SubagentFinishedEvent, SubagentStartedEvent
+from kama_claude.core.bus.events import SubagentStartedEvent
 from kama_claude.core.checkpoint.checkpoint import RunCheckpoint
-from kama_claude.core.config import AgentConfig, CompactionConfig, ExecutionConfig
+from kama_claude.core.config import (
+    AgentConfig,
+    CompactionConfig,
+    ExecutionConfig,
+    MemoryConfig,
+    SubagentConfig,
+)
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.events.writer import EventWriter
 from kama_claude.core.loop import AgentLoop
+from kama_claude.core.memory.store import MemoryStore
 from kama_claude.core.runs import new_run_id
-from kama_claude.core.subagent.registry import ActiveSubagent, BackgroundTaskRegistry
-from kama_claude.core.subagent.result import SubagentResult
+from kama_claude.core.subagent.registry import (
+    ActiveSubagent,
+    BackgroundTaskRegistry,
+    SubagentLimitError,
+)
+from kama_claude.core.subagent.report import HANDOFF_INSTRUCTIONS
+from kama_claude.core.subagent.result import PENDING_RESULT
 from kama_claude.core.tools.base import BaseTool, ToolParams, ToolResult
+from kama_claude.core.tools.builtin.memory import MemoryReadTool, MemoryWriteTool
 from kama_claude.core.tools.factory import builtin_tools
 from kama_claude.core.tools.registry import ToolRegistry
 
@@ -82,6 +95,10 @@ class SpawnAgentTool(BaseTool):
         model: str = "",
         provider_factory: Callable[[str], LLMProvider] | None = None,
         tool_whitelist: list[str] | None = None,
+        root_run_id: str | None = None,
+        subagent_config: SubagentConfig | None = None,
+        memory_config: MemoryConfig | None = None,
+        memory_project_root: Path | None = None,
     ) -> None:
         self._provider = provider
         self._parent_bus = parent_bus
@@ -94,12 +111,19 @@ class SpawnAgentTool(BaseTool):
         self._provider_factory = provider_factory
         self._tool_whitelist = set(tool_whitelist) if tool_whitelist is not None else None
         self._task_registry = task_registry
-        self._runs_dir = runs_dir
+        self._runs_dir = runs_dir.resolve()
         self._session_id = session_id
         self._depth = depth
         self._workspace = (workspace if workspace is not None else Path.cwd()).resolve()
         self._execution = execution or ExecutionConfig()
         self._profiles = AgentProfileLoader(self._workspace)
+        self._memory_config = memory_config or MemoryConfig()
+        self._memory_project_root = MemoryStore(
+            self._workspace, self._memory_config, project=memory_project_root,
+        ).project_root
+        self._root_run_id = root_run_id or parent_run_id
+        self._subagent_config = subagent_config or SubagentConfig()
+        self._task_registry.bind_root(self._root_run_id, session_id, self._subagent_config)
 
     # 派生子 agent，前台时阻塞直到完成并返回结果，后台时立即返回 run_id
     async def invoke(self, params: dict[str, object]) -> ToolResult:
@@ -124,68 +148,79 @@ class SpawnAgentTool(BaseTool):
             return ToolResult(content=str(exc), is_error=True, error_type="configuration_error")
 
         child_run_id = new_run_id()
-        child_context = ExecutionContext(
-            run=RunCheckpoint(
-                run_id=child_run_id, goal=p.prompt, max_steps=self._agent_config.max_steps,
-                model=model, provider=self._provider_name, workspace=str(self._workspace),
-                max_run_seconds=self._agent_config.max_run_seconds,
-                max_total_tokens=self._agent_config.max_total_tokens,
-                repeat_failure_limit=self._agent_config.repeat_failure_limit,
-            ),
-            system_prompt_override=profile.system_prompt if profile else None,
-        )
+        try:
+            self._task_registry.reserve(child_run_id, self._root_run_id, self._session_id)
+        except SubagentLimitError as exc:
+            return ToolResult(content=str(exc), is_error=True, error_type="resource_limit")
 
-        child_bus = EventBus()
-
-        # 将子 bus 所有事件桥接到父 bus，TUI 据此渲染嵌套进度
-        async def _bridge(event: BaseModel) -> None:
-            await self._parent_bus.publish_safe(event)
-
-        child_bus.subscribe(_bridge)
-
-        # 为子agent构建专门的tool_registry
-        child_registry = self._build_child_registry(
-            child_bus, child_run_id, profile, provider=provider, model=model,
-        )
-        child_run_path = self._runs_dir / child_run_id
-        child_run_path.mkdir(parents=True, exist_ok=True)
-        # 每个子任务独立记账，普通请求、摘要与重试共用同一预算
-        child_loop = create_agent_loop(
-            provider, child_registry, child_bus, context=child_context,
-            compaction=self._compaction, permission_manager=self._permission_manager,
-            session_id=self._session_id, run_path=child_run_path,
-        )
-
-        await self._parent_bus.publish_safe(
-            SubagentStartedEvent(
-                run_id=child_run_id,
-                parent_run_id=self._parent_run_id,
-                description=p.description,
-                ts=_now(),
+        task: asyncio.Task[None] | None = None
+        try:
+            child_context = ExecutionContext(
+                run=RunCheckpoint(
+                    run_id=child_run_id, goal=p.prompt, max_steps=self._agent_config.max_steps,
+                    model=model, provider=self._provider_name, workspace=str(self._workspace),
+                    max_run_seconds=self._agent_config.max_run_seconds,
+                    max_total_tokens=self._agent_config.max_total_tokens,
+                    repeat_failure_limit=self._agent_config.repeat_failure_limit,
+                    memory_project_root=str(self._memory_project_root),
+                ),
+                system_prompt_override=(
+                    profile.system_prompt if profile else
+                    "You are a helpful AI assistant. Use tools to complete the assigned sub-task."
+                ) + HANDOFF_INSTRUCTIONS,
             )
-        )
 
-        # 前后台共用运行与收尾；Core 统一持有任务，查询权限绑定所属会话
-        task = asyncio.create_task(self._run_child(
-            child_loop, child_context, child_bus, child_run_path,
-        ))
-        self._task_registry.register(
-            child_run_id, task, child_context, session_id=self._session_id,
-            parent_run_id=self._parent_run_id, bus=self._parent_bus,
-        )
+            child_bus = EventBus()
+
+            # 将子 bus 所有事件桥接到父 bus，TUI 据此渲染嵌套进度
+            async def _bridge(event: BaseModel) -> None:
+                await self._parent_bus.publish_safe(event)
+
+            child_bus.subscribe(_bridge)
+            child_registry = self._build_child_registry(
+                child_bus, child_run_id, profile, provider=provider, model=model,
+            )
+            child_run_path = self._runs_dir / child_run_id
+            child_run_path.mkdir(parents=True, exist_ok=True)
+            child_loop = create_agent_loop(
+                provider, child_registry, child_bus, context=child_context,
+                compaction=self._compaction, permission_manager=self._permission_manager,
+                session_id=self._session_id, run_path=child_run_path,
+                memory_config=self._memory_config,
+            )
+            # 先登记再发布开始事件；门闩保证父任务先记录派生关系，子任务才执行。
+            start = asyncio.Event()
+            task = asyncio.create_task(self._run_child(
+                child_loop, child_context, child_bus, child_run_path, start,
+            ))
+            entry = self._task_registry.register(
+                child_run_id, task, child_context, session_id=self._session_id,
+                parent_run_id=self._parent_run_id, bus=self._parent_bus,
+                root_run_id=self._root_run_id, run_path=child_run_path,
+            )
+            await self._parent_bus.publish_safe(SubagentStartedEvent(
+                run_id=child_run_id, parent_run_id=self._parent_run_id,
+                description=p.description, ts=_now(),
+            ))
+            start.set()
+        except BaseException:
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            raise
+        finally:
+            self._task_registry.release(child_run_id, self._root_run_id, self._session_id)
+
         if p.run_in_background:
-            return ToolResult(
-                content=(
-                    f"Subagent started in background. run_id={child_run_id}. "
-                    f"Use agent_result(run_id='{child_run_id}') to retrieve result."
-                )
-            )
+            return ToolResult(content=(
+                f"Subagent started in background. run_id={child_run_id}. "
+                f"Use agent_result(run_id='{child_run_id}') to retrieve result."
+            ))
 
-        # 前台调用等待同一 Task；取消会向子 Loop 和工具清理传递
+        # 前台取消继续传递给子任务；结果与后台查询使用同一份已保存的交接。
         await task
-        return SubagentResult.from_run(
-            child_context.run, self._session_id, self._parent_run_id,
-        ).as_tool_result()
+        assert entry.result is not None
+        return entry.result.as_tool_result()
 
     # 前后台共用收尾，异常与取消也报告终态，通知异常不改变执行结果
     async def _run_child(
@@ -194,9 +229,11 @@ class SpawnAgentTool(BaseTool):
         context: ExecutionContext,
         bus: EventBus,
         run_path: Path,
+        start: asyncio.Event,
     ) -> None:
         try:
-            async with EventWriter(run_path / "events.jsonl") as writer:
+            await start.wait()
+            async with EventWriter(run_path / "events.jsonl", run_id=context.run.run_id) as writer:
                 writer.subscribe(bus)
                 await loop.run()
         except asyncio.CancelledError:
@@ -213,13 +250,8 @@ class SpawnAgentTool(BaseTool):
             else:
                 context.mark_failed("subagent_error")
         finally:
-            run = context.run
-            await self._parent_bus.publish_safe(SubagentFinishedEvent(
-                run_id=run.run_id, parent_run_id=self._parent_run_id, status=run.status,
-                reason=run.reason, actual_tokens=run.actual_tokens,
-                estimated_tokens=run.estimated_tokens, elapsed_seconds=run.elapsed_seconds,
-                usage_complete=run.usage_complete, ts=_now(),
-            ))
+            # 报告落盘后才发布完成通知；失败由注册表转成明确的失败结果。
+            await self._task_registry.notify_finished(context.run.run_id)
 
     # 构造子 registry；基于角色配置过滤工具，深度允许时注册嵌套 SpawnAgentTool
     def _build_child_registry(
@@ -245,6 +277,14 @@ class SpawnAgentTool(BaseTool):
         for tool in builtin_tools(self._workspace, self._execution, child_task_manager):
             if _allowed(tool.name):
                 registry.register(tool)
+        memory = MemoryStore(
+            self._workspace, self._memory_config, project=self._memory_project_root,
+        )
+        for tool in (
+            MemoryReadTool(memory), MemoryWriteTool(memory, self._session_id, child_run_id),
+        ):
+            if _allowed(tool.name):
+                registry.register(tool)
 
         if self._depth < 1:
             nested = SpawnAgentTool(
@@ -257,6 +297,9 @@ class SpawnAgentTool(BaseTool):
                 runs_dir=self._runs_dir,
                 session_id=self._session_id,
                 depth=self._depth + 1,
+                root_run_id=self._root_run_id, subagent_config=self._subagent_config,
+                memory_config=self._memory_config,
+                memory_project_root=self._memory_project_root,
                 workspace=self._workspace,
                 execution=self._execution,
                 agent_config=self._agent_config, compaction=self._compaction,
@@ -275,6 +318,10 @@ class SpawnAgentTool(BaseTool):
 
 class AgentResultParams(ToolParams):
     run_id: str = Field(min_length=1, description="Child Run ID from this session's spawn_agent.")
+    wait_s: float = Field(
+        default=10, ge=0, le=30, allow_inf_nan=False,
+        description="Wait at most this many seconds; 0 queries now. Retry if still running.",
+    )
 
 
 # 查询后台 subagent 的执行状态和最终结果
@@ -282,7 +329,8 @@ class AgentResultTool(BaseTool):
     name = "agent_result"
     description = (
         "Retrieve the result of a background sub-agent previously started with spawn_agent. "
-        "Returns 'still running' if the sub-agent has not yet completed."
+        "Wait up to wait_s (default 10, maximum 30) seconds; 0 queries immediately. "
+        "If still running, call again later. Waiting never cancels the background task."
     )
     input_schema = AgentResultParams.model_json_schema()
     params_model = AgentResultParams
@@ -295,7 +343,7 @@ class AgentResultTool(BaseTool):
     # 查询指定 run_id 的后台任务状态，返回结果或错误
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = AgentResultParams.model_validate(params)
-        entry = self._task_registry.get(p.run_id, self._session_id)
+        entry = await self._task_registry.wait_result(p.run_id, self._session_id, p.wait_s)
         if entry is None:
             return ToolResult(
                 content=f"Unknown run_id for this session: {p.run_id} (missing or expired).",
@@ -303,5 +351,5 @@ class AgentResultTool(BaseTool):
                 error_type="runtime_error",
             )
         if isinstance(entry, ActiveSubagent):
-            return ToolResult(content="still running")
+            return ToolResult(content=PENDING_RESULT)
         return entry.as_tool_result()

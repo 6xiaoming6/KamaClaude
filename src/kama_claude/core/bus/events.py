@@ -292,8 +292,7 @@ class RunBudgetEvent(BaseModel):
     run_id: str
     method: str = ""
     estimated_input_tokens: int = 0
-    trigger_tokens: int = 0  # 本次动态压缩阈值；0 表示关闭自动压缩
-    underestimate_factor: float = 1.0  # Cline 式低估系数，范围一到四
+    trigger_tokens: int = 0  # 固定配置比例对应的压缩阈值；0 表示关闭自动压缩
     actual_tokens: int = 0
     estimated_tokens: int = 0
     elapsed_seconds: float = 0.0

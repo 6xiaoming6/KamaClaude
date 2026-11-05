@@ -10,12 +10,14 @@ from kama_claude.core.config.models import (
     McpServerConfig,
     MemoryConfig,
     PermissionConfig,
+    SubagentConfig,
     TraceConfig,
 )
 
 __all__ = [
     "LoggingConfig",
     "AgentConfig",
+    "SubagentConfig",
     "LlmConfig",
     "TraceConfig",
     "PermissionConfig",
