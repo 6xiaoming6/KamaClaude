@@ -81,7 +81,9 @@ class SessionCloseResult(BaseModel):
 
 class PermissionRespondCommand(BaseModel):
     type: Literal["permission.respond"] = "permission.respond"
-    tool_use_id: str
+    request_id: str
+    session_id: str
+    run_id: str
     # "allow_once" | "always_allow" | "deny_once" | "always_deny"
     decision: Literal["allow_once", "always_allow", "deny_once", "always_deny"]
 

@@ -215,11 +215,14 @@ class ContextCompactedEvent(BaseModel):
 # 工具调用需要审批，展示参数并等待用户决定(通知前端)
 class PermissionRequestedEvent(BaseModel):
     type: Literal["permission.requested"] = "permission.requested"
+    request_id: str  # Core 生成的审批 ID，不复用模型的工具 ID
     run_id: str
     tool_use_id: str
     tool_name: str
     params: dict[str, Any]
     param_preview: str
+    reason: str = ""  # 为什么要求审批
+    approval_scope: str = "仅本次操作"  # 持续允许的具体范围
     workspace: str | None = None  # 文件工具绑定的根目录
     resolved_path: str | None = None  # 实际访问目标，包含链接解析结果
     outside_workspace: bool = False  # 外部路径必须单次审批
@@ -233,6 +236,7 @@ class PermissionGrantedEvent(BaseModel):
     type: Literal["permission.granted"] = "permission.granted"
     run_id: str
     tool_use_id: str
+    request_id: str = ""  # 自动放行没有等待请求
     # "allow_once" | "always_allow" | "auto_allow"
     decision: str
     ts: str
@@ -243,6 +247,7 @@ class PermissionDeniedEvent(BaseModel):
     type: Literal["permission.denied"] = "permission.denied"
     run_id: str
     tool_use_id: str
+    request_id: str = ""
     # "deny_once" | "always_deny" | "auto_deny"
     decision: str
     ts: str

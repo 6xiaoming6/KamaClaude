@@ -332,7 +332,10 @@ async def test_disconnect_keeps_run_and_live_permission(tmp_path: Path) -> None:
     opened = await mgr.open(session.id)
     assert opened["running"] is True
     assert opened["pending_permissions"][0]["tool_use_id"] == "id-a"
-    permissions.respond("id-a", "allow_once")
+    pending = opened["pending_permissions"][0]
+    permissions.respond(
+        pending["request_id"], "allow_once", session_id=session.id, run_id=pending["run_id"],
+    )
     await finish(mgr, session.id)
     assert tool.calls == 1 and not permissions._pending
 
@@ -576,7 +579,10 @@ async def test_restart_recreates_permission_wait(
     await restored.resume(session.id, opened["revision"])
     await asyncio.wait_for(requested.wait(), 2)
     assert a.calls == 0 and fresh_permissions is not permissions
-    fresh_permissions.respond("id-a", "allow_once")
+    pending = fresh_permissions.pending_for_session(session.id)[0]
+    fresh_permissions.respond(
+        pending["request_id"], "allow_once", session_id=session.id, run_id=pending["run_id"],
+    )
     await finish(restored, session.id)
     assert a.calls == 1
 

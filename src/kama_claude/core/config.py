@@ -54,6 +54,12 @@ class PermissionConfig:
 
 
 @dataclass
+class ExecutionConfig:
+    forward_env: list[str] = field(default_factory=list)  # 额外透传的变量名
+    env: dict[str, str] = field(default_factory=dict)  # 明确传给命令的变量
+
+
+@dataclass
 class CompactionConfig:
     auto_threshold: float = 0.8  # 请求前按估算输入触发，0 表示关闭压力层
     prune_target_ratio: float = 0.65  # 程序层尽量降到软阈值以下，减少反复整理
@@ -84,6 +90,7 @@ class McpServerConfig:
     command: str = ""              # stdio 专用：可执行文件路径
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
+    forward_env: list[str] = field(default_factory=list)
     url: str = ""                 # Streamable HTTP 完整端点
     headers: dict[str, str] = field(default_factory=dict)
 
@@ -102,6 +109,7 @@ class KamaConfig:
     llm: LlmConfig = field(default_factory=LlmConfig)
     trace: TraceConfig = field(default_factory=TraceConfig)
     permission: PermissionConfig = field(default_factory=PermissionConfig)
+    execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     compaction: CompactionConfig = field(default_factory=CompactionConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
@@ -147,7 +155,8 @@ def get_config() -> KamaConfig:
 # 将已解析的 TOML 根表写入 config；未知小节或类型错误时退出进程
 def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
     unknown = set(data.keys()) - {
-        "core", "logging", "agent", "llm", "trace", "permission", "compaction", "memory", "mcp",
+        "core", "logging", "agent", "llm", "trace", "permission", "execution",
+        "compaction", "memory", "mcp",
     }
     if unknown:
         raise SystemExit(f"Unknown top-level config keys: {', '.join(sorted(unknown))}")
@@ -260,6 +269,15 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
                 raise SystemExit("Config error: permission.timeout_s must be a non-negative number")
             config.permission.timeout_s = float(val)
 
+    if "execution" in data:
+        execution = data["execution"]
+        if not isinstance(execution, dict) or set(execution) - {"env", "forward_env"}:
+            raise SystemExit("Config error: [execution] accepts only env and forward_env")
+        config.execution.env = _env_values(execution.get("env", config.execution.env))
+        config.execution.forward_env = _env_names(
+            execution.get("forward_env", config.execution.forward_env),
+        )
+
     if "compaction" in data:
         comp = data["compaction"]
         if not isinstance(comp, dict):
@@ -324,7 +342,10 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
                     "replace old TCP host/port with a Streamable HTTP url"
                 )
             allowed = {"name", "transport"}
-            allowed |= {"command", "args", "env"} if transport == "stdio" else {"url", "headers"}
+            allowed |= (
+                {"command", "args", "env", "forward_env"}
+                if transport == "stdio" else {"url", "headers"}
+            )
             if set(srv) - allowed:
                 raise SystemExit(f"Config error: unsupported fields for MCP {transport}")
             s = McpServerConfig(name=name, transport=transport)
@@ -344,7 +365,9 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
                     not isinstance(k, str) or not isinstance(v, str) for k, v in val.items()
                 ):
                     raise SystemExit(f"Config error: mcp.servers[{i}].env must be a table")
-                s.env = {str(k): str(v) for k, v in val.items()}
+                s.env = _env_values(val)
+            if "forward_env" in srv:
+                s.forward_env = _env_names(srv["forward_env"])
             if transport == "stdio" and not s.command.strip():
                 raise SystemExit(f"Config error: MCP '{name}' requires command")
             if transport == "streamable-http":
@@ -372,6 +395,23 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
                 s.url, s.headers = url, headers
             names.add(name)
             config.mcp.servers.append(s)
+
+
+def _env_names(value: Any) -> list[str]:
+    if not isinstance(value, list) or any(
+        not isinstance(name, str) or not name or "=" in name or "\0" in name for name in value
+    ):
+        raise SystemExit("Config error: forward_env must be an array of environment variable names")
+    return value
+
+
+def _env_values(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict) or any(
+        not isinstance(name, str) or not name or "=" in name or "\0" in name
+        or not isinstance(item, str) or "\0" in item for name, item in value.items()
+    ):
+        raise SystemExit("Config error: env must contain valid string names and values")
+    return value
 
 
 # 用 KAMA_* 环境变量覆盖 config 中对应字段（若变量已设置）

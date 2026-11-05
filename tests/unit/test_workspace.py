@@ -131,8 +131,6 @@ async def test_external_approval_is_once_and_validated(tmp_path: Path) -> None:
     archive.write_text("full archived output", encoding="utf-8")
     policy_file = tmp_path / "policy.toml"
     manager = PermissionManager(policy_file=policy_file)
-    manager._persistent_always["read_file"] = "allow"
-    manager._session_always[("session-one", "read_file")] = "allow"
     requests: list[PermissionRequestedEvent] = []
     bus = EventBus()
 
@@ -147,11 +145,11 @@ async def test_external_approval_is_once_and_validated(tmp_path: Path) -> None:
         assert event.allowed_decisions == ["allow_once", "deny_once"]
         for invalid in ("always_allow", "always_deny", "made_up"):
             with pytest.raises(ValueError):
-                manager.respond(event.tool_use_id, invalid)
+                manager.respond(event.request_id, invalid, session_id=event.session_id, run_id=event.run_id)
         pending = manager.pending_for_session("session-one")
         assert pending[0]["resolved_path"] == str(archive)
         assert pending[0]["allowed_decisions"] == event.allowed_decisions
-        manager.respond(event.tool_use_id, "allow_once")
+        manager.respond(event.request_id, "allow_once", session_id=event.session_id, run_id=event.run_id)
 
     bus.subscribe(approve)
     for uid in ("one", "two"):
@@ -187,7 +185,7 @@ async def test_external_write_denial_timeout_and_allow(tmp_path: Path) -> None:
     # 对本次请求明确拒绝
     async def deny(event: BaseModel) -> None:
         if isinstance(event, PermissionRequestedEvent):
-            manager.respond(event.tool_use_id, "deny_once")
+            manager.respond(event.request_id, "deny_once", session_id=event.session_id, run_id=event.run_id)
 
     bus.subscribe(deny)
     for active_bus in (bus, EventBus()):
@@ -204,7 +202,7 @@ async def test_external_write_denial_timeout_and_allow(tmp_path: Path) -> None:
     # 对新的一次调用批准，不修改工具级策略
     async def allow(event: BaseModel) -> None:
         if isinstance(event, PermissionRequestedEvent):
-            manager.respond(event.tool_use_id, "allow_once")
+            manager.respond(event.request_id, "allow_once", session_id=event.session_id, run_id=event.run_id)
 
     bus = EventBus()
     bus.subscribe(allow)
@@ -222,7 +220,6 @@ async def test_static_deny_cannot_be_overridden(tmp_path: Path) -> None:
     root.mkdir()
     target = tmp_path / "outside.txt"
     manager = PermissionManager({"write_file": ToolPolicy(default=PermissionDecision.DENY)})
-    manager._persistent_always["write_file"] = "allow"
     result = await call_file(
         WriteFileTool(root), {"path": str(target), "content": "no"}, manager,
     )
@@ -272,7 +269,7 @@ async def test_changed_target_after_approval_denied(tmp_path: Path) -> None:
             requests.append(event)
             unlink_directory(link)
             directory_link(link, second)
-            manager.respond(event.tool_use_id, "allow_once")
+            manager.respond(event.request_id, "allow_once", session_id=event.session_id, run_id=event.run_id)
 
     bus.subscribe(swap_and_allow)
     stages: list[str] = []
@@ -336,7 +333,7 @@ def test_runner_restore_and_nested_agents_share_workspace(
                 assert tool.paths.root == root
             bash = registry.get("bash")
             assert isinstance(bash, BashTool)
-            assert bash._workspace == root
+            assert bash.workspace == root
             spawn = registry.get("spawn_agent")
             if depth == 2:
                 assert spawn is None

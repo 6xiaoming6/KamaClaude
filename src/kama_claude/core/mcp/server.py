@@ -64,7 +64,9 @@ class McpServerManager:
         if cfg.transport == "stdio":
             if not cfg.command:
                 raise ValueError(f"mcp server '{cfg.name}': stdio transport requires 'command'")
-            await client.connect_stdio(cfg.command, cfg.args, cfg.env or None)
+            await client.connect_stdio(
+                cfg.command, cfg.args, cfg.env or None, forward_env=cfg.forward_env,
+            )
         elif cfg.transport == "streamable-http":
             await client.connect_http(cfg.url, cfg.headers or None)
         else:

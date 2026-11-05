@@ -6,7 +6,7 @@
 
 - TCP loopback `127.0.0.1:7437` (override via `KAMA_HOST` / `KAMA_PORT`)
 - Each message is one `\n`-terminated JSON line (NDJSON)
-- Commands use JSON-RPC 2.0 (client â†’ server); Events use `kind=event` envelope (server â†’ client)
+- Commands use JSON-RPC 2.0 (client ¡ú server); Events use `kind=event` envelope (server ¡ú client)
 
 ## Commands
 
@@ -1147,7 +1147,9 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
 | Field | Type | Required |
 |---|---|---|
 | `type` | `string` | no |
-| `tool_use_id` | `string` | yes |
+| `request_id` | `string` | yes |
+| `session_id` | `string` | yes |
+| `run_id` | `string` | yes |
 | `decision` | `string` | yes |
 
 ```json
@@ -1159,8 +1161,16 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
       "title": "Type",
       "type": "string"
     },
-    "tool_use_id": {
-      "title": "Tool Use Id",
+    "request_id": {
+      "title": "Request Id",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
       "type": "string"
     },
     "decision": {
@@ -1175,7 +1185,9 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
     }
   },
   "required": [
-    "tool_use_id",
+    "request_id",
+    "session_id",
+    "run_id",
     "decision"
   ],
   "title": "PermissionRespondCommand",
@@ -1254,7 +1266,7 @@ Session-scoped pushes include session_id and event_seq inside event. SessionOpen
 
 ## IPC Events
 
-Events sent over the IPC socket (daemon â†’ client).
+Events sent over the IPC socket (daemon ¡ú client).
 
 ### ContextCompactionStartedEvent
 
@@ -1439,11 +1451,14 @@ Events sent over the IPC socket (daemon â†’ client).
 | Field | Type | Required |
 |---|---|---|
 | `type` | `string` | no |
+| `request_id` | `string` | yes |
 | `run_id` | `string` | yes |
 | `tool_use_id` | `string` | yes |
 | `tool_name` | `string` | yes |
 | `params` | `object` | yes |
 | `param_preview` | `string` | yes |
+| `reason` | `string` | no |
+| `approval_scope` | `string` | no |
 | `workspace` | `string | null` | no |
 | `resolved_path` | `string | null` | no |
 | `outside_workspace` | `boolean` | no |
@@ -1458,6 +1473,10 @@ Events sent over the IPC socket (daemon â†’ client).
       "const": "permission.requested",
       "default": "permission.requested",
       "title": "Type",
+      "type": "string"
+    },
+    "request_id": {
+      "title": "Request Id",
       "type": "string"
     },
     "run_id": {
@@ -1479,6 +1498,16 @@ Events sent over the IPC socket (daemon â†’ client).
     },
     "param_preview": {
       "title": "Param Preview",
+      "type": "string"
+    },
+    "reason": {
+      "default": "",
+      "title": "Reason",
+      "type": "string"
+    },
+    "approval_scope": {
+      "default": "\u4ec5\u672c\u6b21\u64cd\u4f5c",
+      "title": "Approval Scope",
       "type": "string"
     },
     "workspace": {
@@ -1535,6 +1564,7 @@ Events sent over the IPC socket (daemon â†’ client).
     }
   },
   "required": [
+    "request_id",
     "run_id",
     "tool_use_id",
     "tool_name",
@@ -1554,6 +1584,7 @@ Events sent over the IPC socket (daemon â†’ client).
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `tool_use_id` | `string` | yes |
+| `request_id` | `string` | no |
 | `decision` | `string` | yes |
 | `ts` | `string` | yes |
 
@@ -1572,6 +1603,11 @@ Events sent over the IPC socket (daemon â†’ client).
     },
     "tool_use_id": {
       "title": "Tool Use Id",
+      "type": "string"
+    },
+    "request_id": {
+      "default": "",
+      "title": "Request Id",
       "type": "string"
     },
     "decision": {
@@ -1600,6 +1636,7 @@ Events sent over the IPC socket (daemon â†’ client).
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `tool_use_id` | `string` | yes |
+| `request_id` | `string` | no |
 | `decision` | `string` | yes |
 | `ts` | `string` | yes |
 
@@ -1618,6 +1655,11 @@ Events sent over the IPC socket (daemon â†’ client).
     },
     "tool_use_id": {
       "title": "Tool Use Id",
+      "type": "string"
+    },
+    "request_id": {
+      "default": "",
+      "title": "Request Id",
       "type": "string"
     },
     "decision": {

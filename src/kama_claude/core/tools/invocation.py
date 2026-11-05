@@ -4,6 +4,7 @@ import asyncio
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import ValidationError
@@ -19,6 +20,7 @@ from kama_claude.core.bus.events import (
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import ToolCallBlock
 from kama_claude.core.tools.base import FileTool, ToolResult
+from kama_claude.core.tools.builtin.bash import BashTool
 from kama_claude.core.tools.errors import RateLimitedError, ToolError
 from kama_claude.core.tools.registry import ToolRegistry
 from kama_claude.core.workspace import WorkspacePathError
@@ -84,6 +86,7 @@ async def invoke_tool(
     *,
     permission_manager: PermissionManager | None = None,
     session_id: str = "",
+    workspace: Path | None = None,
     checkpoint_hook: ToolCheckpointHook | None = None,
     notify_result: bool = True,
 ) -> ToolResult:
@@ -147,8 +150,12 @@ async def invoke_tool(
             checkpoint_hook("awaiting_approval")
 
         # 将审批事件安全交给观察者，Future 的生命周期仍由权限管理器负责
+        request_id = ""
+
         async def emit_permission(raw: dict[str, Any]) -> None:
-            await bus.publish_safe(PermissionRequestedEvent(**raw, run_id=run_id))
+            nonlocal request_id
+            request_id = raw["request_id"]
+            await bus.publish_safe(PermissionRequestedEvent(**raw))
 
         path_options = {"path_access": path_access} if path_access is not None else {}
         allowed, decision = await permission_manager.check_and_wait(
@@ -157,14 +164,18 @@ async def invoke_tool(
             params=params,
             session_id=session_id,
             event_emitter=emit_permission,
+            run_id=run_id,
+            # 命令以工具实际绑定的 cwd 为准，独立构造工具时也不能借用别的目录授权。
+            workspace=tool.workspace if isinstance(tool, BashTool) else workspace,
             **path_options,
         )
         if not allowed:
-            if decision != "auto_deny":
+            if request_id:
                 await bus.publish_safe(
                     PermissionDeniedEvent(
                         run_id=run_id,
                         tool_use_id=tool_call.id,
+                        request_id=request_id,
                         decision=decision,
                         ts=_now(),
                     )
@@ -181,6 +192,7 @@ async def invoke_tool(
                 PermissionGrantedEvent(
                     run_id=run_id,
                     tool_use_id=tool_call.id,
+                    request_id=request_id,
                     decision=decision,
                     ts=_now(),
                 )

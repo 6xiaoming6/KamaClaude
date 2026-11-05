@@ -222,6 +222,8 @@ class SessionManager:
             if session.mode == "one_shot":
                 if self._task_registry is not None:
                     await self._task_registry.cancel(session_id=sid)
+                if self._permissions is not None:
+                    self._permissions.cancel_session(sid, reason="session_closed")
                 await self._bus.publish_safe(
                     SessionClosedEvent(session_id=sid, ts=session.updated_at)
                 )
@@ -293,8 +295,6 @@ class SessionManager:
         cp = self._recovery.recover_orphaned_run(sid, running=self.is_running(sid))
         self._sessions[sid] = Session.from_dict(cp.session)
         pending = self._permissions.pending_for_session(sid) if self._permissions else []
-        for event in pending:
-            event["run_id"] = cp.run.run_id if cp.run else ""
         return {
             "session": cp.session,
             "revision": cp.revision,
@@ -381,6 +381,8 @@ class SessionManager:
             session.updated_at = _now()
             cp.session = session.to_dict()
             self._store.checkpoints.save(cp)
+            if self._permissions is not None:
+                self._permissions.cancel_session(sid, reason="session_closed")
             await self._bus.publish_safe(SessionClosedEvent(session_id=sid, ts=_now()))
 
     # 空闲会话的手动压缩与正常执行复用同一权威工作历史

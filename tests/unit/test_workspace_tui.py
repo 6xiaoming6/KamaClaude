@@ -19,7 +19,10 @@ async def idle_socket(self: KamaTuiApp) -> None:
 class Client:
     # 保存重连时尚未处理的审批请求
     def __init__(self, request: dict[str, Any]) -> None:
-        self.request = request
+        self.request = {
+            "request_id": "approval-one", "session_id": "sess-one", "run_id": "run-one",
+            **request,
+        }
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     # 用同一待审批载荷模拟 session.open 和 permission.respond
@@ -71,7 +74,8 @@ async def test_external_options_and_reconnect(monkeypatch: pytest.MonkeyPatch) -
         await pilot.press("down", "enter")
         await pilot.pause()
         assert client.calls[-1] == (
-            "permission.respond", {"tool_use_id": "tool-one", "decision": "deny_once"},
+            "permission.respond", {"request_id": "approval-one", "decision": "deny_once",
+                                   "session_id": "sess-one", "run_id": "run-one"},
         )
 
 
@@ -94,6 +98,7 @@ async def test_approval_buttons_and_ordinary_options(monkeypatch: pytest.MonkeyP
         assert client.calls[-1][1]["decision"] == "allow_once"
         app._handle_event_inner({
             "type": "permission.requested", "tool_use_id": "ordinary", "tool_name": "bash",
+            "request_id": "approval-ordinary", "session_id": "sess-one", "run_id": "run-two",
             "params": {"command": "echo hello"}, "param_preview": "echo hello",
         })
         await pilot.pause()
@@ -102,4 +107,7 @@ async def test_approval_buttons_and_ordinary_options(monkeypatch: pytest.MonkeyP
         assert len(select.query(Button)) == 4
         await pilot.press("a")
         await pilot.pause()
-        assert client.calls[-1][1] == {"tool_use_id": "ordinary", "decision": "always_allow"}
+        assert client.calls[-1][1] == {
+            "request_id": "approval-ordinary", "session_id": "sess-one", "run_id": "run-two",
+            "decision": "always_allow",
+        }

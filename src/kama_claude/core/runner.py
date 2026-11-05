@@ -126,7 +126,7 @@ class AgentRunner:
         registry = ToolRegistry()
         workspace = workspace if workspace is not None else Path.cwd()
         for t in [
-            ReadFileTool(workspace), BashTool(workspace),
+            ReadFileTool(workspace), BashTool(workspace, self._config.execution),
             WriteFileTool(workspace), ListDirTool(workspace),
             FindFilesTool(workspace), SearchTextTool(workspace), EditFileTool(workspace),
         ]:
@@ -176,6 +176,7 @@ class AgentRunner:
                         session_id=session_id,
                         depth=0,
                         workspace=workspace,
+                        execution=self._config.execution,
                         agent_config=limits, compaction=self._config.compaction,
                         provider_name=provider_name, model=model,
                         provider_factory=self._provider_for_model, tool_whitelist=child_tools,

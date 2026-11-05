@@ -163,9 +163,9 @@ class PermissionSelect(Vertical):
 
     _CHOICES: tuple[tuple[str, str, str], ...] = (
         ("allow_once",   "Allow once",   "y / 1"),
-        ("always_allow", "Always allow", "a / 2"),
+        ("always_allow", "本会话允许此范围", "a / 2"),
         ("deny_once",    "Deny",         "n / 3"),
-        ("always_deny",  "Always deny",  "d / 4"),
+        ("always_deny",  "本会话拒绝此范围", "d / 4"),
     )
     _KEY_MAP: dict[str, str] = {
         "y": "allow_once",  "1": "allow_once",
@@ -174,19 +174,24 @@ class PermissionSelect(Vertical):
         "d": "always_deny", "4": "always_deny",
     }
 
-    # 用户作出权限决策时发布，携带工具 ID 和决策字符串
+    # 用户作出权限决策时发布，携带审批请求 ID 和决策字符串
     class Decided(Message):
-        # 初始化决策消息，存储控件引用、工具 ID 和决策
-        def __init__(self, widget: PermissionSelect, tool_use_id: str, decision: str) -> None:
+        # 初始化决策消息，存储控件引用、审批 ID 和决策
+        def __init__(self, widget: PermissionSelect, request_id: str, decision: str) -> None:
             self.widget = widget
-            self.tool_use_id = tool_use_id
+            self.request_id = request_id
             self.decision = decision
             super().__init__()
 
-    # 初始化控件，存储工具 ID（用于 IPC 回复）
-    def __init__(self, tool_use_id: str, allowed_decisions: list[str] | None = None) -> None:
+    # 初始化控件，存储审批 ID 与原始会话、Run（用于 IPC 回复）
+    def __init__(
+        self, request_id: str, allowed_decisions: list[str] | None = None, *,
+        session_id: str = "", run_id: str = "",
+    ) -> None:
         super().__init__()
-        self._tool_use_id = tool_use_id
+        self._request_id = request_id
+        self.session_id = session_id
+        self.run_id = run_id
         self._cursor = 0
         self._choices = tuple(
             choice for choice in self._CHOICES
@@ -284,7 +289,7 @@ class PermissionSelect(Vertical):
         if decision not in {choice[0] for choice in self._choices}:
             return
         log.debug("PermissionSelect._pick  decision=%s", decision)
-        self.post_message(self.Decided(self, self._tool_use_id, decision))
+        self.post_message(self.Decided(self, self._request_id, decision))
 
 
 class PermissionBlock(Static):
@@ -292,9 +297,9 @@ class PermissionBlock(Static):
 
     _LABEL_MAP: dict[str, str] = {
         "allow_once":   "allowed (once)",
-        "always_allow": "always allowed",
+        "always_allow": "allowed for this scope in this session",
         "deny_once":    "denied",
-        "always_deny":  "always denied",
+        "always_deny":  "denied for this scope in this session",
         "timeout":      "⏱ timed out",
     }
     LABEL_MAP = _LABEL_MAP
@@ -771,22 +776,25 @@ class KamaTuiApp(App[None]):
     # 处理内联审批控件的用户决策：发送 IPC 响应并恢复输入框
     # self.post_message(self.Decided(...))后，框架会自动调用on_permission_select_decided
     async def on_permission_select_decided(self, msg: PermissionSelect.Decided) -> None:
-        tool_use_id = msg.tool_use_id
+        request_id = msg.request_id
         decision = msg.decision
-        log.info("permission decided tool_use_id=%s decision=%s", tool_use_id, decision)
+        log.info("permission decided request_id=%s decision=%s", request_id, decision)
         try:
+            # 后端确认有效后才移除控件；非法或失败的响应不能伪装成已批准。
+            if self._client is None:
+                return
+            try:
+                await self._client.send_command("permission.respond", {
+                    "request_id": request_id, "decision": decision,
+                    "session_id": msg.widget.session_id, "run_id": msg.widget.run_id,
+                })
+            except (IpcError, RuntimeError, OSError) as exc:
+                self._append(Static(f"审批未提交：{exc}", classes="log-line", markup=False))
+                return
             msg.widget.remove()
-            perm_block = self._pending_permission_blocks.pop(tool_use_id, None)
+            perm_block = self._pending_permission_blocks.pop(request_id, None)
             if perm_block is not None:
                 perm_block._resolve(decision)
-            if self._client is not None:
-                try:
-                    await self._client.send_command(
-                        "permission.respond",
-                        {"tool_use_id": tool_use_id, "decision": decision},
-                    )
-                except (IpcError, RuntimeError, OSError):
-                    pass
             if not self._pending_permission_blocks:
                 p = self._prompt()
                 if p is not None:
@@ -795,7 +803,7 @@ class KamaTuiApp(App[None]):
                     p.border_title = "type a message — enter to send, ⌘/⇧/⌥+enter for newline"
                     p.focus()
         except Exception:
-            log.exception("on_permission_select_decided failed tool_use_id=%s", tool_use_id)
+            log.exception("on_permission_select_decided failed request_id=%s", request_id)
 
     # 向日志视图追加一个 widget 并滚动到底部
     def _append(self, widget: Widget) -> None:
@@ -1378,6 +1386,9 @@ class KamaTuiApp(App[None]):
             ))
 
         elif t == "permission.requested":
+            request_id = str(event.get("request_id", ""))
+            if not request_id or request_id in self._pending_permission_blocks:
+                return
             tool_use_id = str(event.get("tool_use_id", ""))
             tool_name = str(event.get("tool_name", ""))
             param_preview = str(event.get("param_preview", ""))
@@ -1390,6 +1401,17 @@ class KamaTuiApp(App[None]):
                 tool_name, tool_use_id, _focused_repr,
             )
             path_details = ""
+            if event.get("resolved_path"):
+                path_details = (
+                    f"实际路径：{event['resolved_path']}\n工作区：{event.get('workspace', '')}"
+                )
+            if tool_name == "bash":
+                params = event.get("params") or {}
+                path_details = (
+                    f"完整命令：\n{params.get('command', '')}\n"
+                    f"工作目录：{event.get('workspace', '')}\n"
+                    "执行方式：本机 shell（未隔离文件和网络访问）"
+                )
             if event.get("outside_workspace"):
                 params = event.get("params") or {}
                 operation = {
@@ -1407,31 +1429,39 @@ class KamaTuiApp(App[None]):
                 old = _preview("\n".join(str(params.get("old_text", "")).splitlines()[:4]), 240)
                 new = _preview("\n".join(str(params.get("new_text", "")).splitlines()[:4]), 240)
                 path_details += f"\n编辑片段预览（最多四行）：\n旧：\n{old}\n新：\n{new}"
+            path_details += (
+                f"\n审批原因：{event.get('reason', '')}"
+                f"\n授权范围：{event.get('approval_scope', '仅本次操作')}"
+            )
             perm_block = PermissionBlock(tool_use_id, tool_name, param_preview, path_details)
-            self._pending_permission_blocks[tool_use_id] = perm_block
+            self._pending_permission_blocks[request_id] = perm_block
             prompt = self._prompt()
             if prompt is not None:
                 prompt.disabled = True
                 prompt.border_title = "permission required"
             self._append(perm_block)
-            select = PermissionSelect(tool_use_id, event.get("allowed_decisions"))
+            select = PermissionSelect(
+                request_id, event.get("allowed_decisions"),
+                session_id=str(event.get("session_id", "")), run_id=str(event.get("run_id", "")),
+            )
             self._mount_permission_select(select)
             log.debug(
                 "PermissionSelect mounted before #prompt  pending=%d",
                 len(self._pending_permission_blocks),
             )
 
-        elif t == "permission.denied":
+        elif t in {"permission.denied", "permission.granted"}:
             # 处理超时或断连等非用户交互触发的 deny
             # 用户主动 deny 已由 on_permission_select_decided 处理
-            tool_use_id = str(event.get("tool_use_id", ""))
+            request_id = str(event.get("request_id", ""))
             decision = str(event.get("decision", "denied"))
-            if tool_use_id in self._pending_permission_blocks:
-                perm_block = self._pending_permission_blocks.pop(tool_use_id)
+            if request_id in self._pending_permission_blocks:
+                perm_block = self._pending_permission_blocks.pop(request_id)
                 perm_block._resolve(decision)
                 try:
-                    select = self.query_one(PermissionSelect)
-                    select.remove()
+                    for select in self.query(PermissionSelect):
+                        if select._request_id == request_id:
+                            select.remove()
                 except Exception:
                     pass
                 if not self._pending_permission_blocks:

@@ -266,7 +266,6 @@ async def test_external_new_tools_require_each_approval(tmp_path: Path, tool_typ
     target.write_text("original", encoding="utf-8")
     manager, bus = PermissionManager(), EventBus()
     tool = tool_type(root)
-    manager._persistent_always[tool.name] = "allow"
     requests: list[PermissionRequestedEvent] = []
 
     # 每次都显式响应单次权限，并核对绑定的实际路径
@@ -276,7 +275,7 @@ async def test_external_new_tools_require_each_approval(tmp_path: Path, tool_typ
             assert event.outside_workspace
             assert event.allowed_decisions == ["allow_once", "deny_once"]
             assert event.resolved_path == str(target if tool_type is EditFileTool else outside)
-            manager.respond(event.tool_use_id, decision)
+            manager.respond(event.request_id, decision, session_id=event.session_id, run_id=event.run_id)
 
     bus.subscribe(respond)
     for index in range(2):
@@ -291,7 +290,7 @@ async def test_external_new_tools_require_each_approval(tmp_path: Path, tool_typ
         assert result.is_error == (decision == "deny_once")
         assert not result.outcome_unknown
     assert len(requests) == 2
-    assert not manager._session_always
+    assert not manager._session_grants
     assert target.read_text(encoding="utf-8") == (
         "again" if tool_type is EditFileTool and decision == "allow_once" else "original"
     )

@@ -301,6 +301,7 @@ class AgentLoop:
                 self._registry, tool_call, self._bus, run.run_id,
                 permission_manager=self._permission_manager,
                 session_id=self._session_id,
+                workspace=Path(run.workspace),
                 # 审批前、真正执行前，调用 _save_tool_phase 保存状态
                 checkpoint_hook=self._save_tool_phase,
                 notify_result=False,

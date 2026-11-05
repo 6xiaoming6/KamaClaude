@@ -317,7 +317,7 @@ async def test_background_task_survives_new_runner(
     # 本次委派与查询都走正常审批
     async def approve(event: BaseModel) -> None:
         if isinstance(event, PermissionRequestedEvent):
-            permissions.respond(event.tool_use_id, "allow_once")
+            permissions.respond(event.request_id, "allow_once", session_id=event.session_id, run_id=event.run_id)
 
     bus.subscribe(approve)
     runners: list[AgentRunner] = []

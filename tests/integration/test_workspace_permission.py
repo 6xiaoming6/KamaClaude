@@ -65,9 +65,18 @@ async def test_external_approval_over_tcp_and_reconnect(tmp_path: Path, free_por
         event = await asyncio.wait_for(requested, 3)
         assert event["resolved_path"] == str(archive)
         assert event["allowed_decisions"] == ["allow_once", "deny_once"]
+        for session_id, run_id in (("other", "run-one"), ("sess-one", "other")):
+            with pytest.raises(IpcError) as wrong_owner:
+                await client.send_command("permission.respond", {
+                    "request_id": event["request_id"], "decision": "allow_once",
+                    "session_id": session_id, "run_id": run_id,
+                })
+            assert wrong_owner.value.code == -32602
+        assert len(manager.pending_for_session("sess-one")) == 1
         with pytest.raises(IpcError) as invalid:
             await client.send_command("permission.respond", {
-                "tool_use_id": "external", "decision": "always_allow",
+                "request_id": event["request_id"], "decision": "always_allow",
+                "session_id": "sess-one", "run_id": "run-one",
             })
         assert invalid.value.code == -32602
         assert not tool_task.done()
@@ -80,12 +89,20 @@ async def test_external_approval_over_tcp_and_reconnect(tmp_path: Path, free_por
         pending = snapshot["pending_permissions"][0]
         assert pending["resolved_path"] == str(archive)
         assert pending["allowed_decisions"] == ["allow_once", "deny_once"]
+        assert pending["request_id"] == event["request_id"]
         await client.send_command("permission.respond", {
-            "tool_use_id": "external", "decision": "allow_once",
+            "request_id": pending["request_id"], "decision": "allow_once",
+            "session_id": "sess-one", "run_id": "run-one",
         })
         result = await asyncio.wait_for(tool_task, 3)
         assert result.content.endswith("1 | archived result")
-        assert manager._session_always == manager._persistent_always == {}
+        assert manager._session_grants == {}
+        with pytest.raises(IpcError) as replay:
+            await client.send_command("permission.respond", {
+                "request_id": pending["request_id"], "decision": "allow_once",
+                "session_id": "sess-one", "run_id": "run-one",
+            })
+        assert replay.value.code == -32602
     finally:
         if tool_task is not None and not tool_task.done():
             tool_task.cancel()

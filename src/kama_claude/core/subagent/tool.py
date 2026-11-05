@@ -15,7 +15,7 @@ from kama_claude.core.bus.events import SubagentFinishedEvent, SubagentStartedEv
 from kama_claude.core.checkpoint.checkpoint import RunCheckpoint
 from kama_claude.core.compact.compactor import Compactor
 from kama_claude.core.compact.estimator import TokenEstimator
-from kama_claude.core.config import AgentConfig, CompactionConfig
+from kama_claude.core.config import AgentConfig, CompactionConfig, ExecutionConfig
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.events.writer import EventWriter
@@ -88,6 +88,7 @@ class SpawnAgentTool(BaseTool):
         session_id: str,
         depth: int = 0,
         workspace: Path | None = None,
+        execution: ExecutionConfig | None = None,
         agent_config: AgentConfig | None = None,
         compaction: CompactionConfig | None = None,
         provider_name: str = "custom",
@@ -110,6 +111,7 @@ class SpawnAgentTool(BaseTool):
         self._session_id = session_id
         self._depth = depth
         self._workspace = (workspace if workspace is not None else Path.cwd()).resolve()
+        self._execution = execution or ExecutionConfig()
         self._profiles = AgentProfileLoader(self._workspace)
 
     # 派生子 agent，前台时阻塞直到完成并返回结果，后台时立即返回 run_id
@@ -266,7 +268,7 @@ class SpawnAgentTool(BaseTool):
         registry = ToolRegistry()
         _all_tools = [
             ReadFileTool(self._workspace),
-            BashTool(self._workspace),
+            BashTool(self._workspace, self._execution),
             WriteFileTool(self._workspace),
             ListDirTool(self._workspace),
             FindFilesTool(self._workspace),
@@ -299,6 +301,7 @@ class SpawnAgentTool(BaseTool):
                 session_id=self._session_id,
                 depth=self._depth + 1,
                 workspace=self._workspace,
+                execution=self._execution,
                 agent_config=self._agent_config, compaction=self._compaction,
                 provider_name=self._provider_name,
                 model=model if model is not None else self._model,

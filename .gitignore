@@ -21,4 +21,4 @@ uv.lock
 
 # Only publish this stage's new documentation
 /docs/*
-!/docs/S9-*.md
+!/docs/S10-*.md

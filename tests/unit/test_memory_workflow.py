@@ -149,17 +149,15 @@ async def test_removed_tool_blocks_old_run_but_new_run_works(
 
 
 # 功能：验证全局写入不被项目层 always_allow 缓存放行，默认项目和会话仍允许
-# 设计：预置两层缓存并在审批事件中明确回复，让真实权限管理器完成挂起和解除
+# 设计：项目/会话正常放行，全局写入则由真实权限管理器挂起并等待回答。
 async def test_global_write_requires_scoped_approval() -> None:
     permissions = PermissionManager(timeout_s=1)
-    permissions._session_always[("s", "memory_write")] = "allow"
-    permissions._persistent_always["memory_write"] = "allow"
     events = []
 
     # 在事件抵达时模拟用户只批准这一次全局写入
     async def approve(event: dict[str, Any]) -> None:
         events.append(event)
-        permissions.respond(event["tool_use_id"], "allow_once")
+        permissions.respond(event["request_id"], "allow_once", session_id=event["session_id"], run_id=event["run_id"])
 
     assert evaluate("memory_write", {"scope": "global"}) == PermissionDecision.ASK
     assert evaluate("memory_write", {"scope": "project"}) == PermissionDecision.ALLOW
@@ -206,11 +204,9 @@ def test_memory_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
         _apply_env(config)
 
 
-# 功能：验证用户明确选择全局 always_allow 后可以复用，且权限文件仍是合法 TOML
-# 设计：通过真实审批和磁盘往返建立独立授权，再重新创建管理器检查跨会话复用
+# 功能：验证全局记忆授权只在原会话复用，不写权限文件。
+# 设计：重复请求命中范围授权；新管理器与另一会话必须重新审批。
 async def test_explicit_global_always_permission_is_separate(tmp_path: Path) -> None:
-    import tomllib
-
     path = tmp_path / "policy.toml"
     permissions = PermissionManager(policy_file=path, timeout_s=1)
     events = []
@@ -218,15 +214,17 @@ async def test_explicit_global_always_permission_is_separate(tmp_path: Path) -> 
     # 用户明确授权全局记忆，不借用之前项目层的许可
     async def approve(event: dict[str, Any]) -> None:
         events.append(event)
-        permissions.respond(event["tool_use_id"], "always_allow")
+        permissions.respond(event["request_id"], "always_allow", session_id=event["session_id"], run_id=event["run_id"])
 
     assert (await permissions.check_and_wait(
         "first", "memory_write", {"scope": "global"}, "s", approve,
     ))[0]
-    parsed = tomllib.loads(path.read_text(encoding="utf-8"))
-    assert parsed["always"]["memory_write_global"] == "allow"
-    restored = PermissionManager(policy_file=path, timeout_s=1)
-    assert (await restored.check_and_wait(
+    assert not path.exists()
+    assert (await permissions.check_and_wait(
+        "same", "memory_write", {"scope": "global"}, "s", approve,
+    ))[0]
+    permissions = PermissionManager(policy_file=path, timeout_s=1)
+    assert (await permissions.check_and_wait(
         "second", "memory_write", {"scope": "global"}, "another", approve,
     ))[0]
-    assert len(events) == 1 and "memory_write" not in parsed["always"]
+    assert len(events) == 2  # 同会话复用；重启和换会话都重新审批。

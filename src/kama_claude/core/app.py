@@ -175,15 +175,17 @@ class CoreApp:
     async def _permission_respond_handler(self, params: dict[str, Any]) -> PermissionRespondResult:
         cmd = PermissionRespondCommand.model_validate(params)
         logger.info(
-            "permission.respond received tool_use_id=%s decision=%s",
-            cmd.tool_use_id, cmd.decision,
+            "permission.respond received request_id=%s decision=%s",
+            cmd.request_id, cmd.decision,
         )
         if self._permission_manager is None:
             logger.error("permission.respond: PermissionManager not initialized")
-            return PermissionRespondResult()
+            raise HandlerError(-32603, "permission manager unavailable")
         # 调用permission_manager.respond方法，将对应工具调用的feture设置为done
         try:
-            self._permission_manager.respond(cmd.tool_use_id, cmd.decision)
+            self._permission_manager.respond(
+                cmd.request_id, cmd.decision, session_id=cmd.session_id, run_id=cmd.run_id,
+            )
         except ValueError as exc:
             raise HandlerError(-32602, str(exc)) from exc
         return PermissionRespondResult()
@@ -283,9 +285,9 @@ class CoreApp:
             timeout_s=self._config.permission.timeout_s,
         )
         logger.info(
-            "permission manager: timeout_s=%.1f  persistent=%d entries",
+            "permission manager: timeout_s=%.1f  legacy deny entries=%d",
             self._config.permission.timeout_s,
-            len(load_policy_file(policy_file)),
+            sum(value == "deny" for value in load_policy_file(policy_file).values()),
         )
 
         self._broadcaster = IpcEventBroadcaster(trace=self._trace)
