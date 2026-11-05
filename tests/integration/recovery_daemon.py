@@ -109,7 +109,6 @@ async def main(root: Path, port: int) -> None:
         "session.open": app._session_open_handler,
         "session.resume": app._session_resume_handler,
         "session.close": app._session_close_handler,
-        "memory.inspect": app._memory_inspect_handler,
     }.items():
         server.register(method, handler)
     await server.start()

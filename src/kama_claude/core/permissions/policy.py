@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
+
+from kama_claude.core.permissions.bash import CommandRule, command_decision
+from kama_claude.core.workspace import PathAccess
 
 
 class PermissionDecision(StrEnum):
@@ -12,29 +14,17 @@ class PermissionDecision(StrEnum):
     ASK = "ask"
 
 
-# 检测 bash 命令是否操作 cwd 之外路径的正则规则列表（强制触发 ASK，不可被 allow_patterns 绕过）
-OUTSIDE_CWD_HEURISTICS: list[str] = [
-    r"(^|\s)/[^\s]",              # absolute path
-    r"(^|\s)~",                   # tilde home
-    r"(^|\s)\.\.(/|$|\s)",        # parent traversal
-    r"\$\{?HOME\b",               # $HOME variable
-    r"\$\{?PWD\b",                # $PWD variable
-    r"(^|\s|;|&&|\|\|)cd(\s|$)",  # explicit cd
-]
-
-_OUTSIDE_CWD_RE: list[re.Pattern[str]] = [re.compile(p) for p in OUTSIDE_CWD_HEURISTICS]
-
-
-# 判断 bash 命令是否命中 outside-cwd 启发式规则
-def matches_outside_cwd(command: str) -> bool:
-    return any(pat.search(command) for pat in _OUTSIDE_CWD_RE)
-
-
 @dataclass
 class ToolPolicy:
     default: PermissionDecision
-    allow_patterns: list[str] = field(default_factory=list)
-    deny_patterns: list[str] = field(default_factory=list)
+    command_rules: list[CommandRule] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PermissionAssessment:
+    decision: PermissionDecision
+    reason: str
+    reusable: bool = True
 
 # 为一些tool创建默认的策略
 DEFAULT_POLICIES: dict[str, ToolPolicy] = {
@@ -79,43 +69,29 @@ def param_preview(tool_name: str, params: dict[str, Any]) -> str:
     return snippet[:_PREVIEW_MAX] if len(snippet) > _PREVIEW_MAX else snippet
 
 
-# 对工具 + 参数执行 4 层静态策略评估，返回 ALLOW/DENY/ASK
+# 查询工具静态策略，不创建审批请求或修改会话授权
 def evaluate(
     tool_name: str,
     params: dict[str, Any],
     policy: ToolPolicy | None = None,
 ) -> PermissionDecision:
-    # 如果没有传入工具的权限就找他的默认权限
-    if policy is None:
-        policy = DEFAULT_POLICIES.get(tool_name)
-    # 如果这个工具没有配置默认权限，就给他兜底的未知工具权限，每次执行都要询问
-    if policy is None:
-        return _UNKNOWN_TOOL_DEFAULT
-    if tool_name == "memory_write" and params.get("scope", "project") == "global":
-        return PermissionDecision.DENY if policy.default == PermissionDecision.DENY else (
-            PermissionDecision.ASK
+    return assess(tool_name, params, policy).decision
+
+
+# 静态规则只在这里判断；Manager 在此结果上处理会话授权和用户等待。
+def assess(
+    tool_name: str, params: dict[str, Any], policy: ToolPolicy | None = None, *,
+    path_access: PathAccess | None = None,
+) -> PermissionAssessment:
+    policy = policy or DEFAULT_POLICIES.get(tool_name)
+    if policy is not None and policy.default == PermissionDecision.DENY:
+        return PermissionAssessment(PermissionDecision.DENY, "工具已被明确禁止")
+    if tool_name == "bash":
+        decision, reason = command_decision(
+            str(params.get("command", "")), rules=policy.command_rules if policy else [],
         )
-
-    # 对bash工具提取需要的指令，只有bash才需要命令，其他的工具只需要传参数就行了
-    command = str(params.get("command", "")) if tool_name == "bash" else ""
-
-    # 对bash工具执行的命令进行层层审查
-    # Tier 1: deny_patterns (bash only)
-    # 如果命令
-    if command:
-        for pat in policy.deny_patterns:
-            if re.search(pat, command):
-                return PermissionDecision.DENY
-
-    # Tier 2: OUTSIDE_CWD_HEURISTICS — forced ASK, not bypassable
-    if command and matches_outside_cwd(command):
-        return PermissionDecision.ASK
-
-    # Tier 3: allow_patterns (bash only)
-    if command:
-        for pat in policy.allow_patterns:
-            if re.search(pat, command):
-                return PermissionDecision.ALLOW
-
-    # Tier 4: tool default
-    return policy.default
+        return PermissionAssessment(PermissionDecision(decision), reason, reusable=False)
+    if path_access is not None and path_access.outside_workspace:
+        return PermissionAssessment(PermissionDecision.ASK, "访问工作区外路径", reusable=False)
+    default = policy.default if policy is not None else _UNKNOWN_TOOL_DEFAULT
+    return PermissionAssessment(default, "工具默认策略")

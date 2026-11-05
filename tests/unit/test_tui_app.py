@@ -3,13 +3,9 @@ from __future__ import annotations
 from rich.markdown import Markdown
 from textual.widget import Widget
 
-from kama_claude.tui.app import (
-    KamaTuiApp,
-    LLMStreamBlock,
-    ToolCallBlock,
-    _param_summary,
-    _preview,
-)
+from kama_claude.tui.app import KamaTuiApp
+from kama_claude.tui.formatting import _param_summary, _preview
+from kama_claude.tui.widgets.conversation import LLMStreamBlock, ToolCallBlock
 
 
 # 功能：验证 _preview 超出长度时截断并追加省略号
@@ -33,7 +29,7 @@ def test_param_summary_prefers_key_fields() -> None:
 def test_llm_tokens_accumulate_in_block() -> None:
     app = KamaTuiApp("127.0.0.1", 9999)
     appended: list[Widget] = []
-    app._append = lambda w: appended.append(w)  # type: ignore[method-assign]
+    app._view.append = lambda w: appended.append(w)  # type: ignore[method-assign]
 
     app._handle_event({"type": "llm.token", "token": "Hello", "run_id": "r", "ts": "t"})
     app._handle_event({"type": "llm.token", "token": " world", "run_id": "r", "ts": "t"})
@@ -57,7 +53,7 @@ def test_llm_block_finalize_renders_markdown() -> None:
 def test_llm_block_resets_after_non_token_event() -> None:
     app = KamaTuiApp("127.0.0.1", 9999)
     appended: list[Widget] = []
-    app._append = lambda w: appended.append(w)  # type: ignore[method-assign]
+    app._view.append = lambda w: appended.append(w)  # type: ignore[method-assign]
 
     app._handle_event({"type": "llm.token", "token": "A", "run_id": "r", "ts": "t"})
     app._handle_event({"type": "step.started", "run_id": "r", "step": 2, "ts": "t"})
@@ -73,7 +69,7 @@ def test_llm_block_resets_after_non_token_event() -> None:
 def test_run_started_appends_widget_with_content() -> None:
     app = KamaTuiApp("127.0.0.1", 9999)
     appended: list[Widget] = []
-    app._append = lambda w: appended.append(w)  # type: ignore[method-assign]
+    app._view.append = lambda w: appended.append(w)  # type: ignore[method-assign]
 
     app._handle_event({
         "type": "run.started", "run_id": "run-abc", "goal": "do the thing", "ts": "t"
@@ -90,7 +86,7 @@ def test_run_started_appends_widget_with_content() -> None:
 def test_run_finished_success_shows_completed() -> None:
     app = KamaTuiApp("127.0.0.1", 9999)
     appended: list[Widget] = []
-    app._append = lambda w: appended.append(w)  # type: ignore[method-assign]
+    app._view.append = lambda w: appended.append(w)  # type: ignore[method-assign]
 
     app._handle_event({
         "type": "run.finished", "run_id": "r", "status": "success", "steps": 3, "ts": "t"
@@ -106,7 +102,7 @@ def test_run_finished_success_shows_completed() -> None:
 def test_run_finished_failed_shows_red() -> None:
     app = KamaTuiApp("127.0.0.1", 9999)
     appended: list[Widget] = []
-    app._append = lambda w: appended.append(w)  # type: ignore[method-assign]
+    app._view.append = lambda w: appended.append(w)  # type: ignore[method-assign]
 
     app._handle_event({
         "type": "run.finished", "run_id": "r", "status": "failed",
@@ -123,7 +119,7 @@ def test_run_finished_failed_shows_red() -> None:
 def test_tool_call_started_and_finished() -> None:
     app = KamaTuiApp("127.0.0.1", 9999)
     appended: list[Widget] = []
-    app._append = lambda w: appended.append(w)  # type: ignore[method-assign]
+    app._view.append = lambda w: appended.append(w)  # type: ignore[method-assign]
 
     app._handle_event({
         "type": "tool.call_started",
@@ -132,7 +128,7 @@ def test_tool_call_started_and_finished() -> None:
         "params": {"command": "echo hi"},
         "run_id": "r", "ts": "t",
     })
-    assert "uid-1" in app._pending_tool_blocks  # type: ignore[attr-defined]
+    assert ("r", "uid-1") in app._view.pending_tools  # type: ignore[attr-defined]
 
     app._handle_event({
         "type": "tool.call_finished",
@@ -142,7 +138,7 @@ def test_tool_call_started_and_finished() -> None:
         "output": "hi",
         "run_id": "r", "ts": "t",
     })
-    assert "uid-1" not in app._pending_tool_blocks  # type: ignore[attr-defined]
+    assert ("r", "uid-1") not in app._view.pending_tools  # type: ignore[attr-defined]
     block = appended[0]
     assert isinstance(block, ToolCallBlock)
     assert block._finished  # type: ignore[attr-defined]
@@ -152,7 +148,7 @@ def test_tool_call_started_and_finished() -> None:
 # 功能：验证 memory_write 工具块显示作用域和 key
 # 设计：直接操作通用 ToolCallBlock，确认不需要专门的记忆显示分支
 def test_memory_write_tool_block_shows_key() -> None:
-    block = ToolCallBlock("memory_write", {"scope": "session", "key": "python"})
+    block = ToolCallBlock("memory_write", {"scope": "project", "key": "python"})
     block.set_result("saved", 3)
     assert "python" in block._summary()  # type: ignore[attr-defined]
 
@@ -178,7 +174,7 @@ async def test_input_submit_appends_user_turn_and_disables_prompt() -> None:
 
     app = KamaTuiApp("127.0.0.1", 9999)
     appended: list[Widget] = []
-    app._append = lambda w: appended.append(w)  # type: ignore[method-assign]
+    app._view.append = lambda w: appended.append(w)  # type: ignore[method-assign]
     app._update_header = lambda state: None  # type: ignore[method-assign]
     app._client = _FakeClient()  # type: ignore[assignment]
     app._session_id = "sess-1"
@@ -199,7 +195,7 @@ async def test_input_submit_appends_user_turn_and_disables_prompt() -> None:
 def test_unknown_event_silently_ignored() -> None:
     app = KamaTuiApp("127.0.0.1", 9999)
     appended: list[Widget] = []
-    app._append = lambda w: appended.append(w)  # type: ignore[method-assign]
+    app._view.append = lambda w: appended.append(w)  # type: ignore[method-assign]
 
     app._handle_event({"type": "some.unknown.type", "run_id": "r", "ts": "t"})
     assert appended == []

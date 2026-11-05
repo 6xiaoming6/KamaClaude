@@ -5,6 +5,7 @@ from pathlib import Path
 
 from pydantic import Field
 
+from kama_claude.core.config import ExecutionConfig
 from kama_claude.core.tools.base import BaseTool, ToolParams, ToolResult
 from kama_claude.core.tools.command import CommandExecutor
 
@@ -33,13 +34,17 @@ class BashTool(BaseTool):
     input_schema = BashParams.model_json_schema()
 
     # 固定命令起始目录，这不是 shell 文件访问沙箱
-    def __init__(self, workspace: Path | None = None) -> None:
-        self._workspace = (workspace if workspace is not None else Path.cwd()).resolve()
+    def __init__(
+        self, workspace: Path | None = None, execution: ExecutionConfig | None = None,
+    ) -> None:
+        self.workspace = (workspace if workspace is not None else Path.cwd()).resolve()
+        self._execution = execution
 
     # 在子进程中执行 shell 命令，合并 stdout/stderr，超时或非零退出码时返回错误
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = BashParams.model_validate(params)
-        result = await CommandExecutor(self._workspace).execute(p.command, p.timeout)
+        executor = CommandExecutor(self.workspace, self._execution)
+        result = await executor.execute(p.command, p.timeout)
         if result.error:
             return ToolResult(
                 content=result.error, is_error=True,

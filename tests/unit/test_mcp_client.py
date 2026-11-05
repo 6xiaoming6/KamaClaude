@@ -6,7 +6,8 @@ import pytest
 from mcp.shared.exceptions import MCPError
 from mcp.types import CONNECTION_CLOSED, REQUEST_TIMEOUT, ListToolsResult, Tool
 
-from kama_claude.core.config import KamaConfig, _apply_toml
+from kama_claude.core.config import KamaConfig
+from kama_claude.core.config.toml import apply_toml
 from kama_claude.core.mcp.client import McpClient, McpServerUnavailableError
 from kama_claude.core.mcp.server import McpServerManager
 
@@ -15,7 +16,7 @@ from kama_claude.core.mcp.server import McpServerManager
 # 设计：两个真实配置小节并存，确认没有把 Core 的 TCP 参数当成 MCP 参数
 def test_config_reads_standard_transports():
     config = KamaConfig()
-    _apply_toml(config, {"mcp": {"servers": [
+    apply_toml(config, {"mcp": {"servers": [
         {"name": "remote", "transport": "streamable-http", "url": "https://example.com/mcp",
          "headers": {"Authorization": "Bearer test"}},
         {"name": "local", "command": "python", "args": ["server.py"], "env": {"KEY": "test"}},
@@ -42,7 +43,7 @@ def test_config_reads_standard_transports():
 # 设计：逐项覆盖 URL、请求头和传输混用，防止错误配置静默降级
 def test_invalid_mcp_config_is_rejected(entry):
     with pytest.raises(SystemExit):
-        _apply_toml(KamaConfig(), {"mcp": {"servers": [{"name": "test", **entry}]}})
+        apply_toml(KamaConfig(), {"mcp": {"servers": [{"name": "test", **entry}]}})
 
 
 # 功能：验证重名服务不会在 Manager 中覆盖连接并遗留后台任务
@@ -50,7 +51,7 @@ def test_invalid_mcp_config_is_rejected(entry):
 def test_duplicate_server_name_rejected():
     server = {"name": "same", "command": "python"}
     with pytest.raises(SystemExit, match="unique"):
-        _apply_toml(KamaConfig(), {"mcp": {"servers": [server, server]}})
+        apply_toml(KamaConfig(), {"mcp": {"servers": [server, server]}})
 
 
 # 功能：验证远程工具分页全部被发现，重复游标不会造成无限循环

@@ -332,7 +332,10 @@ async def test_disconnect_keeps_run_and_live_permission(tmp_path: Path) -> None:
     opened = await mgr.open(session.id)
     assert opened["running"] is True
     assert opened["pending_permissions"][0]["tool_use_id"] == "id-a"
-    permissions.respond("id-a", "allow_once")
+    pending = opened["pending_permissions"][0]
+    permissions.respond(
+        pending["request_id"], "allow_once", session_id=session.id, run_id=pending["run_id"],
+    )
     await finish(mgr, session.id)
     assert tool.calls == 1 and not permissions._pending
 
@@ -576,7 +579,10 @@ async def test_restart_recreates_permission_wait(
     await restored.resume(session.id, opened["revision"])
     await asyncio.wait_for(requested.wait(), 2)
     assert a.calls == 0 and fresh_permissions is not permissions
-    fresh_permissions.respond("id-a", "allow_once")
+    pending = fresh_permissions.pending_for_session(session.id)[0]
+    fresh_permissions.respond(
+        pending["request_id"], "allow_once", session_id=session.id, run_id=pending["run_id"],
+    )
     await finish(restored, session.id)
     assert a.calls == 1
 
@@ -850,7 +856,7 @@ async def test_tool_notification_observes_committed_result(
 
 
 # 功能：验证审批前或执行前保存失败时，工具不会执行或发出完成通知
-# 设计：在两个前置保存点注入错误，使用自动允许策略避免人为审批影响执行边界
+# 设计：询问策略覆盖审批前提交，自动允许覆盖执行前提交，两者均不应进入工具
 @pytest.mark.parametrize("phase", ["awaiting_approval", "executing"])
 async def test_tool_phase_save_failure_prevents_execution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
@@ -859,7 +865,9 @@ async def test_tool_phase_save_failure_prevents_execution(
     bus = EventBus()
     events: list[Any] = []
     permissions = PermissionManager(
-        {"a": ToolPolicy(default=PermissionDecision.ALLOW)}, timeout_s=0,
+        {"a": ToolPolicy(default=(
+            PermissionDecision.ASK if phase == "awaiting_approval" else PermissionDecision.ALLOW
+        ))}, timeout_s=0,
     )
     tool = ProbeTool("a")
     mgr = manager(store, Provider([tool_response("a")]), [tool], bus, permissions)

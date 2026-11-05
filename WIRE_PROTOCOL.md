@@ -779,7 +779,7 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
       "type": "integer"
     },
     "messages": {
-      "description": "Full original conversation from thread.jsonl, not compacted model context.",
+      "description": "Full original conversation from thread.jsonl, not compacted model context. Rows may include id and run_id for display correlation; these are not model input.",
       "items": {
         "additionalProperties": true,
         "type": "object"
@@ -907,247 +907,14 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
   "type": "object"
 }
 ```
-### MemoryInspectCommand
-
-| Field | Type | Required |
-|---|---|---|
-| `type` | `string` | no |
-| `session_id` | `string` | yes |
-| `scope` | `? | null` | no |
-| `key` | `string | null` | no |
-| `query` | `string` | no |
-| `offset` | `integer` | no |
-| `limit` | `integer` | no |
-
-```json
-{
-  "$defs": {
-    "MemoryScope": {
-      "enum": [
-        "global",
-        "project",
-        "session"
-      ],
-      "type": "string"
-    }
-  },
-  "properties": {
-    "type": {
-      "const": "memory.inspect",
-      "default": "memory.inspect",
-      "title": "Type",
-      "type": "string"
-    },
-    "session_id": {
-      "title": "Session Id",
-      "type": "string"
-    },
-    "scope": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/MemoryScope"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null
-    },
-    "key": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Key"
-    },
-    "query": {
-      "default": "",
-      "title": "Query",
-      "type": "string"
-    },
-    "offset": {
-      "default": 0,
-      "minimum": 0,
-      "title": "Offset",
-      "type": "integer"
-    },
-    "limit": {
-      "default": 20,
-      "maximum": 50,
-      "minimum": 1,
-      "title": "Limit",
-      "type": "integer"
-    }
-  },
-  "required": [
-    "session_id"
-  ],
-  "title": "MemoryInspectCommand",
-  "type": "object"
-}
-```
-### MemoryInspectResult
-
-| Field | Type | Required |
-|---|---|---|
-| `workspace` | `string` | yes |
-| `layers` | `array` | yes |
-| `entry` | `object | null` | yes |
-| `run_id` | `string | null` | yes |
-| `snapshot` | `? | null` | yes |
-
-```json
-{
-  "$defs": {
-    "MemoryLayerSnapshot": {
-      "properties": {
-        "scope": {
-          "$ref": "#/$defs/MemoryScope"
-        },
-        "budget": {
-          "title": "Budget",
-          "type": "integer"
-        },
-        "estimated_tokens": {
-          "default": 0,
-          "title": "Estimated Tokens",
-          "type": "integer"
-        },
-        "included": {
-          "items": {
-            "type": "string"
-          },
-          "title": "Included",
-          "type": "array"
-        },
-        "summarized": {
-          "items": {
-            "type": "string"
-          },
-          "title": "Summarized",
-          "type": "array"
-        },
-        "omitted": {
-          "default": 0,
-          "title": "Omitted",
-          "type": "integer"
-        },
-        "warnings": {
-          "items": {
-            "type": "string"
-          },
-          "title": "Warnings",
-          "type": "array"
-        }
-      },
-      "required": [
-        "scope",
-        "budget"
-      ],
-      "title": "MemoryLayerSnapshot",
-      "type": "object"
-    },
-    "MemoryScope": {
-      "enum": [
-        "global",
-        "project",
-        "session"
-      ],
-      "type": "string"
-    },
-    "MemorySnapshot": {
-      "properties": {
-        "text": {
-          "default": "",
-          "title": "Text",
-          "type": "string"
-        },
-        "estimated_tokens": {
-          "default": 0,
-          "title": "Estimated Tokens",
-          "type": "integer"
-        },
-        "layers": {
-          "items": {
-            "$ref": "#/$defs/MemoryLayerSnapshot"
-          },
-          "title": "Layers",
-          "type": "array"
-        }
-      },
-      "title": "MemorySnapshot",
-      "type": "object"
-    }
-  },
-  "properties": {
-    "workspace": {
-      "title": "Workspace",
-      "type": "string"
-    },
-    "layers": {
-      "items": {
-        "additionalProperties": true,
-        "type": "object"
-      },
-      "title": "Layers",
-      "type": "array"
-    },
-    "entry": {
-      "anyOf": [
-        {
-          "additionalProperties": true,
-          "type": "object"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "title": "Entry"
-    },
-    "run_id": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "title": "Run Id"
-    },
-    "snapshot": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/MemorySnapshot"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    }
-  },
-  "required": [
-    "workspace",
-    "layers",
-    "entry",
-    "run_id",
-    "snapshot"
-  ],
-  "title": "MemoryInspectResult",
-  "type": "object"
-}
-```
 ### PermissionRespondCommand
 
 | Field | Type | Required |
 |---|---|---|
 | `type` | `string` | no |
-| `tool_use_id` | `string` | yes |
+| `request_id` | `string` | yes |
+| `session_id` | `string` | yes |
+| `run_id` | `string` | yes |
 | `decision` | `string` | yes |
 
 ```json
@@ -1159,8 +926,16 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
       "title": "Type",
       "type": "string"
     },
-    "tool_use_id": {
-      "title": "Tool Use Id",
+    "request_id": {
+      "title": "Request Id",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
       "type": "string"
     },
     "decision": {
@@ -1175,7 +950,9 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
     }
   },
   "required": [
-    "tool_use_id",
+    "request_id",
+    "session_id",
+    "run_id",
     "decision"
   ],
   "title": "PermissionRespondCommand",
@@ -1439,11 +1216,14 @@ Events sent over the IPC socket (daemon → client).
 | Field | Type | Required |
 |---|---|---|
 | `type` | `string` | no |
+| `request_id` | `string` | yes |
 | `run_id` | `string` | yes |
 | `tool_use_id` | `string` | yes |
 | `tool_name` | `string` | yes |
 | `params` | `object` | yes |
 | `param_preview` | `string` | yes |
+| `reason` | `string` | no |
+| `approval_scope` | `string` | no |
 | `workspace` | `string | null` | no |
 | `resolved_path` | `string | null` | no |
 | `outside_workspace` | `boolean` | no |
@@ -1458,6 +1238,10 @@ Events sent over the IPC socket (daemon → client).
       "const": "permission.requested",
       "default": "permission.requested",
       "title": "Type",
+      "type": "string"
+    },
+    "request_id": {
+      "title": "Request Id",
       "type": "string"
     },
     "run_id": {
@@ -1479,6 +1263,16 @@ Events sent over the IPC socket (daemon → client).
     },
     "param_preview": {
       "title": "Param Preview",
+      "type": "string"
+    },
+    "reason": {
+      "default": "",
+      "title": "Reason",
+      "type": "string"
+    },
+    "approval_scope": {
+      "default": "\u4ec5\u672c\u6b21\u64cd\u4f5c",
+      "title": "Approval Scope",
       "type": "string"
     },
     "workspace": {
@@ -1535,6 +1329,7 @@ Events sent over the IPC socket (daemon → client).
     }
   },
   "required": [
+    "request_id",
     "run_id",
     "tool_use_id",
     "tool_name",
@@ -1554,6 +1349,7 @@ Events sent over the IPC socket (daemon → client).
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `tool_use_id` | `string` | yes |
+| `request_id` | `string` | no |
 | `decision` | `string` | yes |
 | `ts` | `string` | yes |
 
@@ -1572,6 +1368,11 @@ Events sent over the IPC socket (daemon → client).
     },
     "tool_use_id": {
       "title": "Tool Use Id",
+      "type": "string"
+    },
+    "request_id": {
+      "default": "",
+      "title": "Request Id",
       "type": "string"
     },
     "decision": {
@@ -1600,6 +1401,7 @@ Events sent over the IPC socket (daemon → client).
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `tool_use_id` | `string` | yes |
+| `request_id` | `string` | no |
 | `decision` | `string` | yes |
 | `ts` | `string` | yes |
 
@@ -1618,6 +1420,11 @@ Events sent over the IPC socket (daemon → client).
     },
     "tool_use_id": {
       "title": "Tool Use Id",
+      "type": "string"
+    },
+    "request_id": {
+      "default": "",
+      "title": "Request Id",
       "type": "string"
     },
     "decision": {

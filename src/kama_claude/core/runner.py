@@ -6,10 +6,10 @@ import logging
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from functools import partial
 from pathlib import Path
 from typing import Any
 
+from kama_claude.core.assembly import create_agent_loop
 from kama_claude.core.bus.events import (
     RunFinishedEvent,
     RunInterruptedEvent,
@@ -18,44 +18,31 @@ from kama_claude.core.bus.events import (
 )
 from kama_claude.core.checkpoint.checkpoint import Checkpoint, CheckpointError, RunCheckpoint
 from kama_claude.core.checkpoint.persistence import RunPersistence
-from kama_claude.core.compact.compactor import Compactor
-from kama_claude.core.compact.estimator import TokenEstimator
 from kama_claude.core.config import KamaConfig
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus, EventHandler
 from kama_claude.core.events.writer import EventWriter
 from kama_claude.core.llm.base import LLMProvider
-from kama_claude.core.llm.managed import ManagedProvider
-from kama_claude.core.llm.provider import AnthropicProvider, DeepseekProvider, OpenaiProvider
+from kama_claude.core.llm.factory import ProviderFactory
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.mcp.server import McpServerManager
-from kama_claude.core.memory.context import build_memory_context
+from kama_claude.core.memory.context import DEFAULT_SYSTEM, build_memory_context, compose_system
+from kama_claude.core.memory.paths import project_root
 from kama_claude.core.memory.store import MemoryStore
 from kama_claude.core.permissions.manager import PermissionManager
-from kama_claude.core.run_budget import RunBudget
 from kama_claude.core.runs import RUNS_DIR, new_run_id
 from kama_claude.core.session.model import Session
 from kama_claude.core.session.store import SessionStore
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
 from kama_claude.core.subagent.tool import AgentResultTool, SpawnAgentTool
+from kama_claude.core.subagent.tracking import SubagentTracker
 from kama_claude.core.task.manager import TaskManager
 from kama_claude.core.tools.builtin import (
-    BashTool,
-    EditFileTool,
-    FindFilesTool,
-    ListDirTool,
     MemoryReadTool,
     MemoryWriteTool,
-    ReadFileTool,
-    SearchTextTool,
-    TaskCreateTool,
-    TaskGetTool,
-    TaskListTool,
-    TaskUpdateTool,
-    WriteFileTool,
 )
+from kama_claude.core.tools.factory import builtin_tools
 from kama_claude.core.tools.registry import ToolRegistry
-from kama_claude.core.trace.provider import TracingProvider
 from kama_claude.core.trace.writer import TraceWriter
 
 
@@ -89,10 +76,12 @@ class AgentRunner:
     ) -> None:
         self._config = config
         self._bus = bus  # 现在事件总线放到了core里面，所有事件
-        self._provider = provider
+        self._providers = ProviderFactory(
+            provider, config.llm.default_model, trace,
+            include_payload=config.trace.include_llm_payload,
+        )
         self._extra_handlers: list[EventHandler] = extra_handlers or []
         self._runs_dir = runs_dir or RUNS_DIR
-        self._trace = trace
         self._permission_manager = permission_manager
         self._mcp_manager = mcp_manager
         # Core 注入跨 Run 注册表；独立 Runner 使用自己的注册表
@@ -125,23 +114,12 @@ class AgentRunner:
 
         registry = ToolRegistry()
         workspace = workspace if workspace is not None else Path.cwd()
-        for t in [
-            ReadFileTool(workspace), BashTool(workspace),
-            WriteFileTool(workspace), ListDirTool(workspace),
-            FindFilesTool(workspace), SearchTextTool(workspace), EditFileTool(workspace),
-        ]:
-            if _ok(t.name):
-                registry.register(t)
-        for t in [
-            TaskCreateTool(task_manager),
-            TaskUpdateTool(task_manager),
-            TaskListTool(task_manager),
-            TaskGetTool(task_manager),
-        ]:
-            if _ok(t.name):
-                registry.register(t)
+        for tool in builtin_tools(workspace, self._config.execution, task_manager):
+            if _ok(tool.name):
+                registry.register(tool)
         memory = MemoryStore(
-            workspace, store.session_dir(session.id) if session and store else None,
+            workspace, self._config.memory,
+            project=Path(run.memory_project_root) if run and run.memory_project_root else None,
         )
         for memory_tool in (
             MemoryReadTool(memory), MemoryWriteTool(memory, session_id, run_id or ""),
@@ -152,13 +130,17 @@ class AgentRunner:
         # 创建子agent的工具是否注册
         if provider is not None and bus is not None and run_id is not None:
             runs_dir = child_runs_dir or self._runs_dir
+            self._task_registry.bind_root(
+                run_id, session_id, self._config.subagent,
+                known_ids=run.subagents if run is not None else (),
+            )
             # 恢复后派生的子任务也沿用父 Run 冻结的限制，而非重启时的新配置
             limits = replace(
                 self._config.agent, max_steps=run.max_steps,
                 max_run_seconds=run.max_run_seconds, max_total_tokens=run.max_total_tokens,
                 repeat_failure_limit=run.repeat_failure_limit,
             ) if run is not None else self._config.agent
-            provider_name, model = (run.provider, run.model) if run else self._provider_identity()
+            provider_name, model = (run.provider, run.model) if run else self._providers.identity()
             child_tools = (
                 [str(schema["name"]) for schema in run.tool_schemas]
                 if run is not None and run.schemas_frozen else tool_whitelist
@@ -176,9 +158,13 @@ class AgentRunner:
                         session_id=session_id,
                         depth=0,
                         workspace=workspace,
+                        execution=self._config.execution,
                         agent_config=limits, compaction=self._config.compaction,
+                        memory_config=self._config.memory,
+                        memory_project_root=memory.project_root,
                         provider_name=provider_name, model=model,
-                        provider_factory=self._provider_for_model, tool_whitelist=child_tools,
+                        provider_factory=self._providers.for_model, tool_whitelist=child_tools,
+                        root_run_id=run_id, subagent_config=self._config.subagent,
                     )
                 )
             if _ok("agent_result"):
@@ -190,19 +176,6 @@ class AgentRunner:
                     registry.register(mcp_tool)
         return registry
 
-    # 记录真实后端类型和模型，不把凭证写入检查点
-    def _provider_identity(self) -> tuple[str, str]:
-        provider = self._provider
-        name = (
-            "deepseek"
-            if provider is None or isinstance(provider, DeepseekProvider)
-            else "anthropic"
-            if isinstance(provider, AnthropicProvider)
-            else "openai"
-            if isinstance(provider, OpenaiProvider)
-            else "custom"
-        )
-        return name, str(getattr(provider, "_model", self._config.llm.default_model))
 
     # 在接收目标时先提交初始 Run，避免任务尚未调度就退出而丢失目标
     def prepare_checkpoint(
@@ -218,7 +191,7 @@ class AgentRunner:
         context = self._create_context(
             self._new_run_state(goal, run_id, tools),
             cp.messages,
-            memory_store=MemoryStore(Path.cwd(), store.session_dir(session.id)),
+            memory_store=MemoryStore(Path.cwd(), self._config.memory),
             system_prompt_override=system_prompt,
         )
         persistence = RunPersistence(context, cp, session, store)
@@ -262,7 +235,8 @@ class AgentRunner:
             for handler in self._extra_handlers:
                 bus.subscribe(handler)
                 observers.callback(bus.unsubscribe, handler)
-            track_children = partial(self._track_children, context)
+            subagents = SubagentTracker(context.run)
+            track_children = subagents.handle_event
             bus.subscribe(track_children)
             observers.callback(bus.unsubscribe, track_children)
             if persistence is not None:
@@ -286,7 +260,7 @@ class AgentRunner:
                 cancelled = False
                 try:
                     loop = self._build_loop(
-                        context, bus, run_path, persistence, resuming=resuming,
+                        context, bus, run_path, persistence, resuming=resuming, subagents=subagents,
                     )
                     await loop.run()
                 except CheckpointError:
@@ -351,7 +325,8 @@ class AgentRunner:
             run,
             cp.messages if cp else [],
             memory_store=MemoryStore(
-                Path(run.workspace), store.session_dir(session.id) if session and store else None,
+                Path(run.workspace), self._config.memory,
+                project=Path(run.memory_project_root) if run.memory_project_root else None,
             ),
             system_prompt_override=system_prompt_override,
         )
@@ -370,10 +345,11 @@ class AgentRunner:
     def _new_run_state(
         self, goal: str, run_id: str, tool_whitelist: list[str] | None,
     ) -> RunCheckpoint:
-        provider, model = self._provider_identity()
+        provider, model = self._providers.identity()
         return RunCheckpoint(
             run_id=run_id, goal=goal, provider=provider, model=model,
             workspace=str(Path.cwd().resolve()),
+            memory_project_root=str(project_root(Path.cwd())),
             max_steps=self._config.agent.max_steps,
             max_run_seconds=self._config.agent.max_run_seconds,
             max_total_tokens=self._config.agent.max_total_tokens,
@@ -397,35 +373,13 @@ class AgentRunner:
         )
         # 没有冻结提示才重新构建，已有值不随记忆文件变化而覆盖
         if not run.system_prompt:
-            # 新 Run 读取一次；恢复和正式调度都复用已冻结提示，完全不碰记忆文件
-            run.memory_snapshot = build_memory_context(
-                memory_store, self._config.memory,
-                include_session=bool(memory_store.has_session),
-            )
-            context.memory_context = run.memory_snapshot.text
-            run.system_prompt = context.system_prompt(
-                "You are a helpful AI assistant. "
-                "Use the available tools to complete the user's goal. "
-                "When the goal is fully achieved, respond with a final answer "
-                "and do not call any more tools."
-            )
+            run.memory_project_root = str(memory_store.project_root)
+            run.base_system_prompt = system_prompt_override or DEFAULT_SYSTEM
+            run.memory_snapshot = build_memory_context(memory_store)
+            run.system_prompt = compose_system(run.base_system_prompt, run.memory_snapshot)
         return context
 
-    # 更新唯一 Run 中的子任务标记，此观察路径不负责检查点提交
-    async def _track_children(self, context: ExecutionContext, event: Any) -> None:
-        run = context.run
-        if getattr(event, "type", "") == "subagent.started":
-            if event.parent_run_id == run.run_id or event.parent_run_id in run.subagents:
-                current = run.tools[run.tool_index] if run.tool_index < len(run.tools) else None
-                background = (
-                    current is not None
-                    and current.name == "spawn_agent"
-                    and bool(current.input.get("run_in_background"))
-                ) or run.subagents.get(event.parent_run_id) == "background"
-                run.subagents[event.run_id] = "background" if background else "running"
-        elif getattr(event, "type", "") == "subagent.finished":
-            if event.run_id in run.subagents and run.subagents[event.run_id] != "background":
-                run.subagents[event.run_id] = event.status
+
 
     # 组装模型、工具和压缩器，Loop 直接持有 Context 与持久化对象
     def _build_loop(
@@ -436,9 +390,10 @@ class AgentRunner:
         persistence: RunPersistence | None,
         *,
         resuming: bool,
+        subagents: SubagentTracker | None = None,
     ) -> AgentLoop:
         task_manager = TaskManager(run_path / ".tasks")
-        provider = self._create_provider(context.run, resuming=resuming)
+        provider = self._providers.create(context.run, resuming=resuming)
         session = persistence.session if persistence else None
         store = persistence.store if persistence else None
         registry = self._build_registry(
@@ -463,61 +418,14 @@ class AgentRunner:
                     frozen_registry.register(tool)
             registry = frozen_registry
         self._save_tool_schemas(context.run, registry, persistence, resuming=resuming)
-        estimator = TokenEstimator(
-            context.run.provider, context.run.model,
-            persistence.checkpoint.token_estimation if persistence else None,
-        )
-        budget = RunBudget(context.run)
-        # 主任务与子任务分别记账，子任务也组装自己的 ManagedProvider
-        provider = ManagedProvider(
-            provider, estimator, self._config.compaction,
-            budget=budget, persistence=persistence, event_bus=bus,
-        )
-        compactor = Compactor(self._config.compaction, estimator)
-        return AgentLoop(
-            provider, registry, bus, context=context,
-            permission_manager=self._permission_manager,
-            compactor=compactor,
-            compaction=self._config.compaction,
-            run_path=run_path,
-            session_id=session.id if session else "",
-            persistence=persistence,
-            budget=budget, estimator=estimator,
+        return create_agent_loop(
+            provider, registry, bus, context=context, compaction=self._config.compaction,
+            permission_manager=self._permission_manager, persistence=persistence,
+            session_id=session.id if session else "", run_path=run_path, subagents=subagents,
+            memory_config=self._config.memory,
         )
 
-    # 校验原后端身份并重建客户端，凭证错误不允许退出整个 Core
-    def _create_provider(self, run: RunCheckpoint, *, resuming: bool) -> LLMProvider:
-        provider_name, model = self._provider_identity()
-        if resuming and (
-            provider_name != run.provider
-            or (self._provider is not None and model != run.model)
-        ):
-            run.reason = "provider or model changed; restore the original backend"
-            raise RuntimeError(run.reason)
-        return self._provider_for_model(run.model)
 
-    # 角色模型只切换当前后端的模型，复用客户端，不按模型名字猜测供应商
-    def _provider_for_model(self, model: str) -> LLMProvider:
-        provider = self._provider
-        try:
-            if provider is None:
-                provider = DeepseekProvider(model)
-            elif model != self._provider_identity()[1]:
-                if isinstance(provider, DeepseekProvider):
-                    provider = DeepseekProvider(model, client=provider._client)
-                elif isinstance(provider, AnthropicProvider):
-                    provider = AnthropicProvider(model, client=provider._client)
-                elif isinstance(provider, OpenaiProvider):
-                    provider = OpenaiProvider(model, client=provider._client)
-                else:
-                    raise ValueError("custom provider does not support a model override")
-        except SystemExit as exc:
-            raise RuntimeError(str(exc)) from exc
-        if self._trace is not None:
-            provider = TracingProvider(
-                provider, self._trace, include_payload=self._config.trace.include_llm_payload,
-            )
-        return provider
 
     # 恢复时校验冻结的工具定义，并在模型执行前提交当前 schema
     def _save_tool_schemas(

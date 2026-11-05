@@ -33,7 +33,7 @@ async def test_locate_read_edit_verify_pipeline(tmp_path: Path, monkeypatch: pyt
     async def approve(event: BaseModel) -> None:
         if isinstance(event, PermissionRequestedEvent):
             approvals.append(event.tool_name)
-            permissions.respond(event.tool_use_id, "allow_once")
+            permissions.respond(event.request_id, "allow_once", session_id=event.session_id, run_id=event.run_id)
 
     bus.subscribe(approve)
 

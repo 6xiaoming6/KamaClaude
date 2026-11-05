@@ -21,8 +21,6 @@ from kama_claude.core.bus.commands import (
     AgentRunResult,
     EventSubscribeCommand,
     EventSubscribeResult,
-    MemoryInspectCommand,
-    MemoryInspectResult,
     PermissionRespondCommand,
     PermissionRespondResult,
     PongResult,
@@ -53,7 +51,8 @@ from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.permissions.storage import load_policy_file
 from kama_claude.core.runner import AgentRunner
 from kama_claude.core.runs import events_file, new_run_id
-from kama_claude.core.session import SessionManager, SessionStore
+from kama_claude.core.session.manager import SessionManager
+from kama_claude.core.session.store import SessionStore
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
 from kama_claude.core.trace.record import TraceRecord
 from kama_claude.core.trace.writer import TraceWriter
@@ -175,15 +174,17 @@ class CoreApp:
     async def _permission_respond_handler(self, params: dict[str, Any]) -> PermissionRespondResult:
         cmd = PermissionRespondCommand.model_validate(params)
         logger.info(
-            "permission.respond received tool_use_id=%s decision=%s",
-            cmd.tool_use_id, cmd.decision,
+            "permission.respond received request_id=%s decision=%s",
+            cmd.request_id, cmd.decision,
         )
         if self._permission_manager is None:
             logger.error("permission.respond: PermissionManager not initialized")
-            return PermissionRespondResult()
+            raise HandlerError(-32603, "permission manager unavailable")
         # 调用permission_manager.respond方法，将对应工具调用的feture设置为done
         try:
-            self._permission_manager.respond(cmd.tool_use_id, cmd.decision)
+            self._permission_manager.respond(
+                cmd.request_id, cmd.decision, session_id=cmd.session_id, run_id=cmd.run_id,
+            )
         except ValueError as exc:
             raise HandlerError(-32602, str(exc)) from exc
         return PermissionRespondResult()
@@ -193,17 +194,7 @@ class CoreApp:
         assert self._sessions is not None
         cmd = SessionCompactCommand.model_validate(params)
         result = await self._sessions.compact(cmd.session_id, cmd.focus)
-        return result  # type: ignore[no-any-return]
-
-    # 直接查看记忆文件与冻结快照，不占用 Agent 步数或生成对话消息
-    async def _memory_inspect_handler(self, params: dict[str, Any]) -> MemoryInspectResult:
-        assert self._sessions is not None
-        cmd = MemoryInspectCommand.model_validate(params)
-        result = self._sessions.inspect_memory(
-            cmd.session_id, scope=cmd.scope, key=cmd.key,
-            query=cmd.query, offset=cmd.offset, limit=cmd.limit,
-        )
-        return MemoryInspectResult(**result)
+        return result
 
     # 关闭 session 并返回 closed 状态
     async def _session_close_handler(self, params: dict[str, Any]) -> SessionCloseResult:
@@ -283,9 +274,9 @@ class CoreApp:
             timeout_s=self._config.permission.timeout_s,
         )
         logger.info(
-            "permission manager: timeout_s=%.1f  persistent=%d entries",
+            "permission manager: timeout_s=%.1f  legacy deny entries=%d",
             self._config.permission.timeout_s,
-            len(load_policy_file(policy_file)),
+            sum(value == "deny" for value in load_policy_file(policy_file).values()),
         )
 
         self._broadcaster = IpcEventBroadcaster(trace=self._trace)
@@ -313,6 +304,7 @@ class CoreApp:
             bus=self._bus,
             provider_factory=lambda: DeepseekProvider(config.llm.default_model),
             compaction=config.compaction,
+            memory=config.memory,
             task_registry=self._task_registry,
             permission_manager=self._permission_manager,
         )
@@ -335,7 +327,6 @@ class CoreApp:
         server.register("session.close", self._session_close_handler)
         server.register("permission.respond", self._permission_respond_handler)
         server.register("session.compact", self._session_compact_handler)
-        server.register("memory.inspect", self._memory_inspect_handler)
 
         addr = await server.start()
         logger.info("kama-core %s listening addr=%s", kama_claude.__version__, addr)

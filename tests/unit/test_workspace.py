@@ -131,8 +131,6 @@ async def test_external_approval_is_once_and_validated(tmp_path: Path) -> None:
     archive.write_text("full archived output", encoding="utf-8")
     policy_file = tmp_path / "policy.toml"
     manager = PermissionManager(policy_file=policy_file)
-    manager._persistent_always["read_file"] = "allow"
-    manager._session_always[("session-one", "read_file")] = "allow"
     requests: list[PermissionRequestedEvent] = []
     bus = EventBus()
 
@@ -147,11 +145,11 @@ async def test_external_approval_is_once_and_validated(tmp_path: Path) -> None:
         assert event.allowed_decisions == ["allow_once", "deny_once"]
         for invalid in ("always_allow", "always_deny", "made_up"):
             with pytest.raises(ValueError):
-                manager.respond(event.tool_use_id, invalid)
+                manager.respond(event.request_id, invalid, session_id=event.session_id, run_id=event.run_id)
         pending = manager.pending_for_session("session-one")
         assert pending[0]["resolved_path"] == str(archive)
         assert pending[0]["allowed_decisions"] == event.allowed_decisions
-        manager.respond(event.tool_use_id, "allow_once")
+        manager.respond(event.request_id, "allow_once", session_id=event.session_id, run_id=event.run_id)
 
     bus.subscribe(approve)
     for uid in ("one", "two"):
@@ -187,7 +185,7 @@ async def test_external_write_denial_timeout_and_allow(tmp_path: Path) -> None:
     # 对本次请求明确拒绝
     async def deny(event: BaseModel) -> None:
         if isinstance(event, PermissionRequestedEvent):
-            manager.respond(event.tool_use_id, "deny_once")
+            manager.respond(event.request_id, "deny_once", session_id=event.session_id, run_id=event.run_id)
 
     bus.subscribe(deny)
     for active_bus in (bus, EventBus()):
@@ -204,7 +202,7 @@ async def test_external_write_denial_timeout_and_allow(tmp_path: Path) -> None:
     # 对新的一次调用批准，不修改工具级策略
     async def allow(event: BaseModel) -> None:
         if isinstance(event, PermissionRequestedEvent):
-            manager.respond(event.tool_use_id, "allow_once")
+            manager.respond(event.request_id, "allow_once", session_id=event.session_id, run_id=event.run_id)
 
     bus = EventBus()
     bus.subscribe(allow)
@@ -222,7 +220,6 @@ async def test_static_deny_cannot_be_overridden(tmp_path: Path) -> None:
     root.mkdir()
     target = tmp_path / "outside.txt"
     manager = PermissionManager({"write_file": ToolPolicy(default=PermissionDecision.DENY)})
-    manager._persistent_always["write_file"] = "allow"
     result = await call_file(
         WriteFileTool(root), {"path": str(target), "content": "no"}, manager,
     )
@@ -256,9 +253,12 @@ async def test_linked_parent_and_directory_recursion(tmp_path: Path) -> None:
 
 # 功能：验证审批期间替换链接会拒绝访问新目标，不重试也不标为未知
 # 设计：审批事件回调中替换真实 junction，核验 executing 提交尚未发生
-async def test_changed_target_after_approval_denied(tmp_path: Path) -> None:
-    root, first, second = (tmp_path / name for name in ("root", "first", "second"))
-    for directory in (root, first, second):
+@pytest.mark.parametrize("internal", [False, True])
+async def test_changed_target_after_approval_denied(tmp_path: Path, internal: bool) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    first, second = ((root if internal else tmp_path) / name for name in ("first", "second"))
+    for directory in (first, second):
         directory.mkdir()
     link = root / "link"
     directory_link(link, first)
@@ -272,7 +272,10 @@ async def test_changed_target_after_approval_denied(tmp_path: Path) -> None:
             requests.append(event)
             unlink_directory(link)
             directory_link(link, second)
-            manager.respond(event.tool_use_id, "allow_once")
+            manager.respond(
+                event.request_id, "always_allow" if internal else "allow_once",
+                session_id=event.session_id, run_id=event.run_id,
+            )
 
     bus.subscribe(swap_and_allow)
     stages: list[str] = []
@@ -287,6 +290,40 @@ async def test_changed_target_after_approval_denied(tmp_path: Path) -> None:
         assert stages == ["awaiting_approval"]
         assert len(requests) == 1
         assert not (first / "a.txt").exists()
+        assert not (second / "a.txt").exists()
+    finally:
+        unlink_directory(link)
+
+
+# 功能：验证内部链接与原文件复用授权，链接改指其他文件后必须重新询问
+# 设计：使用真实 junction 和真实文件写入，排除仅靠原始路径或父目录复用许可
+async def test_file_grant_follows_resolved_target(tmp_path: Path) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    link = tmp_path / "alias"
+    directory_link(link, first)
+    manager, bus = PermissionManager(), EventBus()
+    requests: list[PermissionRequestedEvent] = []
+    async def approve(event: BaseModel) -> None:
+        if isinstance(event, PermissionRequestedEvent):
+            requests.append(event)
+            manager.respond(
+                event.request_id, "always_allow" if len(requests) == 1 else "deny_once",
+                session_id=event.session_id, run_id=event.run_id,
+            )
+    bus.subscribe(approve)
+    tool = WriteFileTool(tmp_path)
+    try:
+        assert not (await call_file(tool, {"path": "alias/a.txt", "content": "one"}, manager, bus)).is_error
+        assert not (await call_file(tool, {"path": "first/a.txt", "content": "two"}, manager, bus)).is_error
+        assert len(requests) == 1
+        unlink_directory(link)
+        directory_link(link, second)
+        result = await call_file(tool, {"path": "alias/a.txt", "content": "no"}, manager, bus)
+        assert result.error_type == "permission_denied"
+        assert [event.resolved_path for event in requests] == [str(first / "a.txt"), str(second / "a.txt")]
+        assert (first / "a.txt").read_text(encoding="utf-8") == "two"
         assert not (second / "a.txt").exists()
     finally:
         unlink_directory(link)
@@ -328,7 +365,7 @@ def test_runner_restore_and_nested_agents_share_workspace(
         loop = runner._build_loop(
             context, EventBus(), tmp_path / "runs" / "run-one", None, resuming=resuming,
         )
-        registry = loop._registry
+        registry = loop._tools.registry
         for depth in range(3):
             for name in ("read_file", "write_file", "list_dir"):
                 tool = registry.get(name)
@@ -336,7 +373,7 @@ def test_runner_restore_and_nested_agents_share_workspace(
                 assert tool.paths.root == root
             bash = registry.get("bash")
             assert isinstance(bash, BashTool)
-            assert bash._workspace == root
+            assert bash.workspace == root
             spawn = registry.get("spawn_agent")
             if depth == 2:
                 assert spawn is None

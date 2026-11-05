@@ -15,10 +15,10 @@ from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.managed import ManagedProvider
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock, UsageStats
-from kama_claude.core.loop import AgentLoop
 from kama_claude.core.run_budget import BudgetExceeded, RunBudget
 from kama_claude.core.tools.base import BaseTool, ToolResult
 from kama_claude.core.tools.registry import ToolRegistry
+from tests.unit.loop_support import make_loop as build_test_loop
 
 
 # 功能：创建有固定身份的 Run，测试不依赖真实模型与用户目录
@@ -137,7 +137,7 @@ async def test_loop_stops_repeated_failures_and_pairs_remaining_tools():
     registry = ToolRegistry()
     registry.register(FailingTool())
     context = ExecutionContext(run=run_state())
-    await AgentLoop(model, registry, EventBus(), context=context).run()
+    await build_test_loop(model, registry, EventBus(), context=context).run()
     assert context.run.status == "failed" and context.run.reason == "repeated_tool_failure"
     assert model.chat.await_count == 5
     assert context.run.tools[-1].status == "completed"
@@ -171,7 +171,7 @@ async def test_time_limit_before_execution_preserves_message_pairs(monkeypatch):
         await asyncio.sleep(10)
     model.chat.side_effect = wait_model
     context = ExecutionContext(run=state)
-    await AgentLoop(model, ToolRegistry(), EventBus(), context=context, budget=budget).run()
+    await build_test_loop(model, ToolRegistry(), EventBus(), context=context, budget=budget).run()
     assert state.status == "failed" and state.reason == "run_time_budget_exceeded"
 
 
@@ -214,7 +214,7 @@ async def test_budget_stops_before_next_tool():
     registry = ToolRegistry()
     registry.register(Tool())
     context = ExecutionContext(run=state)
-    await AgentLoop(model, registry, EventBus(), context=context).run()
+    await build_test_loop(model, registry, EventBus(), context=context).run()
     assert calls == [1] and state.status == "failed"
     assert state.tools[0].result["content"] == "done"
     assert "not executed" in state.tools[1].result["content"]
@@ -244,7 +244,7 @@ async def test_time_limit_during_tool_keeps_unknown(monkeypatch):
     registry.register(Tool())
     context = ExecutionContext(run=state)
     persistence = Mock()
-    await AgentLoop(
+    await build_test_loop(
         model, registry, EventBus(), context=context, budget=budget, persistence=persistence,
     ).run()
     assert effects == [1]

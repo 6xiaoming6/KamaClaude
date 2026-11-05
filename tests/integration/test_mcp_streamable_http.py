@@ -59,7 +59,7 @@ async def test_real_http_service_roundtrip_and_close(mcp_endpoint):
     await asyncio.create_task(client.connect_http(mcp_endpoint, HEADERS))
     try:
         tools = await client.list_tools()
-        assert {tool.name for tool in tools} == {"add", "fail", "slow"}
+        assert {tool.name for tool in tools} == {"add", "fail", "slow", "has_environment"}
         assert client.protocol_version
         output = await asyncio.gather(
             client.call_tool("add", {"a": 2, "b": 3}),
@@ -124,16 +124,20 @@ async def test_cancel_http_call_keeps_session_usable(mcp_endpoint):
 
 # 功能：验证保留的 stdio 传输能运行官方 SDK 服务，并在关闭时结束子进程
 # 设计：服务将 PID 写入临时文件，检查真实进程身份而非只断言 mock 被调用
-async def test_real_stdio_service_still_works(tmp_path):
+async def test_real_stdio_service_still_works(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "s10-fake-key")
+    monkeypatch.setenv("S10_MCP_FLAG", "explicitly-forwarded")
     client = McpClient()
     pid_path = tmp_path / "mcp.pid"
     process = None
     try:
         await client.connect_stdio(sys.executable, ["-X", "utf8", "-B", str(SCRIPT), "stdio"],
-                                   {"MCP_TEST_PID": str(pid_path)})
+                                   {"MCP_TEST_PID": str(pid_path)}, forward_env=["S10_MCP_FLAG"])
         process = psutil.Process(int(pid_path.read_text(encoding="utf-8")))
         assert await client.list_tools()
         assert json.loads(await client.call_tool("add", {"a": 5, "b": 6})) == 11
+        assert json.loads(await client.call_tool("has_environment", {"name": "OPENAI_API_KEY"})) is False
+        assert json.loads(await client.call_tool("has_environment", {"name": "S10_MCP_FLAG"})) is True
     finally:
         await client.close()
     assert process is not None and not process.is_running()

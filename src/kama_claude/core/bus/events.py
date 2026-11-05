@@ -215,15 +215,18 @@ class ContextCompactedEvent(BaseModel):
 # 工具调用需要审批，展示参数并等待用户决定(通知前端)
 class PermissionRequestedEvent(BaseModel):
     type: Literal["permission.requested"] = "permission.requested"
+    request_id: str  # Core 生成的审批 ID，不复用模型的工具 ID
     run_id: str
     tool_use_id: str
     tool_name: str
     params: dict[str, Any]
     param_preview: str
+    reason: str = ""  # 为什么要求审批
+    approval_scope: str = "仅本次操作"  # 文件会话授权只针对当前工具与后端实际路径
     workspace: str | None = None  # 文件工具绑定的根目录
     resolved_path: str | None = None  # 实际访问目标，包含链接解析结果
     outside_workspace: bool = False  # 外部路径必须单次审批
-    allowed_decisions: list[str] | None = None  # 未提供时沿用普通审批四选项
+    allowed_decisions: list[str] | None = None  # Core 始终提供；缺失时前端只展示单次选项
     session_id: str
     ts: str
 
@@ -233,6 +236,7 @@ class PermissionGrantedEvent(BaseModel):
     type: Literal["permission.granted"] = "permission.granted"
     run_id: str
     tool_use_id: str
+    request_id: str = ""  # 自动放行没有等待请求
     # "allow_once" | "always_allow" | "auto_allow"
     decision: str
     ts: str
@@ -243,6 +247,7 @@ class PermissionDeniedEvent(BaseModel):
     type: Literal["permission.denied"] = "permission.denied"
     run_id: str
     tool_use_id: str
+    request_id: str = ""
     # "deny_once" | "always_deny" | "auto_deny"
     decision: str
     ts: str
@@ -287,8 +292,7 @@ class RunBudgetEvent(BaseModel):
     run_id: str
     method: str = ""
     estimated_input_tokens: int = 0
-    trigger_tokens: int = 0  # 本次动态压缩阈值；0 表示关闭自动压缩
-    underestimate_factor: float = 1.0  # Cline 式低估系数，范围一到四
+    trigger_tokens: int = 0  # 固定配置比例对应的压缩阈值；0 表示关闭自动压缩
     actual_tokens: int = 0
     estimated_tokens: int = 0
     elapsed_seconds: float = 0.0

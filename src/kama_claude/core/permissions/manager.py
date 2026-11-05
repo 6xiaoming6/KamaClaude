@@ -1,250 +1,187 @@
 from __future__ import annotations
 
 import asyncio
-import datetime
 import logging
-import re
+import os
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
-from datetime import UTC
+from copy import deepcopy
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from kama_claude.core.permissions.policy import (
     DEFAULT_POLICIES,
     PermissionDecision,
     ToolPolicy,
-    matches_outside_cwd,
+    assess,
     param_preview,
 )
-from kama_claude.core.permissions.storage import load_policy_file, save_policy_file
+from kama_claude.core.permissions.scope import ApprovalScope, approval_scope
+from kama_claude.core.permissions.storage import load_policy_file
 from kama_claude.core.workspace import PathAccess
 
 logger = logging.getLogger(__name__)
-
 _DEFAULT_DECISIONS = ("allow_once", "always_allow", "deny_once", "always_deny")
-_EXTERNAL_DECISIONS = ("allow_once", "deny_once")
-
-
-def _now() -> str:
-    return datetime.datetime.now(UTC).isoformat()
+_FILE_DECISIONS = ("allow_once", "deny_once", "always_allow")
+_ONCE_DECISIONS = ("allow_once", "deny_once")
+_FILE_TOOLS = {"read_file", "write_file", "edit_file", "list_dir", "find_files", "search_text"}
 
 
 @dataclass
 class _PendingRequest:
     future: asyncio.Future[str]
-    session_id: str
-    tool_name: str
-    allowed_decisions: tuple[str, ...] = _DEFAULT_DECISIONS
-    payload: dict[str, Any] = field(default_factory=dict)
+    payload: dict[str, Any]
 
 
-# 管理工具调用权限：策略评估、用户审批挂起、session 级和持久化 always 缓存、超时
 class PermissionManager:
+    # 审批等待和会话授权只放内存，不保存一次性批准或 Future。
     def __init__(
-        self,
-        policies: dict[str, ToolPolicy] | None = None,
-        *,
-        policy_file: Path | None = None,
-        timeout_s: float = 60.0,
+        self, policies: dict[str, ToolPolicy] | None = None, *,
+        policy_file: Path | None = None, timeout_s: float = 60.0,
     ) -> None:
-        self._policies: dict[str, ToolPolicy] = policies or dict(DEFAULT_POLICIES)
-        # tool_use_id → pending Future + metadata
+        self._policies = dict(DEFAULT_POLICIES if policies is None else policies)
         self._pending: dict[str, _PendingRequest] = {}
-        # (session_id, tool_name) → "allow" | "deny"（session 内存，重启丢失）
-        self._session_always: dict[tuple[str, str], str] = {}
-        # tool_name → "allow" | "deny"（持久化，从 policy_file 加载）
-        self._policy_file = policy_file
-        self._persistent_always: dict[str, str] = (
-            load_policy_file(policy_file) if policy_file is not None else {}
-        )
-        # 0 表示不超时
+        self._file_grants: set[tuple[str, str, str]] = set()
+        # 其他工具保留完整参数授权；文件不再使用目录或资源范围。
+        self._session_grants: dict[ApprovalScope, bool] = {}
+        # 旧文件只保留拒绝记录；旧工具级允许不再自动放行，也不改写原文件。
+        stored = load_policy_file(policy_file) if policy_file is not None else {}
+        self._persistent_denials = {name for name, value in stored.items() if value == "deny"}
+        if "allow" in stored.values():
+            logger.warning("legacy tool-wide allows ignored; approve scoped operations again")
         self._timeout_s = timeout_s
 
-    # 对工具名 + 参数执行 4 层静态评估，不挂起
-    # 只对允许工具执行进行静态评估，不需要等待用户审批
+    # 查询静态禁止与默认策略，不读取会话文件授权。
     def evaluate(self, tool_name: str, params: dict[str, Any]) -> PermissionDecision:
-        from kama_claude.core.permissions.policy import evaluate
-        policy = self._policies.get(tool_name)
-        return evaluate(tool_name, params, policy)
+        if self._is_persistently_denied(tool_name, params):
+            return PermissionDecision.DENY
+        return assess(tool_name, params, self._policies.get(tool_name)).decision
 
-    # 检查权限；如需 ask 则向客户端发事件并等待响应；返回 (allowed, decision_str)
-    async def check_and_wait(
-        self,
-        tool_use_id: str,
-        tool_name: str,
-        params: dict[str, Any],
-        session_id: str,
-        event_emitter: Callable[[dict[str, Any]], Awaitable[None]],
-        path_access: PathAccess | None = None,
-    ) -> tuple[bool, str]:
-        command = str(params.get("command", "")) if tool_name == "bash" else ""
-        policy = self._policies.get(tool_name)
-        external_path = path_access is not None and path_access.outside_workspace
-        # 文件工具的明确禁止优先于历史缓存，外部批准不能提升静态策略
-        if path_access is not None and policy and policy.default == PermissionDecision.DENY:
-            return False, "auto_deny"
-
-        # Tier 1: deny_patterns（bash only，不可被缓存绕过）
-        # 先检查bash工具执行的命令是否是不允许的
-        if command and policy:
-            for pat in policy.deny_patterns:
-                if re.search(pat, command):
-                    logger.debug("permission: deny_pattern hit tool=%s", tool_name)
-                    return False, "auto_deny"
-
-        # Tier 2: OUTSIDE_CWD_HEURISTICS（bash only，强制 ASK，不可被任何缓存绕过）
-        # 如果bash工具需要访问外层目录，一律询问用户
-        outside_cwd = bool(command and matches_outside_cwd(command))
-        global_memory = tool_name == "memory_write" and params.get("scope", "project") == "global"
-        if global_memory and policy and policy.default == PermissionDecision.DENY:
-            return False, "auto_deny"
-
-        # 全局授权单独缓存，项目记忆的 always_allow 不能顺便授权全局写入
-        cache_name = "memory_write_global" if global_memory else tool_name
-        if not outside_cwd and not external_path:
-            # Tier 3: session always 缓存
-            session_key = (session_id, cache_name)
-            if session_key in self._session_always:
-                cached = self._session_always[session_key]
-                logger.debug("permission: session cache hit tool=%s decision=%s", tool_name, cached)
-                return cached == "allow", f"auto_{cached}"
-
-            # Tier 4: persistent always（跨 session）
-            if cache_name in self._persistent_always:
-                cached = self._persistent_always[cache_name]
-                logger.debug(
-                    "permission: persistent cache hit tool=%s decision=%s", tool_name, cached,
-                )
-                return cached == "allow", f"auto_{cached}"
-
-            # Tier 5: allow_patterns（bash only）
-            if command and policy:
-                for pat in policy.allow_patterns:
-                    if re.search(pat, command):
-                        return True, "auto_allow"
-
-            # Tier 6: tool default
-            if policy is not None:
-                default = PermissionDecision.ASK if global_memory else policy.default
-                if default == PermissionDecision.ALLOW:
-                    return True, "auto_allow"
-                if default == PermissionDecision.DENY:
-                    return False, "auto_deny"
-            # default == ASK（bash、unknown tool）→ fall through to Future
-
-        # ASK 路径（来自 OUTSIDE_CWD 强制 ASK，或 default=ASK）
-        loop = asyncio.get_event_loop()
-        future: asyncio.Future[str] = loop.create_future()
-        self._pending[tool_use_id] = _PendingRequest(
-            future=future,
-            session_id=session_id,
-            tool_name=tool_name,
-            allowed_decisions=_EXTERNAL_DECISIONS if external_path else _DEFAULT_DECISIONS,
+    # 旧策略只继续保留明确拒绝，不重新启用工具级永久允许。
+    def _is_persistently_denied(self, tool_name: str, params: dict[str, Any]) -> bool:
+        return tool_name in self._persistent_denials or (
+            tool_name == "memory_write" and params.get("scope", "project") == "global"
+            and "memory_write_global" in self._persistent_denials
         )
+
+    # 先统一判断禁止和强制审批，再考虑本会话内的有限授权。
+    async def check_and_wait(
+        self, tool_use_id: str, tool_name: str, params: dict[str, Any], session_id: str,
+        event_emitter: Callable[[dict[str, Any]], Awaitable[None]],
+        path_access: PathAccess | None = None, *, run_id: str = "",
+        workspace: Path | None = None,
+    ) -> tuple[bool, str]:
+        params = deepcopy(params)
+        assessment = assess(
+            tool_name, params, self._policies.get(tool_name), path_access=path_access,
+        )
+        if (
+            assessment.decision == PermissionDecision.DENY
+            or self._is_persistently_denied(tool_name, params)
+        ):
+            return False, "auto_deny"
+        root = path_access.workspace if path_access is not None else (workspace or Path.cwd())
+        file_key = None
+        scope = None
+        description = "仅本次操作"
+        decisions: tuple[str, ...] = _ONCE_DECISIONS
+        if (
+            tool_name in {"write_file", "edit_file"} and path_access is not None
+            and not path_access.outside_workspace and session_id
+        ):
+            # 只取后端解析的目标；原始输入、父目录与正文都不参与授权键。
+            file_key = (session_id, tool_name, os.path.normcase(str(path_access.target)))
+            description = f"本会话允许使用 {tool_name} 操作此文件：{path_access.target}"
+            decisions = _FILE_DECISIONS
+            if file_key in self._file_grants:
+                return True, "auto_allow"
+        elif (
+            tool_name not in _FILE_TOOLS and tool_name != "bash"
+            and assessment.reusable and session_id
+        ):
+            scope, description = approval_scope(session_id, root, tool_name, params)
+            decisions = _DEFAULT_DECISIONS
+            if scope in self._session_grants:
+                allowed = self._session_grants[scope]
+                return allowed, "auto_allow" if allowed else "auto_deny"
+        if assessment.decision == PermissionDecision.ALLOW:
+            return True, "auto_allow"
+
+        request_id = uuid4().hex
+        future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         payload: dict[str, Any] = {
-            "type": "permission.requested", "tool_use_id": tool_use_id,
-            "tool_name": tool_name, "params": params,
-            "param_preview": param_preview(tool_name, params),
-            "session_id": session_id, "ts": _now(),
+            "type": "permission.requested", "request_id": request_id,
+            "run_id": run_id, "session_id": session_id,
+            "tool_use_id": tool_use_id, "tool_name": tool_name,
+            "params": params, "param_preview": param_preview(tool_name, params),
+            "workspace": str(root.resolve()), "reason": assessment.reason,
+            "approval_scope": description,
+            "allowed_decisions": list(decisions),
+            "ts": datetime.now(UTC).isoformat(),
         }
         if path_access is not None:
             payload.update(
-                workspace=str(path_access.workspace), resolved_path=str(path_access.target),
-                outside_workspace=external_path,
-                allowed_decisions=list(
-                    _EXTERNAL_DECISIONS if external_path else _DEFAULT_DECISIONS,
-                ),
+                resolved_path=str(path_access.target),
+                outside_workspace=path_access.outside_workspace,
             )
-        self._pending[tool_use_id].payload = payload
+        self._pending[request_id] = _PendingRequest(future, payload)
         try:
-            await event_emitter(payload)
-            if self._timeout_s > 0:
-                raw = await asyncio.wait_for(future, timeout=self._timeout_s)
-            else:
-                raw = await future
-            # 外部授权只消费一次，不进入工具级 always 缓存或持久文件
-            if external_path:
-                return raw == "allow_once", raw
-            return self._apply_response(raw, session_id, cache_name), raw
+            # 观察者和重连返回值拿到副本，不能修改绑定本次审批的参数与身份。
+            await event_emitter(deepcopy(payload))
+            raw = (
+                await asyncio.wait_for(future, self._timeout_s)
+                if self._timeout_s > 0 else await future
+            )
+            if request_id not in self._pending:
+                return False, "deny_once"  # 会话已关闭，即使回答先到达也不能重新授予权限。
+            # 等待期间策略可能被收紧，已有回答不能覆盖新的硬性禁止。
+            if self.evaluate(tool_name, params) == PermissionDecision.DENY:
+                return False, "auto_deny"
+            allowed = raw in {"allow_once", "always_allow"}
+            if file_key is not None and raw == "always_allow":
+                self._file_grants.add(file_key)
+            elif scope is not None and raw in {"always_allow", "always_deny"}:
+                self._session_grants[scope] = allowed
+            return allowed, raw
         except TimeoutError:
             return False, "timeout"
         finally:
-            self._pending.pop(tool_use_id, None)
+            self._pending.pop(request_id, None)
             if not future.done():
                 future.cancel()
 
-    # 重连时只展示仍有效的审批，不持久化 Future 或一次性授权
+    # 只重现活跃请求，不持久化 Future 和单次授权。
     def pending_for_session(self, session_id: str) -> list[dict[str, Any]]:
         return [
-            dict(req.payload) for req in self._pending.values()
-            if req.session_id == session_id and not req.future.done()
+            deepcopy(req.payload) for req in self._pending.values()
+            if req.payload["session_id"] == session_id and not req.future.done()
         ]
 
-    # 处理客户端返回的审批决策，resolve 对应 Future
-    def respond(self, tool_use_id: str, decision: str) -> None:
-        req = self._pending.get(tool_use_id)
-        if req is None:
-            logger.warning("permission.respond: unknown tool_use_id=%s", tool_use_id)
-            return
-        if decision not in req.allowed_decisions:
+    # 先核对身份和有效选项，非法回复不消费仍在等待的请求。
+    def respond(
+        self, request_id: str, decision: str, *, session_id: str, run_id: str,
+    ) -> None:
+        req = self._pending.get(request_id)
+        if req is None or req.future.done():
+            raise ValueError("approval request has expired or was already answered")
+        if (session_id, run_id) != (req.payload["session_id"], req.payload["run_id"]):
+            raise ValueError("approval does not belong to this session/run")
+        if decision not in req.payload["allowed_decisions"]:
             raise ValueError(f"decision is not allowed for this request: {decision}")
-        self._pending.pop(tool_use_id)
-        # 将用户决定填入 Future，让等待审批的协程恢复执行
-        if not req.future.done():
-            req.future.set_result(decision)
+        req.future.set_result(decision)
 
-    # 应用审批决策，更新 session + persistent 缓存，返回是否放行
-    # 如果用户允许的话最终返回True，不允许就返回False
-    # 如果是always的决策还需要更新策略缓存
-    def _apply_response(self, decision: str, session_id: str, tool_name: str) -> bool:
-        allow = decision in ("allow_once", "always_allow")
-        if decision == "always_allow":
-            self._session_always[(session_id, tool_name)] = "allow"
-            self._persistent_always[tool_name] = "allow"
-            logger.info(
-                "permission: always allow tool=%s policy_file=%s persistent=%s",
-                tool_name, self._policy_file, self._persistent_always,
-            )
-            if self._policy_file is not None:
-                try:
-                    save_policy_file(self._persistent_always, self._policy_file)
-                    logger.info("permission: policy.toml written path=%s", self._policy_file)
-                except Exception:
-                    logger.exception(
-                        "permission: failed to write policy.toml path=%s", self._policy_file,
-                    )
-            else:
-                logger.warning("permission: policy_file is None, skipping persistence")
-        elif decision == "always_deny":
-            self._session_always[(session_id, tool_name)] = "deny"
-            self._persistent_always[tool_name] = "deny"
-            logger.info(
-                "permission: always deny tool=%s policy_file=%s persistent=%s",
-                tool_name, self._policy_file, self._persistent_always,
-            )
-            if self._policy_file is not None:
-                try:
-                    save_policy_file(self._persistent_always, self._policy_file)
-                    logger.info("permission: policy.toml written path=%s", self._policy_file)
-                except Exception:
-                    logger.exception(
-                        "permission: failed to write policy.toml path=%s", self._policy_file,
-                    )
-            else:
-                logger.warning("permission: policy_file is None, skipping persistence")
-        return allow
-
-    # 客户端断连时拒绝该 session 所有待审批请求，防止 Future 永久挂起
-    def cancel_session(self, session_id: str, reason: str = "client_disconnected") -> None:
-        to_cancel = [
-            uid for uid, req in self._pending.items()
-            if req.session_id == session_id
-        ]
-        for uid in to_cancel:
-            req = self._pending.pop(uid)
-            if not req.future.done():
-                logger.debug(
-                    "permission: cancel pending tool_use_id=%s reason=%s", uid, reason
-                )
-                req.future.set_result("deny_once")
+    # 主动关闭会话时拒绝待审批调用，并撤销该会话内的所有授权。
+    def cancel_session(self, session_id: str, reason: str = "session_closed") -> None:
+        for request_id, req in list(self._pending.items()):
+            if req.payload["session_id"] == session_id:
+                self._pending.pop(request_id)
+                if not req.future.done():
+                    req.future.set_result("deny_once")
+        self._session_grants = {
+            key: value for key, value in self._session_grants.items()
+            if key.session_id != session_id
+        }
+        self._file_grants = {key for key in self._file_grants if key[0] != session_id}
+        logger.debug("permission: cleared session=%s reason=%s", session_id, reason)

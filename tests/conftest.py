@@ -12,6 +12,14 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+# 每项测试绑定独立用户目录，记忆和子进程测试都不能读写真实用户数据。
+def isolated_user_home(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path_factory.mktemp("user-home")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+
+
 @pytest.fixture
 def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:

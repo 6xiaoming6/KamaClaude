@@ -273,7 +273,7 @@ async def test_child_time_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
 def test_role_model_uses_same_backend(provider_type: Any) -> None:
     client = object()
     runner = AgentRunner(KamaConfig(), provider=provider_type("original", client=client))
-    selected = runner._provider_for_model("role-model")
+    selected = runner._providers.for_model("role-model")
     assert type(selected) is provider_type
     assert selected._model == "role-model" and selected._client is client
 
@@ -317,7 +317,7 @@ async def test_background_task_survives_new_runner(
     # 本次委派与查询都走正常审批
     async def approve(event: BaseModel) -> None:
         if isinstance(event, PermissionRequestedEvent):
-            permissions.respond(event.tool_use_id, "allow_once")
+            permissions.respond(event.request_id, "allow_once", session_id=event.session_id, run_id=event.run_id)
 
     bus.subscribe(approve)
     runners: list[AgentRunner] = []
@@ -346,7 +346,7 @@ async def test_background_task_survives_new_runner(
     assert all(runner._task_registry is registry for runner in runners)
     assert checkpoint.run is not None and checkpoint.run.status == "success"
     assert any(
-        block.get("content") == "child answer"
+        "child answer" in block.get("content", "")
         for message in checkpoint.messages if isinstance(message["content"], list)
         for block in message["content"] if block.get("type") == "tool_result"
     )
@@ -393,7 +393,7 @@ def test_restored_parent_passes_frozen_limits(tmp_path: Path) -> None:
     )
     context = ExecutionContext(run=run)
     loop = runner._build_loop(context, EventBus(), tmp_path / "runs", None, resuming=True)
-    spawn = loop._registry.get("spawn_agent")
+    spawn = loop._tools.registry.get("spawn_agent")
     assert isinstance(spawn, SpawnAgentTool)
     assert spawn._agent_config == AgentConfig(
         max_steps=3, max_total_tokens=20_000, max_run_seconds=60, repeat_failure_limit=2,

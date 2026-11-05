@@ -2,20 +2,18 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
-from datetime import UTC, datetime
 
 import anthropic
 import httpx
 from pydantic import BaseModel
 
-from kama_claude.core.bus.events import RunBudgetEvent
 from kama_claude.core.checkpoint.persistence import RunPersistence
 from kama_claude.core.compact.estimator import TokenEstimator
 from kama_claude.core.config import CompactionConfig
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.base import LLMProvider
 from kama_claude.core.llm.types import LlmResponse
-from kama_claude.core.run_budget import RunBudget
+from kama_claude.core.run_budget import RunBudget, publish_budget
 
 
 # 仅对明确的传输故障、限流和服务端错误做有限重试
@@ -32,7 +30,7 @@ def _retryable(exc: Exception) -> bool:
 
 
 class ManagedProvider:
-    # 普通请求和自动摘要共享预算，手动摘要只统计与校准、不修改已结束 Run
+    # 普通请求和自动摘要共享预算，手动摘要只记录用量、不修改已结束 Run。
     def __init__(
         self, inner: LLMProvider, estimator: TokenEstimator, config: CompactionConfig,
         *, budget: RunBudget | None = None, persistence: RunPersistence | None = None,
@@ -56,19 +54,13 @@ class ManagedProvider:
     # 发布主任务预算，摘要也归属原 Run，避免污染其他会话
     async def notify(
         self, method: str = "", estimated_input: int = 0, reason: str = "",
-        *, trigger_tokens: int = 0, underestimate_factor: float = 1.0,
+        *, trigger_tokens: int = 0,
     ) -> None:
-        if self._bus is None or self._budget is None:
-            return
-        run = self._budget.run
-        await self._bus.publish_safe(RunBudgetEvent(
-            run_id=run.run_id, method=method, estimated_input_tokens=estimated_input,
-            actual_tokens=run.actual_tokens, estimated_tokens=run.estimated_tokens,
-            elapsed_seconds=run.elapsed_seconds, max_total_tokens=run.max_total_tokens,
-            max_run_seconds=run.max_run_seconds, usage_complete=run.usage_complete,
-            reason=reason, trigger_tokens=trigger_tokens,
-            underestimate_factor=underestimate_factor, ts=datetime.now(UTC).isoformat(),
-        ))
+        if self._bus is not None and self._budget is not None:
+            await publish_budget(
+                self._bus, self._budget, method, estimated_input, reason,
+                trigger_tokens=trigger_tokens,
+            )
 
     # 每次实际重试分别预留并记账，完整响应和当前请求估算严格配对
     async def chat(
@@ -82,7 +74,7 @@ class ManagedProvider:
         # 固定本次实际提交的输入，不能拿回复追加后的消息去匹配 Usage
         request_messages = deepcopy(messages)
         request_schemas = deepcopy(tool_schemas)
-        trigger = counter.trigger(limit, self._config.auto_threshold)
+        trigger = int(limit * self._config.auto_threshold)
         estimate = counter.request(system or "", messages, tool_schemas)
         # 事件只转发观察信息，Usage 比例使用配置的窗口而不是模型名猜测
         async def forward(event: BaseModel) -> None:
@@ -105,7 +97,7 @@ class ManagedProvider:
             self._save()
             await self.notify(
                 counter.method, estimate, "model_retry" if attempt else "",
-                trigger_tokens=trigger, underestimate_factor=counter.underestimate_factor,
+                trigger_tokens=trigger,
             )
             try:
                 remaining = self._budget.remaining_seconds() if self._budget else None
@@ -139,14 +131,18 @@ class ManagedProvider:
                     self._budget.settle(reservation, actual)
                 else:
                     self.manual_tokens += actual
+                covered_messages: list[dict[str, object]] = [
+                    *request_messages,
+                    {"role": "assistant", "content": response.content_blocks()},
+                ]
                 self.estimator.observe(
-                    system or "", request_messages, request_schemas, usage.total_input, kind=kind,
+                    system or "", covered_messages, request_schemas, usage.total_input,
+                    output_tokens=usage.output_tokens, kind=kind,
                 )
                 usage.context_pct = usage.total_input / self._config.context_window_tokens
             self._save()
             await self.notify(
                 counter.method, estimate, trigger_tokens=trigger,
-                underestimate_factor=counter.underestimate_factor,
             )
             return response
         raise AssertionError("unreachable")

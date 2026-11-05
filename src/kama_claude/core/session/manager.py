@@ -5,14 +5,11 @@ import logging
 import uuid
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from kama_claude.core.bus.commands import SessionCompactResult
 from kama_claude.core.bus.envelope import HandlerError
 from kama_claude.core.bus.events import (
-    ContextCompactedEvent,
-    ContextCompactionFailedEvent,
-    ContextCompactionStartedEvent,
     RunFinishedEvent,
     RunInterruptedEvent,
     SessionClosedEvent,
@@ -24,13 +21,10 @@ from kama_claude.core.bus.events import (
 )
 from kama_claude.core.checkpoint.checkpoint import Checkpoint, CheckpointError
 from kama_claude.core.checkpoint.recovery import RECOVERY_REQUIRED, SessionRecovery
-from kama_claude.core.compact.compactor import Compactor, write_summary
-from kama_claude.core.compact.estimator import TokenEstimator, estimate_bytes
-from kama_claude.core.config import CompactionConfig
+from kama_claude.core.compact.manager import compact_session
+from kama_claude.core.config import CompactionConfig, MemoryConfig
 from kama_claude.core.events.bus import EventBus
-from kama_claude.core.llm.managed import ManagedProvider
-from kama_claude.core.memory.model import SCOPES, MemoryError, MemoryScope
-from kama_claude.core.memory.store import MemoryStore
+from kama_claude.core.memory.model import MemoryError
 from kama_claude.core.runs import new_run_id
 from kama_claude.core.session.model import Session, SessionMode
 from kama_claude.core.session.store import SessionStore
@@ -65,6 +59,7 @@ class SessionManager:
         permission_manager: PermissionManager | None = None,
         compaction: CompactionConfig | None = None,
         task_registry: BackgroundTaskRegistry | None = None,
+        memory: MemoryConfig | None = None,
     ) -> None:
         self._store = store
         self._recovery = SessionRecovery(store)
@@ -74,6 +69,7 @@ class SessionManager:
         self._provider_factory = provider_factory
         self._permissions = permission_manager
         self._compaction = compaction or CompactionConfig()
+        self._memory = memory or MemoryConfig()
         self._task_registry = task_registry
         self._sessions: dict[str, Session] = {}
         self._locks: dict[str, asyncio.Lock] = {}
@@ -154,9 +150,14 @@ class SessionManager:
             # 先保存目标和初始 Run，再登记后台执行，避免调度窗口丢任务
             runner = self._runner_factory()
             # 保存初始检查点，记录初始信息
-            runner.prepare_checkpoint(
-                cp, session, goal, run_id, system_prompt, tools, self._store,
-            )
+            try:
+                runner.prepare_checkpoint(
+                    cp, session, goal, run_id, system_prompt, tools, self._store,
+                )
+            except MemoryError as exc:
+                # 规则加载失败发生在任务登记前，回到磁盘中的原会话状态。
+                self._sessions[sid] = Session.from_dict(cp.session)
+                raise HandlerError(-32040, str(exc)) from exc
             # 先提交再启动；Core 持有任务，前端断线后仍可继续
             task = self._start(
                 sid, run_id,
@@ -222,6 +223,8 @@ class SessionManager:
             if session.mode == "one_shot":
                 if self._task_registry is not None:
                     await self._task_registry.cancel(session_id=sid)
+                if self._permissions is not None:
+                    self._permissions.cancel_session(sid, reason="session_closed")
                 await self._bus.publish_safe(
                     SessionClosedEvent(session_id=sid, ts=session.updated_at)
                 )
@@ -293,45 +296,13 @@ class SessionManager:
         cp = self._recovery.recover_orphaned_run(sid, running=self.is_running(sid))
         self._sessions[sid] = Session.from_dict(cp.session)
         pending = self._permissions.pending_for_session(sid) if self._permissions else []
-        for event in pending:
-            event["run_id"] = cp.run.run_id if cp.run else ""
         return {
             "session": cp.session,
             "revision": cp.revision,
-            "messages": self._store.read_history(sid),
+            "messages": self._store.read_history(sid, include_metadata=True),
             "run": cp.run.model_dump(mode="json") if cp.run else None,
             "running": self.is_running(sid),
             "pending_permissions": pending,
-        }
-
-    # 只读查看当前 Markdown 和最近 Run 注入快照，不触发恢复、模型或文件写入
-    def inspect_memory(
-        self, sid: str, *, scope: MemoryScope | None = None, key: str | None = None,
-        query: str = "", offset: int = 0, limit: int = 20,
-    ) -> dict[str, Any]:
-        self._get_session(sid)
-        if key is not None and scope is None:
-            raise HandlerError(-32602, "reading a memory key requires scope")
-        cp = self._store.checkpoints.load(sid)
-        memory = MemoryStore(Path.cwd(), self._store.session_dir(sid))
-        try:
-            if key is not None:
-                assert scope is not None
-                entry = memory.read(scope, key, offset=offset)
-                layers = []
-            else:
-                entry = None
-                layers = [
-                    memory.list(item, query=query, offset=offset, limit=limit)
-                    for item in ((scope,) if scope is not None else SCOPES)
-                ]
-        except MemoryError as exc:
-            raise HandlerError(-32040, str(exc)) from exc
-        return {
-            "workspace": str(Path.cwd().resolve()), "layers": layers, "entry": entry,
-            "run_id": cp.run.run_id if cp.run else None,
-            "snapshot": cp.run.memory_snapshot.model_dump(mode="json")
-            if cp.run and cp.run.memory_snapshot is not None else None,
         }
 
     # 在会话锁内应用恢复决定，保存成功后才启动原 Run
@@ -381,76 +352,21 @@ class SessionManager:
             session.updated_at = _now()
             cp.session = session.to_dict()
             self._store.checkpoints.save(cp)
+            if self._permissions is not None:
+                self._permissions.cancel_session(sid, reason="session_closed")
             await self._bus.publish_safe(SessionClosedEvent(session_id=sid, ts=_now()))
 
     # 空闲会话的手动压缩与正常执行复用同一权威工作历史
-    async def compact(self, sid: str, focus: str = "") -> Any:
+    async def compact(self, sid: str, focus: str = "") -> SessionCompactResult:
         session = self._get_session(sid)
         if self.is_running(sid) or self._locks[sid].locked():
             raise HandlerError(SESSION_BUSY, "session busy")
         if session.status in ("closed", "interrupted"):
             raise HandlerError(RECOVERY_REQUIRED, "open an idle session before compaction")
         async with self._locks[sid]:
-            from kama_claude.core.bus.commands import SessionCompactResult
-            cp = self._store.ensure_checkpoint(sid)
-            run_id = cp.run.run_id if cp.run else ""
-            run_path = self._store.runs_dir(sid) / (run_id or "manual")
-            config = self._compaction
-            estimator = TokenEstimator(
-                cp.run.provider if cp.run else "", cp.run.model if cp.run else "",
-                cp.token_estimation,
-            )
-            managed: ManagedProvider | None = None
-
-            # 手动摘要按需创建模型，不扣除已结束 Run 的预算
-            def summary_provider() -> LLMProvider:
-                nonlocal managed
-                managed = ManagedProvider(self._get_compaction_provider(), estimator, config)
-                return managed
-
-            await self._bus.publish_safe(ContextCompactionStartedEvent(
-                session_id=sid, run_id=run_id,
-                original_tokens=estimate_bytes(cp.messages), ts=_now(),
-            ))
-            result = await Compactor(config, estimator).prepare_context(
-                cp.messages, focus=focus, manual=True,
-                outputs_dir=run_path / "outputs",
-                system=cp.run.system_prompt if cp.run else "",
-                tool_schemas=cp.run.tool_schemas if cp.run else [],
-                provider_factory=summary_provider,
-            )
-            # 程序缩减也要提交；摘要失败不丢弃已经完成的程序处理
-            if result.compacted:
-                cp.messages = result.messages
-            # 摘要失败也可能取得 Usage，最新 Usage 锚点与工作历史在同一处提交
-            if result.compacted or managed is not None:
-                self._store.save_checkpoint(cp)
-            log.info("manual compaction actual_tokens=%d", managed.manual_tokens if managed else 0)
-            if result.summary_text:
-                write_summary(run_path, result.summary_text)
-            if result.compacted and result.reason in ("", "below_threshold", "auto_disabled"):
-                await self._bus.publish_safe(ContextCompactedEvent(
-                    session_id=sid, run_id=run_id,
-                    original_tokens=result.original_token_estimate,
-                    summary_tokens=result.summary_tokens,
-                    remaining_tokens=result.remaining_token_estimate,
-                    applied_stages=result.applied_stages, llm_used=result.llm_used, ts=_now(),
-                ))
-            else:
-                await self._bus.publish_safe(ContextCompactionFailedEvent(
-                    session_id=sid, run_id=run_id, reason=result.reason,
-                    applied_stages=result.applied_stages, llm_used=result.llm_used, ts=_now(),
-                ))
-            return SessionCompactResult(
-                summary_tokens=result.summary_tokens,
-                saved_tokens=max(
-                    0, result.original_token_estimate - result.remaining_token_estimate,
-                ),
-                compacted=result.compacted,
-                original_tokens=result.original_token_estimate,
-                remaining_tokens=result.remaining_token_estimate,
-                reason=result.reason,
-                applied_stages=result.applied_stages, llm_used=result.llm_used,
+            return await compact_session(
+                self._store, sid, self._bus, self._compaction, self._get_compaction_provider, focus,
+                memory_config=self._memory,
             )
 
     # 仅在程序层不足时取得摘要 Provider，已有实例继续复用

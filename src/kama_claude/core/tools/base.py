@@ -42,7 +42,20 @@ class FileTool(BaseTool):
 
     # 提供真实路径供权限层判断，调用入口已先完成参数模型校验
     def path_access(self, params: dict[str, object]) -> PathAccess:
-        return self.paths.inspect(str(params.get("path", ".")))
+        access = self.paths.inspect(str(params.get("path", ".")))
+        self._check_writable(access.target)
+        return access
+
+    # 审批前和真实写入前都检查；直接调用不能跳过用户规则只读保护。
+    def _check_writable(self, path: Path) -> None:
+        if self.name in {"write_file", "edit_file"}:
+            from kama_claude.core.memory.paths import guard_file_write
+            from kama_claude.core.workspace import WorkspacePathError
+
+            try:
+                guard_file_write(path, self.paths.root)
+            except PermissionError as exc:
+                raise WorkspacePathError(str(exc)) from exc
 
     # 直接调用同样校验边界；approved_path 是内部参数，不属于工具 Schema
     async def invoke(
@@ -51,6 +64,7 @@ class FileTool(BaseTool):
         if self.params_model is not None:
             self.params_model.model_validate(params)
         path = self.paths.resolve(str(params.get("path", ".")), approved_path=approved_path)
+        self._check_writable(path)
         return await self._invoke_path(params, path)
 
     # 子类只处理已通过边界校验的文件操作

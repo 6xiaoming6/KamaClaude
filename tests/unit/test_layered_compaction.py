@@ -390,7 +390,7 @@ def test_tui_displays_programmatic_and_partial_results(monkeypatch: pytest.Monke
     app = KamaTuiApp("127.0.0.1", 1)
     app._session_id = "sess-layered"
     text = []
-    monkeypatch.setattr(app, "_append", lambda widget: text.append(str(widget.content)))
+    monkeypatch.setattr(app._view, "append", lambda widget: text.append(str(widget.content)))
     base = {"session_id": "sess-layered", "run_id": "run", "original_tokens": 10_000,
             "summary_tokens": 0, "remaining_tokens": 3_000}
     app._handle_event({"type": "context.compacted", **base, "applied_stages": ["deduplicate"], "llm_used": False})
@@ -470,7 +470,7 @@ def test_prune_target_configuration(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     for name in list(os.environ):
         if name.startswith("KAMA_"):
             monkeypatch.delenv(name)
-    monkeypatch.setattr("kama_claude.core.config.load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr("kama_claude.core.config.loader.load_dotenv", lambda *args, **kwargs: None)
     monkeypatch.chdir(tmp_path)
     config_path = tmp_path / "config.toml"
     config_path.write_text("[compaction]\nprune_target_ratio=0.55\n", encoding="utf-8")

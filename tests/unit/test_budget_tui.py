@@ -25,6 +25,6 @@ async def test_budget_status_updates_one_widget(monkeypatch):
         assert len(app.query("#budget-run-test")) == 1
         text = str(app.query_one("#budget-run-test", Static).render())
         assert "107" in text and "Usage+增量" in text and "压缩阈值 800" in text
-        app._subagent_run_ids["child"] = "run-test"
+        app._view.subagent_runs["child"] = "run-test"
         app._handle_event_inner({**event, "run_id": "child"})
         assert not list(app.query("#budget-child"))

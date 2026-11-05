@@ -12,6 +12,9 @@ from pathlib import Path
 
 import psutil
 
+from kama_claude.core.config import ExecutionConfig
+from kama_claude.core.process_env import build_process_env
+
 log = logging.getLogger(__name__)
 _OUTPUT_LIMIT = 64 * 1024
 
@@ -26,8 +29,9 @@ class CommandResult:
 
 class CommandExecutor:
     # 绑定执行目录，进程树只在本次调用内管理，不创建后台守护进程
-    def __init__(self, cwd: Path | None = None) -> None:
-        self.cwd = cwd or Path.cwd()
+    def __init__(self, cwd: Path | None = None, execution: ExecutionConfig | None = None) -> None:
+        self.cwd = (cwd or Path.cwd()).resolve()
+        self._execution = execution or ExecutionConfig()
 
     # 逐块排空管道，只保留固定大小的字节缓冲，避免大输出耗尽内存
     async def _read_output(self, stream: asyncio.StreamReader) -> str:
@@ -110,6 +114,9 @@ class CommandExecutor:
             # 启动也受保护，取消发生在创建窗口时仍能取回句柄并清理
             launch = asyncio.create_task(asyncio.create_subprocess_shell(
                 command, cwd=self.cwd, stdin=asyncio.subprocess.DEVNULL,
+                env=build_process_env(
+                    forward_env=self._execution.forward_env, env=self._execution.env,
+                ),
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
                 start_new_session=os.name != "nt",
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,

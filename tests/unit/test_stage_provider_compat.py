@@ -51,7 +51,10 @@ async def test_manual_compaction_creates_provider_on_demand(tmp_path: Path) -> N
     assert store.read_messages(session.id)[0]["content"].startswith(SUMMARY_MARKER)
     assert "保留项目约定和剩余任务。" in store.read_messages(session.id)[0]["content"]
     assert (store.session_dir(session.id) / "thread.jsonl").read_bytes() == original_thread
-    assert (await manager.open(session.id))["messages"] == history()
+    assert [
+        {"role": message["role"], "content": message["content"]}
+        for message in (await manager.open(session.id))["messages"]
+    ] == history()
     assert not list(store.session_dir(session.id).glob("thread_*.jsonl.bak"))
     assert "项目约定" in provider.chat.call_args.kwargs["messages"][0]["content"]
 

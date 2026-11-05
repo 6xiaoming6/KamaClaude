@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
+from collections.abc import Sequence
 from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass, field
 from typing import Any
@@ -15,6 +15,8 @@ from mcp.client import Transport
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
 from mcp.types import CONNECTION_CLOSED, REQUEST_TIMEOUT, Implementation, TextContent
+
+from kama_claude.core.process_env import build_process_env
 
 log = logging.getLogger(__name__)
 
@@ -56,9 +58,10 @@ class McpClient:
     # 启动本地 stdio 服务，由 SDK 完成初始化与消息分发
     async def connect_stdio(
         self, command: str, args: list[str], env: dict[str, str] | None = None,
+        *, forward_env: Sequence[str] = (),
     ) -> None:
         await self._connect(StdioServerParameters(
-            command=command, args=args, env={**os.environ, **(env or {})},
+            command=command, args=args, env=build_process_env(forward_env=forward_env, env=env),
         ))
 
     # 连接标准 Streamable HTTP 端点，SDK 同时处理 JSON 和 SSE 响应

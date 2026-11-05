@@ -11,7 +11,8 @@ from kama_claude.core.checkpoint.checkpoint import CheckpointError
 from kama_claude.core.llm.types import LlmResponse
 from kama_claude.core.session.store import SessionStore
 from kama_claude.core.tools.base import ToolResult
-from kama_claude.tui.app import KamaTuiApp, LLMStreamBlock, ToolCallBlock
+from kama_claude.tui.app import KamaTuiApp
+from kama_claude.tui.widgets.conversation import LLMStreamBlock, ToolCallBlock
 from tests.unit.test_checkpoint_recovery import (
     Crash,
     ProbeTool,
@@ -142,9 +143,19 @@ async def test_full_history_survives_preview_and_next_run(tmp_path: Path) -> Non
     await mgr.send_message(session.id, "继续追问")
     reopened = await manager(SessionStore(tmp_path), provider, [tool]).open(session.id)
     assert reopened["messages"][:4] == first["messages"]
-    assert reopened["messages"][-2] == {"role": "user", "content": "继续追问"}
+    assert reopened["messages"][-2]["role"] == "user"
+    assert reopened["messages"][-2]["content"] == "继续追问"
+    assert reopened["messages"][-2]["id"]
+    assert reopened["messages"][-2]["run_id"] == reopened["run"]["run_id"]
     assert reopened["messages"][-1]["content"] == [{"type": "text", "text": "第二轮完整答复"}]
-    assert await mgr.get_history(session.id) == reopened["messages"]
+    assert await mgr.get_history(session.id) == [
+        {"role": message["role"], "content": message["content"]}
+        for message in reopened["messages"]
+    ]
+    assert all(
+        "id" not in message and "run_id" not in message
+        for call in provider.calls for message in call["messages"]
+    )
     assert tool.calls == 1
 
 

@@ -33,6 +33,11 @@ async def slow() -> str:
     return "finished"
 
 
+@server.tool(description="Report environment presence without exposing values")
+def has_environment(name: str) -> bool:
+    return name in os.environ
+
+
 # 启动独立 SDK 服务，HTTP 模式支持 JSON/SSE 响应和固定测试请求头
 def main() -> None:
     if path := os.environ.get("MCP_TEST_PID"):

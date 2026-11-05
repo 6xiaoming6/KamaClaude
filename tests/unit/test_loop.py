@@ -12,6 +12,7 @@ from kama_claude.core.llm.types import LlmResponse, ToolCallBlock
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.tools.base import BaseTool, ToolResult
 from kama_claude.core.tools.registry import ToolRegistry
+from tests.unit.loop_support import make_loop as build_test_loop
 
 # --- stubs -------------------------------------------------------------------
 
@@ -87,7 +88,7 @@ def _make_loop(
     context: ExecutionContext,
 ) -> tuple[AgentLoop, EventBus]:
     b = bus or EventBus()
-    return AgentLoop(provider, registry or ToolRegistry(), b, context=context), b  # type: ignore[arg-type]
+    return build_test_loop(provider, registry or ToolRegistry(), b, context=context), b  # type: ignore[arg-type]
 
 
 async def _events(bus: EventBus) -> list[BaseModel]:

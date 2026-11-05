@@ -27,18 +27,3 @@ def load_policy_file(path: Path | None = None) -> dict[str, str]:
             if v in ("allow", "deny"):
                 result[k] = v
     return result
-
-
-# 将 {tool_name: "allow"/"deny"} 写入 policy.toml，覆盖 [always] 节
-def save_policy_file(always: dict[str, str], path: Path | None = None) -> None:
-    p = (path or _DEFAULT_POLICY_PATH).expanduser()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    lines = [
-        "# ~/.kama/policy.toml",
-        "# 由 kama-core 自动管理，手动编辑生效但格式须正确",
-        "",
-        "[always]",
-    ]
-    for tool, decision in sorted(always.items()):
-        lines.append(f'{tool} = "{decision}"')
-    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
