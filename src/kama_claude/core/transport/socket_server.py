@@ -13,8 +13,11 @@ from pydantic import BaseModel, ValidationError
 from kama_claude.core.bus.envelope import (
     INTERNAL_ERROR,
     INVALID_REQUEST,
+    MESSAGE_TOO_LARGE,
     METHOD_NOT_FOUND,
     PARSE_ERROR,
+    SERVER_BUSY,
+    SERVER_SHUTTING_DOWN,
     HandlerError,
     JsonRpcError,
     JsonRpcRequest,
@@ -24,209 +27,295 @@ from kama_claude.core.bus.envelope import (
 from kama_claude.core.checkpoint.checkpoint import CheckpointError
 from kama_claude.core.trace.record import TraceRecord
 from kama_claude.core.trace.writer import TraceWriter
+from kama_claude.core.transport.framing import MAX_LINE_BYTES, FrameTooLargeError, encode_frame
 from kama_claude.core.transport.ipc_broadcaster import IpcEventBroadcaster
+from kama_claude.core.transport.sender import ConnectionSender
 
 logger = logging.getLogger(__name__)
-
 type CommandHandler = Callable[[dict[str, Any]], Awaitable[Any]]
-
-# 每个连接处理协程中，当前正在处理的 writer（供 handler 读取连接上下文）
-_writer_var: ContextVar[asyncio.StreamWriter] = ContextVar("_writer_var")
+_sender_var: ContextVar[ConnectionSender] = ContextVar("_sender_var")
+_MAX_LINE_BYTES = MAX_LINE_BYTES
 
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-# 返回当前 handler 调用所属连接的 StreamWriter
-def get_connection_writer() -> asyncio.StreamWriter:
-    return _writer_var.get()
+# handler 只引用已有连接，不能为订阅或回放另外创建发送任务。
+def get_connection_sender() -> ConnectionSender:
+    return _sender_var.get()
 
-_MAX_LINE_BYTES = 64 * 1024 * 1024  # 64 MB per frame，兼容 MCP 大文件工具结果
+
+def get_connection_writer() -> asyncio.StreamWriter:
+    return get_connection_sender().writer
 
 
 class SocketServer:
     def __init__(
-        self,
-        host: str,
-        port: int,
-        broadcaster: IpcEventBroadcaster | None = None,
-        trace: TraceWriter | None = None,
+        self, host: str, port: int, broadcaster: IpcEventBroadcaster | None = None,
+        trace: TraceWriter | None = None, *, max_requests: int = 8,
+        max_control_requests: int = 2, global_max_requests: int = 64,
+        global_max_control_requests: int = 8, send_timeout: float = 5.0,
+        shutdown_timeout: float = 2.0,
     ) -> None:
-        self._host = host
-        self._port = port
+        if any(type(value) is not int or value <= 0 for value in (
+            max_requests, max_control_requests, global_max_requests, global_max_control_requests,
+        )) or send_timeout <= 0 or shutdown_timeout <= 0:
+            raise ValueError("transport limits must be positive")
+        self._host, self._port = host, port
         self._handlers: dict[str, CommandHandler] = {}
+        self._controls: set[str] = set()
         self._server: asyncio.AbstractServer | None = None
-        self._broadcaster = broadcaster
-        self._trace = trace
-        self._active_writers: set[asyncio.StreamWriter] = set()
+        self._broadcaster, self._trace = broadcaster, trace
+        self._senders: dict[asyncio.StreamWriter, ConnectionSender] = {}
+        self._requests: dict[asyncio.StreamWriter, dict[asyncio.Task[None], bool]] = {}
+        self._connections: set[asyncio.Task[None]] = set()
+        self._max_requests, self._max_controls = max_requests, max_control_requests
+        self._global_max_requests = global_max_requests
+        self._global_max_controls = global_max_control_requests
+        self._normal_active = self._control_active = 0
+        self._send_timeout, self._shutdown_timeout = send_timeout, shutdown_timeout
+        self._closing = False
+        self._stop_lock = asyncio.Lock()
 
-    # 注册一个方法名对应的命令处理函数
-    def register(self, method: str, handler: CommandHandler) -> None:
+    def register(self, method: str, handler: CommandHandler, *, control: bool = False) -> None:
         self._handlers[method] = handler
+        if control:
+            self._controls.add(method)
+        else:
+            self._controls.discard(method)
 
-    # 启动 TCP 服务器；若端口已被占用则退出进程
     async def start(self) -> str:
         try:
-            # 巧妙的端口占用检测，如果能脸上目标端口，说明目标端口已经被占用了，抛出异常
-            _r, w = await asyncio.open_connection(self._host, self._port)
-            w.close()
-            await w.wait_closed()
+            _reader, writer = await asyncio.open_connection(self._host, self._port)
+            writer.close()
+            await writer.wait_closed()
             raise SystemExit(f"core already running at {self._host}:{self._port}")
         except (ConnectionRefusedError, OSError):
             pass
-
-        # 端口没有被占用的话就启动服务
-        # 注册到事件循环，启动后台 accept 循环，循环注册成功启动server后就会接着往下走，不阻塞
+        self._closing = False
         self._server = await asyncio.start_server(
-            self._handle_connection, # 每次新连接到来时执行的回调函数
-            host=self._host,
-            port=self._port,
-            limit=_MAX_LINE_BYTES,
+            self._handle_connection, host=self._host, port=self._port, limit=_MAX_LINE_BYTES,
         )
         return f"{self._host}:{self._port}"
 
-    # 关闭服务器：先断开所有活跃连接，再等待服务器完全关闭（最多 2 秒）
-    async def stop(self) -> None:
-        if self._server is None:
-            return
-        for writer in list(self._active_writers):
-            try:
-                writer.close()
-            except Exception:
-                pass
-        self._server.close()
-        try:
-            await asyncio.wait_for(self._server.wait_closed(), timeout=2.0)
-        except (TimeoutError, asyncio.CancelledError):
-            pass
+    # 先关业务接入；已有连接仍能回答审批，直到业务检查点收尾完成。
+    def begin_shutdown(self) -> None:
+        self._closing = True
+        if self._server is not None:
+            self._server.close()
 
-    # 处理单个客户端连接
-    # reader可以读取客户端的数据，writer可以向客户端发送数据
+    async def stop(self) -> None:
+        async with self._stop_lock:
+            self.begin_shutdown()
+            writers = list(self._requests)
+            try:
+                await asyncio.gather(*(self._cancel_requests(writer) for writer in writers))
+            finally:
+                try:
+                    await asyncio.gather(*(
+                        sender.close(self._shutdown_timeout)
+                        for sender in list(self._senders.values())
+                    ))
+                finally:
+                    await self._wait_tasks(set(self._connections), "connection cleanup")
+                    if self._server is not None:
+                        try:
+                            async with asyncio.timeout(self._shutdown_timeout):
+                                await self._server.wait_closed()
+                        except TimeoutError:
+                            logger.warning("TCP server close timed out")
+
+    # 只取消 RPC 等待；SessionManager 持有并 shield 的业务 Run 不属于此集合。
+    async def _cancel_requests(self, writer: asyncio.StreamWriter) -> None:
+        tasks = set(self._requests.get(writer, {}))
+        for task in tasks:
+            task.cancel()
+        await self._wait_tasks(tasks, "request cancellation")
+
+    async def _wait_tasks(self, tasks: set[asyncio.Task[None]], label: str) -> None:
+        if not tasks:
+            return
+        _, pending = await asyncio.wait(tasks, timeout=self._shutdown_timeout)
+        if pending:
+            logger.warning("%s timed out; remaining=%d", label, len(pending))
+            for task in pending:
+                task.cancel()
+
     async def _handle_connection(
-        self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
     ) -> None:
-        peer = writer.get_extra_info("peername", "<unknown>")
-        logger.debug("client connected: %s", peer)
-        self._active_writers.add(writer)
-        try:
-            # 持续读取对应连接的请求
-            await self._read_loop(reader, writer)
-        except ConnectionError as exc:
-            # 客户端退出可能触发连接重置，按正常断线清理，不取消业务 Run
-            logger.debug("client connection lost: %s (%s)", peer, exc)
-        finally:
-            # 客户端退出后，捕获异常后把退出的客户端的writer移除，清理订阅
-            self._active_writers.discard(writer)
+        if self._closing:
+            writer.close()
+            return
+        owner = asyncio.current_task()
+        if owner is not None:
+            self._connections.add(owner)
+
+        def failed() -> None:
             if self._broadcaster is not None:
                 self._broadcaster.unsubscribe(writer)
-            try:
-                writer.close()
-            except Exception:
-                pass
-            logger.debug("client disconnected: %s", peer)
 
-    # 持续读取换行分隔的 JSON 行并逐行分发处理
-    async def _read_loop(
-        self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-    ) -> None:
-        while True:
+        sender = ConnectionSender(writer, drain_timeout=self._send_timeout, on_failure=failed)
+        self._senders[writer] = sender
+        self._requests[writer] = {}
+        try:
+            await self._read_loop(reader, writer)
+        except ConnectionError as exc:
+            logger.debug("client connection lost: %s", exc)
+        finally:
+            failed()
+            try:
+                await self._cancel_requests(writer)
+            finally:
+                try:
+                    await sender.close(self._shutdown_timeout)
+                finally:
+                    try:
+                        async with asyncio.timeout(self._shutdown_timeout):
+                            await writer.wait_closed()
+                    except (OSError, TimeoutError):
+                        pass
+                    self._senders.pop(writer, None)
+                    # 不配合取消的请求仍保留登记，直到真正结束后释放全局额度。
+                    if not self._requests.get(writer):
+                        self._requests.pop(writer, None)
+                    if owner is not None:
+                        self._connections.discard(owner)
+
+    # 校验和容量检查在 create_task 前完成，不堆积等待信号量的协程。
+    async def _read_loop(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        sender = self._senders[writer]
+        while not sender.closed:
             try:
                 line = await reader.readline()
-            except asyncio.LimitOverrunError:
+            except (ValueError, asyncio.LimitOverrunError):
                 await self._send(writer, make_error(None, INVALID_REQUEST, "Request too large"))
                 return
-
-            if not line:
+            if not line or sender.closed:
                 return
-
-            # 每条命令独立作为 task 执行，避免长时间运行的 handler（如 session.send_message）
-            # 阻塞读循环，使 permission.respond 等并发命令能被及时处理
-            asyncio.create_task(self._handle_line(line, writer))
-
-    # 解析单行 JSON-RPC 请求并调用对应 handler，将结果或错误写回客户端
-    async def _handle_line(self, line: bytes, writer: asyncio.StreamWriter) -> None:
-        try:
-            raw: Any = json.loads(line)
-        except json.JSONDecodeError as e:
-            await self._send(writer, make_error(None, PARSE_ERROR, f"Parse error: {e}"))
-            return
-
-        try:
-            req = JsonRpcRequest.model_validate(raw)
-        except ValidationError as e:
-            await self._send(writer, make_error(None, INVALID_REQUEST, "Invalid Request", str(e)))
-            return
-
-        if self._trace is not None:
-            client_id = str(writer.get_extra_info("peername", "<unknown>"))
-            # 这里用trace记录 cli->core的请求
-            self._trace.emit(
-                TraceRecord(
-                    ts=_now(),
-                    direction="CLIENT→CORE",
-                    layer="ipc",
-                    kind="command",
-                    client_id=client_id,
-                    data={"method": req.method, "id": req.id, "params": req.params},
+            try:
+                raw: Any = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                await self._send(writer, make_error(None, PARSE_ERROR, f"Parse error: {exc}"))
+                continue
+            try:
+                request = JsonRpcRequest.model_validate(raw)
+            except ValidationError as exc:
+                await self._send(
+                    writer, make_error(None, INVALID_REQUEST, "Invalid Request", str(exc)),
                 )
-            )
+                continue
+            error = self._admit(request, writer)
+            if error is not None:
+                await self._send(writer, error)
 
+    # 单事件循环内同步占位；完成回调复用原连接集合，迟到回调也能释放全局额度。
+    def _admit(self, request: JsonRpcRequest, writer: asyncio.StreamWriter) -> JsonRpcError | None:
+        control = request.method in self._controls
+        if self._closing and not control:
+            return make_error(request.id, SERVER_SHUTTING_DOWN, "Server shutting down")
+        group = self._requests[writer]
+        local = sum(flag == control for flag in group.values())
+        active = self._control_active if control else self._normal_active
+        if local >= (self._max_controls if control else self._max_requests) or active >= (
+            self._global_max_controls if control else self._global_max_requests
+        ):
+            return make_error(request.id, SERVER_BUSY, "Server busy")
+        task = asyncio.create_task(
+            self._handle_request(request, writer), name=f"rpc:{request.method}",
+        )
+        group[task] = control
+        if control:
+            self._control_active += 1
+        else:
+            self._normal_active += 1
+
+        def done(completed: asyncio.Task[None]) -> None:
+            flag = group.pop(completed, None)
+            if flag is not None:
+                if flag:
+                    self._control_active -= 1
+                else:
+                    self._normal_active -= 1
+            if not group and writer not in self._senders:
+                self._requests.pop(writer, None)
+            if not completed.cancelled():
+                error = completed.exception()
+                if error is not None:
+                    logger.error("request task failed: %s", error)
+
+        task.add_done_callback(done)
+        return None
+
+    async def _handle_request(self, request: JsonRpcRequest, writer: asyncio.StreamWriter) -> None:
+        sender = self._senders[writer]
+        if sender.closed:
+            return
+        token = _sender_var.set(sender)
+        try:
+            await self._execute_request(request, writer)
+        finally:
+            _sender_var.reset(token)
+
+    # handler 的业务异常仍转换为结构化响应；取消与检查点错误保留各自边界。
+    async def _execute_request(self, req: JsonRpcRequest, writer: asyncio.StreamWriter) -> None:
+        # 已接收但尚未调度的普通请求，也不能越过关闭接入的边界。
+        if self._closing and req.method not in self._controls:
+            await self._send(
+                writer, make_error(req.id, SERVER_SHUTTING_DOWN, "Server shutting down"),
+            )
+            return
+        if self._trace is not None:
+            self._trace.emit(TraceRecord(
+                ts=_now(), direction="CLIENT→CORE", layer="ipc", kind="command",
+                client_id=str(writer.get_extra_info("peername", "<unknown>")),
+                data={"method": req.method, "id": req.id, "params": req.params},
+            ))
         handler = self._handlers.get(req.method)
         if handler is None:
             await self._send(
-                writer,
-                make_error(req.id, METHOD_NOT_FOUND, f"Method not found: {req.method}"),
+                writer, make_error(req.id, METHOD_NOT_FOUND, f"Method not found: {req.method}"),
             )
             return
-
-        # 处理请求前，把当前连接的writer保存到_writer_var，便于后面广播器保存对应的writer
-        _writer_var.set(writer)
         try:
-            # 拿到处理该请求的方法返回的结果返回
             result = await handler(req.params)
-        except CheckpointError as e:
-            await self._send(writer, make_error(req.id, -32032, str(e)))
-            return
-        except HandlerError as e:
-            await self._send(writer, make_error(req.id, e.code, str(e), e.data))
-            return
-        except ValidationError as e:
-            await self._send(
-                writer,
-                make_error(req.id, INVALID_REQUEST, "Invalid params", str(e)),
-            )
-            return
-        except Exception as e:
-            logger.exception("handler %s raised: %s", req.method, e)
-            await self._send(writer, make_error(req.id, INTERNAL_ERROR, "Internal error"))
-            return
+        except CheckpointError as exc:
+            response: BaseModel = make_error(req.id, -32032, str(exc))
+        except HandlerError as exc:
+            response = make_error(req.id, exc.code, str(exc), exc.data)
+        except ValidationError as exc:
+            response = make_error(req.id, INVALID_REQUEST, "Invalid params", str(exc))
+        except Exception:
+            logger.exception("handler %s raised", req.method)
+            response = make_error(req.id, INTERNAL_ERROR, "Internal error")
+        else:
+            data = result.model_dump() if isinstance(result, BaseModel) else result
+            response = JsonRpcSuccess(id=req.id, result=data)
+        await self._send(writer, response)
 
-        result_data: Any = result.model_dump() if isinstance(result, BaseModel) else result
-        try:
-            await self._send(writer, JsonRpcSuccess(id=req.id, result=result_data))
-        except (ConnectionResetError, BrokenPipeError, OSError):
-            logger.debug("client disconnected before response for %s", req.method)
-
-    # 将 pydantic 消息序列化为 JSON 行并写入流，随后刷新缓冲区
     async def _send(self, writer: asyncio.StreamWriter, msg: BaseModel) -> None:
-        writer.write(msg.model_dump_json().encode() + b"\n")
-        await writer.drain()
+        sender = self._senders.get(writer)
+        if sender is None:
+            return
+        try:
+            frame = encode_frame(msg, _MAX_LINE_BYTES)
+        except FrameTooLargeError:
+            msg = make_error(getattr(msg, "id", None), MESSAGE_TOO_LARGE,
+                             "Response too large; read data in smaller pages")
+            try:
+                frame = encode_frame(msg, _MAX_LINE_BYTES)
+            except FrameTooLargeError as exc:
+                sender.abort(exc)
+                return
+        try:
+            await sender.send(frame)
+        except ConnectionError:
+            return
         if self._trace is not None:
-            kind = "error" if isinstance(msg, JsonRpcError) else "response"
-            client_id = str(writer.get_extra_info("peername", "<unknown>"))
-            # 这里用trace记录core->client的请求响应
-            self._trace.emit(
-                TraceRecord(
-                    ts=_now(),
-                    direction="CORE→CLIENT",
-                    layer="ipc",
-                    kind=kind,
-                    client_id=client_id,
-                    data=msg.model_dump(),
-                )
-            )
+            self._trace.emit(TraceRecord(
+                ts=_now(), direction="CORE→CLIENT", layer="ipc",
+                kind="error" if isinstance(msg, JsonRpcError) else "response",
+                client_id=str(writer.get_extra_info("peername", "<unknown>")),
+                data={**msg.model_dump(), "stage": "written"},
+            ))

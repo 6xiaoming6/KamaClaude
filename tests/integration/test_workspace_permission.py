@@ -17,7 +17,7 @@ from kama_claude.core.tools.invocation import invoke_tool
 from kama_claude.core.tools.registry import ToolRegistry
 from kama_claude.core.transport.ipc_broadcaster import IpcEventBroadcaster
 from kama_claude.core.transport.socket_client import IpcError, SocketClient
-from kama_claude.core.transport.socket_server import SocketServer, get_connection_writer
+from kama_claude.core.transport.socket_server import SocketServer, get_connection_sender
 
 
 # 功能：验证真实 TCP 下外部读取两选项、内部写入三选项，重连后仍能批准原请求
@@ -41,7 +41,7 @@ async def test_file_approval_over_tcp_and_reconnect(
 
     # 新连接绑定同一会话并返回仍有效的审批快照
     async def open_session(params: dict[str, Any]) -> dict[str, Any]:
-        broadcaster.subscribe(get_connection_writer(), ["permission.*"], scope="session:sess-one")
+        broadcaster.subscribe(get_connection_sender(), ["permission.*"], scope="session:sess-one")
         return {"pending_permissions": manager.pending_for_session("sess-one")}
 
     server.register("session.open", open_session)

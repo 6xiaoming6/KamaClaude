@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 from kama_claude.core.bus.commands import SessionCompactResult
-from kama_claude.core.bus.envelope import HandlerError
+from kama_claude.core.bus.envelope import SERVER_SHUTTING_DOWN, HandlerError
 from kama_claude.core.bus.events import (
     RunFinishedEvent,
     RunInterruptedEvent,
@@ -75,6 +75,7 @@ class SessionManager:
         self._sessions: dict[str, Session] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._tasks: dict[str, asyncio.Task[str]] = {}
+        self._stopping = False
         self._load_errors: dict[str, str] = {}
         self._skill_loader = SkillLoader()
         for sid in store.session_ids():
@@ -108,6 +109,8 @@ class SessionManager:
         run_id: str | None = None,
         wait: bool = True,
     ) -> str:
+        if self._stopping:
+            raise HandlerError(SERVER_SHUTTING_DOWN, "Server shutting down")
         session = self._get_session(sid)
         lock = self._locks[sid]
         if lock.locked() or self.is_running(sid):
@@ -290,10 +293,13 @@ class SessionManager:
         cp = self._recovery.recover_orphaned_run(sid, running=self.is_running(sid))
         self._sessions[sid] = Session.from_dict(cp.session)
         pending = self._permissions.pending_for_session(sid) if self._permissions else []
+        messages, cursor, end = self._store.read_history_page(sid, include_metadata=True)
         return {
             "session": cp.session,
             "revision": cp.revision,
-            "messages": self._store.read_history(sid, include_metadata=True),
+            "messages": messages,
+            "next_cursor": cursor,
+            "history_end": end,
             "run": cp.run.model_dump(mode="json") if cp.run else None,
             "running": self.is_running(sid),
             "pending_permissions": pending,
@@ -306,6 +312,8 @@ class SessionManager:
         expected_revision: int,
         action: Literal["continue", "retry_tool", "abort"] = "continue",
     ) -> dict[str, Any]:
+        if self._stopping:
+            raise HandlerError(SERVER_SHUTTING_DOWN, "Server shutting down")
         self._get_session(sid)
         if self.is_running(sid) or self._locks[sid].locked():
             raise HandlerError(SESSION_BUSY, "run is already running")
@@ -376,8 +384,22 @@ class SessionManager:
         self._get_session(sid)
         return self._store.read_history(sid)
 
+    def get_history_page(
+        self, sid: str, cursor: int = 0, history_end: int | None = None, *,
+        include_metadata: bool = False,
+    ) -> tuple[list[dict[str, Any]], int | None, int]:
+        self._get_session(sid)
+        try:
+            return self._store.read_history_page(
+                sid, cursor, history_end, include_metadata=include_metadata,
+            )
+        except ValueError as exc:
+            raise HandlerError(-32602, str(exc)) from exc
+
     # Core 关闭时等待所有受管任务完成检查点收尾
     async def shutdown(self) -> None:
+        # 已接收的 RPC 可能仍在准备会话；先阻止它随后启动新 Run。
+        self._stopping = True
         tasks = list(self._tasks.values())
         for task in tasks:
             task.cancel()

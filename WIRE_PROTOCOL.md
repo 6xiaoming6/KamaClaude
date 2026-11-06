@@ -477,6 +477,9 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
 |---|---|---|
 | `type` | `string` | no |
 | `session_id` | `string` | yes |
+| `cursor` | `integer` | no |
+| `history_end` | `integer | null` | no |
+| `include_metadata` | `boolean` | no |
 
 ```json
 {
@@ -490,6 +493,32 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
     "session_id": {
       "title": "Session Id",
       "type": "string"
+    },
+    "cursor": {
+      "default": 0,
+      "description": "Byte offset returned by next_cursor.",
+      "minimum": 0,
+      "title": "Cursor",
+      "type": "integer"
+    },
+    "history_end": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Fixed snapshot end offset.",
+      "title": "History End"
+    },
+    "include_metadata": {
+      "default": false,
+      "title": "Include Metadata",
+      "type": "boolean"
     }
   },
   "required": [
@@ -505,6 +534,8 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
 | Field | Type | Required |
 |---|---|---|
 | `messages` | `array` | yes |
+| `next_cursor` | `integer | null` | no |
+| `history_end` | `integer` | no |
 
 ```json
 {
@@ -516,6 +547,23 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
       },
       "title": "Messages",
       "type": "array"
+    },
+    "next_cursor": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Next Cursor"
+    },
+    "history_end": {
+      "default": 0,
+      "title": "History End",
+      "type": "integer"
     }
   },
   "required": [
@@ -771,6 +819,8 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
 | `running` | `boolean` | yes |
 | `pending_permissions` | `array` | yes |
 | `event_seq` | `integer` | no |
+| `next_cursor` | `integer | null` | no |
+| `history_end` | `integer` | no |
 
 ```json
 {
@@ -785,7 +835,7 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
       "type": "integer"
     },
     "messages": {
-      "description": "Full original conversation from thread.jsonl, not compacted model context. Rows may include id and run_id for display correlation; these are not model input.",
+      "description": "First page of original conversation from thread.jsonl, not compacted model context. Follow next_cursor with session.get_history using the same history_end. Rows may include id and run_id for display correlation; these are not model input.",
       "items": {
         "additionalProperties": true,
         "type": "object"
@@ -821,6 +871,23 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
       "default": 0,
       "title": "Event Seq",
       "type": "integer"
+    },
+    "next_cursor": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Next Cursor"
+    },
+    "history_end": {
+      "default": 0,
+      "title": "History End",
+      "type": "integer"
     }
   },
   "required": [
@@ -835,6 +902,9 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
   "type": "object"
 }
 ```
+
+History is paged: session.open returns the first page plus next_cursor and history_end. Fetch session.get_history with that cursor, the same history_end, and include_metadata=true until next_cursor is null. The fixed end excludes messages appended after the open snapshot; apply buffered events after event_seq. Pages target 1 MiB or 200 messages without splitting a message. IPC frames remain limited to 64 MiB; an oversized RPC response returns -32033, and an oversized incoming frame closes the connection and fails pending requests.
+
 ### SessionResumeCommand
 
 | Field | Type | Required |
@@ -984,6 +1054,13 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
   "type": "object"
 }
 ```
+
+## Request Admission and Connection Sending
+
+Requests are validated and admitted before a handler Task is created. Ordinary limits are 8 per connection and 64 globally; core.ping and permission.respond have separate limits of 2 per connection and 8 globally. Full capacity returns -32034 Server busy without creating waiting Tasks. Quotas include response sending. Shutdown rejects new ordinary work with -32035 Server shutting down while existing connections can still process control requests during Run cleanup.
+
+Responses, live events and replay share one FIFO ConnectionSender per connection. Live publication only enqueues; RPC and replay wait for their frame to be written. The queue allows 128 frames and 64 MiB + 1 byte including in-flight frames. Queue overflow, a 5-second drain timeout or write failure closes that connection and fails send waiters. Other connections and Core-owned Runs continue. Trace stage=queued is not delivery confirmation; stage=written follows drain. Changing subscriptions does not close the Sender. Pending requests, Sender drain and connection close each use 2-second shutdown waits.
+
 
 ## Server Push
 

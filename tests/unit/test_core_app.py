@@ -63,3 +63,42 @@ async def test_shutdown_closes_server(
             signal.SIGINT,
             signal.SIGTERM,
         ]
+
+
+@pytest.mark.parametrize("failure", [None, "sessions", "mcp", "server"])
+async def test_shutdown_gates_requests_first_and_keeps_cleanup_on_failure(monkeypatch, failure):
+    order = []
+    started = asyncio.Event()
+
+    def record(name):
+        order.append(name)
+        if name == failure:
+            raise RuntimeError(f"controlled {name} failure")
+
+    server = Mock()
+    server.start = AsyncMock(side_effect=lambda: started.set() or "local")
+    server.begin_shutdown.side_effect = lambda: record("gate")
+    server.stop = AsyncMock(side_effect=lambda: record("server"))
+    sessions = Mock()
+    sessions.shutdown = AsyncMock(side_effect=lambda: record("sessions"))
+    mcp = Mock()
+    mcp.start_all = AsyncMock()
+    mcp.stop_all = AsyncMock(side_effect=lambda: record("mcp"))
+    trace = Mock()
+    trace.start = AsyncMock()
+    trace.stop = AsyncMock(side_effect=lambda: record("trace"))
+    monkeypatch.setattr(core_app, "get_config", lambda: KamaConfig())
+    monkeypatch.setattr(core_app, "setup_logging", Mock())
+    monkeypatch.setattr(core_app, "SocketServer", Mock(return_value=server))
+    monkeypatch.setattr(core_app, "SessionManager", Mock(return_value=sessions))
+    monkeypatch.setattr(core_app, "McpServerManager", Mock(return_value=mcp))
+    monkeypatch.setattr(core_app, "TraceWriter", Mock(return_value=trace))
+    monkeypatch.setattr(core_app, "sys", SimpleNamespace(platform="win32"))
+    task = asyncio.create_task(core_app.CoreApp().run())
+    await asyncio.wait_for(started.wait(), 2)
+    task.cancel()
+    with pytest.raises(RuntimeError if failure else asyncio.CancelledError):
+        await task
+    assert order == ["gate", "sessions", "mcp", "server", "trace"]
+    controls = {call.args[0] for call in server.register.call_args_list if call.kwargs.get("control")}
+    assert controls == {"core.ping", "permission.respond"}

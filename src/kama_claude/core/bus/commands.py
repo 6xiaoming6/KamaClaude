@@ -63,10 +63,15 @@ class SessionSendMessageResult(BaseModel):
 class SessionGetHistoryCommand(BaseModel):
     type: Literal["session.get_history"] = "session.get_history"
     session_id: str
+    cursor: int = Field(default=0, ge=0, description="Byte offset returned by next_cursor.")
+    history_end: int | None = Field(default=None, ge=0, description="Fixed snapshot end offset.")
+    include_metadata: bool = False
 
 
 class SessionGetHistoryResult(BaseModel):
     messages: list[dict[str, Any]]
+    next_cursor: int | None = None
+    history_end: int = 0
 
 
 class SessionCloseCommand(BaseModel):
@@ -127,7 +132,8 @@ class SessionOpenResult(BaseModel):
     revision: int
     messages: list[dict[str, Any]] = Field(
         description=(
-            "Full original conversation from thread.jsonl, not compacted model context. "
+            "First page of original conversation from thread.jsonl, not compacted model context. "
+            "Follow next_cursor with session.get_history using the same history_end. "
             "Rows may include id and run_id for display correlation; these are not model input."
         ),
     )
@@ -135,6 +141,8 @@ class SessionOpenResult(BaseModel):
     running: bool
     pending_permissions: list[dict[str, Any]]
     event_seq: int = 0
+    next_cursor: int | None = None
+    history_end: int = 0
 
 
 class SessionResumeCommand(BaseModel):

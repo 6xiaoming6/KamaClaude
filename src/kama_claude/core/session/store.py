@@ -14,6 +14,8 @@ from kama_claude.core.session.model import Session
 
 logger = logging.getLogger(__name__)
 MessageContent = str | list[dict[str, Any]]
+_HISTORY_PAGE_BYTES = 1024 * 1024
+_HISTORY_PAGE_MESSAGES = 200
 
 
 # 返回当前 UTC 时间
@@ -194,6 +196,49 @@ class SessionStore:
             for row in self._read_history_rows(sid)
             if row.get("role") in ("user", "assistant")
         ]
+
+    # 游标是 thread 的字节位置；固定 end 后，后续追加留给实时事件，不混进旧快照。
+    def read_history_page(
+        self, sid: str, cursor: int = 0, history_end: int | None = None, *,
+        include_metadata: bool = False,
+    ) -> tuple[list[dict[str, Any]], int | None, int]:
+        path = self.session_dir(sid) / "thread.jsonl"
+        size = path.stat().st_size if path.exists() else 0
+        end = size if history_end is None else history_end
+        if not 0 <= cursor <= end <= size:
+            raise ValueError("invalid history cursor or snapshot end")
+        if cursor == end:
+            return [], None, end
+        messages: list[dict[str, Any]] = []
+        consumed, offset = 0, cursor
+        with path.open("rb") as stream:
+            if cursor:
+                stream.seek(cursor - 1)
+                if stream.read(1) != b"\n":
+                    raise ValueError("history cursor must point to a message boundary")
+            stream.seek(cursor)
+            while offset < end and len(messages) < _HISTORY_PAGE_MESSAGES:
+                line = stream.readline(end - offset)
+                # 不拆开一条消息；单条超过页目标时单独返回，由传输层检查硬上限。
+                if messages and consumed + len(line) > _HISTORY_PAGE_BYTES:
+                    break
+                try:
+                    row = json.loads(line)
+                    if not isinstance(row, dict):
+                        raise ValueError("invalid history row")
+                except (ValueError, UnicodeError) as exc:
+                    raise CheckpointError(
+                        f"invalid history row for {sid} at byte {offset}"
+                    ) from exc
+                offset = stream.tell()
+                consumed += len(line)
+                if row.get("role") in ("user", "assistant"):
+                    messages.append({
+                        "role": row["role"], "content": row.get("content", ""),
+                        **({key: row[key] for key in ("id", "run_id") if key in row}
+                           if include_metadata else {}),
+                    })
+        return messages, offset if offset < end else None, end
 
     # 读取原始行；崩溃留下的未完成末行只在补写时修复，其余损坏明确报错
     def _read_history_rows(self, sid: str, *, repair_tail: bool = False) -> list[dict[str, Any]]:

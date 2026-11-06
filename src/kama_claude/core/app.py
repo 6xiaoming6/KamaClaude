@@ -56,8 +56,14 @@ from kama_claude.core.session.store import SessionStore
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
 from kama_claude.core.trace.record import TraceRecord
 from kama_claude.core.trace.writer import TraceWriter
+from kama_claude.core.transport.framing import encode_frame
 from kama_claude.core.transport.ipc_broadcaster import IpcEventBroadcaster
-from kama_claude.core.transport.socket_server import SocketServer, get_connection_writer
+from kama_claude.core.transport.sender import ConnectionSender
+from kama_claude.core.transport.socket_server import (
+    SocketServer,
+    get_connection_sender,
+    get_connection_writer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +153,7 @@ class CoreApp:
         self._broadcaster.unsubscribe(writer)
         if result["run"]:
             self._broadcaster.bind_run(result["run"]["run_id"], cmd.session_id)
-        self._broadcaster.subscribe(writer, ["*"], f"session:{cmd.session_id}")
+        self._broadcaster.subscribe(get_connection_sender(), ["*"], f"session:{cmd.session_id}")
         result["event_seq"] = self._broadcaster.sequence(cmd.session_id)
         return SessionOpenResult(**result)
 
@@ -163,12 +169,14 @@ class CoreApp:
         )
         return SessionResumeResult(**result)
 
-    # 返回 session 的完整 Anthropic messages 历史
+    # 分页返回完整原文；固定快照末尾避免加载期间重复纳入实时追加。
     async def _session_history_handler(self, params: dict[str, Any]) -> SessionGetHistoryResult:
         assert self._sessions is not None
         cmd = SessionGetHistoryCommand.model_validate(params)
-        messages = await self._sessions.get_history(cmd.session_id)
-        return SessionGetHistoryResult(messages=messages)
+        messages, cursor, end = self._sessions.get_history_page(
+            cmd.session_id, cmd.cursor, cmd.history_end, include_metadata=cmd.include_metadata,
+        )
+        return SessionGetHistoryResult(messages=messages, next_cursor=cursor, history_end=end)
 
     # 接收客户端权限审批响应，resolve 对应挂起的 Future
     async def _permission_respond_handler(self, params: dict[str, Any]) -> PermissionRespondResult:
@@ -206,23 +214,23 @@ class CoreApp:
     # 注册客户端事件订阅，可选先回放 events.jsonl 历史再接收实时流
     async def _subscribe_handler(self, params: dict[str, Any]) -> EventSubscribeResult:
         cmd = EventSubscribeCommand.model_validate(params)
-        writer = get_connection_writer()
+        sender = get_connection_sender()
 
         replayed_count = 0
         if cmd.replay_from_run is not None:
             replayed_count = await self._replay_events(
-                cmd.replay_from_run, writer, cmd.topics
+                cmd.replay_from_run, sender, cmd.topics
             )
         assert self._broadcaster is not None
         # 客户端发送订阅请求时，广播器会保存当前客户端的订阅内容，以后事件发布时广播给订阅了的客户端
-        sub_id = self._broadcaster.subscribe(writer, cmd.topics, cmd.scope)
+        sub_id = self._broadcaster.subscribe(sender, cmd.topics, cmd.scope)
         return EventSubscribeResult(subscription_id=sub_id, replayed_count=replayed_count)
 
     # 从 events.jsonl 向 writer 回放匹配 topic 的历史事件，返回已回放条数
     async def _replay_events(
         self,
         run_id: str,
-        writer: asyncio.StreamWriter,
+        sender: ConnectionSender,
         topics: list[str],
     ) -> int:
         path = events_file(run_id)
@@ -249,11 +257,9 @@ class CoreApp:
             if not any(fnmatch.fnmatch(event_type, p) for p in topics):
                 continue
             envelope = EventPushEnvelope(event=event)
-            writer.write(envelope.model_dump_json().encode() + b"\n")
+            # 回放可以等待写出，避免快速灌满健康连接的队列。
+            await sender.send(encode_frame(envelope))
             count += 1
-
-        if count:
-            await writer.drain()
         return count
 
     # 启动守护进程：加载配置、初始化日志、启动 trace、启动 TCP 服务器，并等待退出信号
@@ -315,7 +321,7 @@ class CoreApp:
             self._broadcaster,
             trace=self._trace,
         )
-        server.register("core.ping", self._ping_handler)
+        server.register("core.ping", self._ping_handler, control=True)
         server.register("agent.run", self._agent_run_handler)
         server.register("event.subscribe", self._subscribe_handler)
         server.register("session.create", self._session_create_handler)
@@ -325,7 +331,7 @@ class CoreApp:
         server.register("session.send_message", self._session_send_handler)
         server.register("session.get_history", self._session_history_handler)
         server.register("session.close", self._session_close_handler)
-        server.register("permission.respond", self._permission_respond_handler)
+        server.register("permission.respond", self._permission_respond_handler, control=True)
         server.register("session.compact", self._session_compact_handler)
 
         addr = await server.start()
@@ -346,13 +352,20 @@ class CoreApp:
         finally:
             # Windows系统下，用户按 Ctrl+C 时，asyncio.run() 会取消主任务，无须额外注册信号处理器
             logger.info("shutting down")
-            if self._sessions is not None:
-                await self._sessions.shutdown()
-            if self._mcp_manager is not None:
-                await self._mcp_manager.stop_all()
-            await server.stop()
-            if self._trace is not None:
-                await self._trace.stop()
+            server.begin_shutdown()
+            try:
+                try:
+                    if self._sessions is not None:
+                        await self._sessions.shutdown()
+                finally:
+                    if self._mcp_manager is not None:
+                        await self._mcp_manager.stop_all()
+            finally:
+                try:
+                    await server.stop()
+                finally:
+                    if self._trace is not None:
+                        await self._trace.stop()
 
 
 # 同步入口：启动 CoreApp 事件循环

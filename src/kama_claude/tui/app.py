@@ -375,6 +375,19 @@ class KamaTuiApp(App[None]):
         self._session_id = sid
         try:
             data = await self._client.send_command("session.open", {"session_id": sid})
+            cursor = data.get("next_cursor")
+            while cursor is not None:
+                page = await self._client.send_command("session.get_history", {
+                    "session_id": sid, "cursor": cursor, "history_end": data["history_end"],
+                    "include_metadata": True,
+                })
+                if page.get("history_end") != data["history_end"]:
+                    raise RuntimeError("history snapshot changed; reopen the session")
+                following = page.get("next_cursor")
+                if following is not None and following <= cursor:
+                    raise RuntimeError("history cursor did not advance; reopen the session")
+                data["messages"].extend(page["messages"])
+                cursor = following
             view = self._view
             await view.remove_children()
             view.reset()

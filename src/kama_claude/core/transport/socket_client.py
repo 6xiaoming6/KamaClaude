@@ -6,11 +6,12 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from kama_claude.core.bus.envelope import JsonRpcRequest
+from kama_claude.core.bus.envelope import MESSAGE_TOO_LARGE, JsonRpcRequest
+from kama_claude.core.transport.framing import MAX_LINE_BYTES, FrameTooLargeError, encode_frame
 
 type EventHandler = Callable[[dict[str, Any]], Awaitable[None]]
 
-_MAX_LINE_BYTES = 64 * 1024 * 1024  # 64 MB per frame，兼容 MCP 大文件工具结果
+_MAX_LINE_BYTES = MAX_LINE_BYTES
 
 
 class IpcError(RuntimeError):
@@ -36,11 +37,13 @@ class SocketClient:
 
     # 关闭 TCP 连接并等待底层 socket 释放
     async def close(self) -> None:
-        if self._writer is not None:
-            self._writer.close()
+        writer, self._writer = self._writer, None
+        self._fail_pending(ConnectionError("Core disconnected"))
+        if writer is not None:
+            writer.close()
             try:
-                await asyncio.wait_for(self._writer.wait_closed(), timeout=1.0)
-            except TimeoutError:
+                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+            except (TimeoutError, OSError):
                 pass
 
     # 注册服务器推送事件的回调，可多次调用以添加多个 handler
@@ -54,11 +57,16 @@ class SocketClient:
         # 生成该请求的rpc_id
         req_id = str(uuid.uuid4())
         request = JsonRpcRequest(id=req_id, method=method, params=params)
+        # 本地就能确认超限，不先发送，也不留下等待响应的 Future。
+        try:
+            frame = encode_frame(request, _MAX_LINE_BYTES)
+        except FrameTooLargeError as exc:
+            raise IpcError(MESSAGE_TOO_LARGE, str(exc)) from exc
         # 创建futrue等待服务端响应
         fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[req_id] = fut
         try:
-            self._writer.write(request.model_dump_json().encode() + b"\n")
+            self._writer.write(frame)
             await self._writer.drain()
             # 服务端按请求 ID 填入 Future 后，这次命令才返回
             return await fut
@@ -66,11 +74,14 @@ class SocketClient:
             self._pending.pop(req_id, None)
             if not fut.done():
                 fut.cancel()
+            elif not fut.cancelled():
+                fut.exception()  # 写入失败与接收断线同时发生时，也回收 Future 的异常。
 
     # 持续读取服务器消息，分发 RPC 响应到 pending future 或事件到 event handler
     async def run_event_loop(self) -> None:
         if self._reader is None:
             raise RuntimeError("not connected — call connect() first")
+        failure: ConnectionError = ConnectionError("Core disconnected")
         try:
             while True:
                 try:
@@ -78,17 +89,21 @@ class SocketClient:
                 except (ConnectionResetError, OSError):
                     break
                 except (ValueError, asyncio.LimitOverrunError):
-                    # 单行超出 limit；丢弃本行，继续读取后续消息
-                    continue
+                    # 无法可靠取得这行的 RPC ID；终止连接，明确结束所有等待。
+                    failure = FrameTooLargeError(f"Core response exceeds {_MAX_LINE_BYTES} bytes")
+                    break
                 if not line:
                     break
                 await self._dispatch(line)
         finally:
-            # _pending里面存的是等待响应的请求，防止一直空等，finally里要处理掉这些等待的future
-            for fut in self._pending.values():
-                if not fut.done():
-                    fut.set_exception(ConnectionError("Core disconnected"))
-            self._pending.clear()
+            self._fail_pending(failure)
+            await self.close()
+
+    def _fail_pending(self, error: ConnectionError) -> None:
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(error)
+        self._pending.clear()
 
     # 解析单行消息并路由到 pending future（RPC 响应）或 event handler（服务器推送）
     # 区分出这行数据到底是某个请求的响应还是事件推送

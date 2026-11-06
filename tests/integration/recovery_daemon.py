@@ -129,6 +129,7 @@ async def main(root: Path, port: int) -> None:
         "session.send_message": app._session_send_handler,
         "session.list": app._session_list_handler,
         "session.open": app._session_open_handler,
+        "session.get_history": app._session_history_handler,
         "session.resume": app._session_resume_handler,
         "session.close": app._session_close_handler,
     }.items():
@@ -138,8 +139,11 @@ async def main(root: Path, port: int) -> None:
     try:
         await asyncio.Event().wait()
     finally:
-        await app._sessions.shutdown()
-        await server.stop()
+        server.begin_shutdown()
+        try:
+            await app._sessions.shutdown()
+        finally:
+            await server.stop()
 
 
 if __name__ == "__main__":

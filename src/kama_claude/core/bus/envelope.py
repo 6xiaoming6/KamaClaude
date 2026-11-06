@@ -41,6 +41,9 @@ INVALID_REQUEST = -32600  # 请求格式错误
 METHOD_NOT_FOUND = -32601 # 方法不存在
 INVALID_PARAMS = -32602   # 参数错误
 INTERNAL_ERROR = -32603   # 服务器内部错误
+MESSAGE_TOO_LARGE = -32033  # 请求或响应超过 TCP 单帧限制
+SERVER_BUSY = -32034  # 请求并发额度已满，可稍后重试
+SERVER_SHUTTING_DOWN = -32035  # 已停止业务接入，不再登记普通请求
 
 
 class HandlerError(Exception):

@@ -213,10 +213,32 @@ def generate() -> str:
         _model_section("SessionListResult", SessionListResult),
         _model_section("SessionOpenCommand", SessionOpenCommand),
         _model_section("SessionOpenResult", SessionOpenResult),
+        "\nHistory is paged: session.open returns the first page plus next_cursor and "
+        "history_end. Fetch session.get_history with that cursor, the same history_end, "
+        "and include_metadata=true until next_cursor is null. The fixed end excludes "
+        "messages appended after the open snapshot; apply buffered events after event_seq. "
+        "Pages target 1 MiB or 200 messages without splitting a message. IPC frames remain "
+        "limited to 64 MiB; an oversized RPC response returns -32033, and an oversized "
+        "incoming frame closes the connection and fails pending requests.\n\n",
         _model_section("SessionResumeCommand", SessionResumeCommand),
         _model_section("SessionResumeResult", SessionResumeResult),
         _model_section("PermissionRespondCommand", PermissionRespondCommand),
         _model_section("PermissionRespondResult", PermissionRespondResult),
+        "\n## Request Admission and Connection Sending\n\n",
+        "Requests are validated and admitted before a handler Task is created. Ordinary "
+        "limits are 8 per connection and 64 globally; core.ping and permission.respond "
+        "have separate limits of 2 per connection and 8 globally. Full capacity returns "
+        "-32034 Server busy without creating waiting Tasks. Quotas include response sending. "
+        "Shutdown rejects new ordinary work with -32035 Server shutting down while "
+        "existing connections can still process control requests during Run cleanup.\n\n",
+        "Responses, live events and replay share one FIFO ConnectionSender per connection. "
+        "Live publication only enqueues; RPC and replay wait for their frame to be written. "
+        "The queue allows 128 frames and 64 MiB + 1 byte including in-flight frames. "
+        "Queue overflow, a 5-second drain timeout or write failure closes that connection "
+        "and fails send waiters. Other connections and Core-owned Runs continue. "
+        "Trace stage=queued is not delivery confirmation; stage=written follows drain. "
+        "Changing subscriptions does not close the Sender. Pending requests, Sender drain "
+        "and connection close each use 2-second shutdown waits.\n\n",
         "\n## Server Push\n\n",
         "Events pushed from daemon to subscribed clients over the same TCP connection.\n\n",
         "Session-scoped pushes include session_id and event_seq inside event. "

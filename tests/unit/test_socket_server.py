@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import socket
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -66,13 +66,20 @@ async def test_connection_loss_is_handled_and_cleans_up(error: ConnectionError) 
     reader = asyncio.StreamReader()
     reader.set_exception(error)
     writer = Mock(spec=asyncio.StreamWriter)
-    broadcaster.subscribe(writer, ["*"])
+    writer.wait_closed = AsyncMock()
+    original_read = server._read_loop
+
+    async def read_with_subscription(reader, writer):
+        broadcaster.subscribe(server._senders[writer], ["*"])
+        await original_read(reader, writer)
+
+    server._read_loop = read_with_subscription
 
     task = asyncio.create_task(server._handle_connection(reader, writer))
     await task
 
     assert task.exception() is None
-    assert writer not in server._active_writers
+    assert writer not in server._senders
     assert not broadcaster._subscriptions
     writer.close.assert_called_once_with()
 
@@ -86,11 +93,18 @@ async def test_other_connection_errors_still_propagate(error: BaseException) -> 
     reader = asyncio.StreamReader()
     reader.set_exception(error)
     writer = Mock(spec=asyncio.StreamWriter)
-    broadcaster.subscribe(writer, ["*"])
+    writer.wait_closed = AsyncMock()
+    original_read = server._read_loop
+
+    async def read_with_subscription(reader, writer):
+        broadcaster.subscribe(server._senders[writer], ["*"])
+        await original_read(reader, writer)
+
+    server._read_loop = read_with_subscription
 
     with pytest.raises(type(error)):
         await server._handle_connection(reader, writer)
 
-    assert writer not in server._active_writers
+    assert writer not in server._senders
     assert not broadcaster._subscriptions
     writer.close.assert_called_once_with()

@@ -12,6 +12,8 @@ from pydantic import BaseModel
 from kama_claude.core.bus.envelope import EventPushEnvelope
 from kama_claude.core.trace.record import TraceRecord
 from kama_claude.core.trace.writer import TraceWriter
+from kama_claude.core.transport.framing import encode_frame
+from kama_claude.core.transport.sender import ConnectionSender
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +25,7 @@ def _now() -> str:
 @dataclass
 class _Subscription:
     sub_id: str
-    writer: asyncio.StreamWriter
+    sender: ConnectionSender
     topics: list[str]
     scope: str
 
@@ -47,20 +49,20 @@ class IpcEventBroadcaster:
     # 注册一个客户端订阅，返回 subscription_id
     def subscribe(
         self,
-        writer: asyncio.StreamWriter,
+        sender: ConnectionSender,
         topics: list[str],
         scope: str = "global",
     ) -> str:
         sub_id = f"sub-{uuid.uuid4().hex[:8]}"
-        sub = _Subscription(sub_id=sub_id, writer=writer, topics=topics, scope=scope)
+        sub = _Subscription(sub_id=sub_id, sender=sender, topics=topics, scope=scope)
         self._subscriptions.append(sub)
         return sub_id
 
     # 移除指定 writer 的所有订阅
     def unsubscribe(self, writer: asyncio.StreamWriter) -> None:
-        self._subscriptions = [s for s in self._subscriptions if s.writer is not writer]
+        self._subscriptions = [s for s in self._subscriptions if s.sender.writer is not writer]
 
-    # 将事件推送到所有匹配的订阅客户端，写入失败时延迟清理死连接
+    # 仅将匹配事件放进连接发送队列，网络等待由各连接独立承担。
     async def handle(self, event: BaseModel) -> None:
         event_dict = event.model_dump()
         event_type: str = event_dict.get("type", "")
@@ -84,10 +86,9 @@ class IpcEventBroadcaster:
                 continue
             try:
                 envelope = EventPushEnvelope(event=event_dict)
-                sub.writer.write(envelope.model_dump_json().encode() + b"\n")
-                await sub.writer.drain()
+                sub.sender.enqueue(encode_frame(envelope))
                 if self._trace is not None:
-                    client_id = str(sub.writer.get_extra_info("peername", "<unknown>"))
+                    client_id = str(sub.sender.writer.get_extra_info("peername", "<unknown>"))
                     self._trace.emit(
                         TraceRecord(
                             ts=_now(),
@@ -96,15 +97,21 @@ class IpcEventBroadcaster:
                             kind="push",
                             run_id=run_id,
                             client_id=client_id,
-                            data={"sub_id": sub.sub_id, "event_type": event_type},
+                            data={
+                                "sub_id": sub.sub_id, "event_type": event_type, "stage": "queued",
+                            },
                         )
                     )
             except (ConnectionResetError, BrokenPipeError, OSError):
                 logger.debug("dead connection for sub %s, scheduling cleanup", sub.sub_id)
-                dead.append(sub.writer)
+                sub.sender.abort(ConnectionError("event delivery failed"))
+                dead.append(sub.sender.writer)
 
         for writer in dead:
             self.unsubscribe(writer)
+        # 只让出调度权，不等网络完成，避免突发事件饿死本来健康的发送任务。
+        if self._subscriptions:
+            await asyncio.sleep(0)
 
     # 检查事件类型是否匹配订阅的 topic 列表（支持 fnmatch glob 模式）
     @staticmethod
