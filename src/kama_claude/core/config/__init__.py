@@ -11,6 +11,7 @@ from kama_claude.core.config.models import (
     MemoryConfig,
     PermissionConfig,
     SubagentConfig,
+    ToolSearchConfig,
     TraceConfig,
 )
 
@@ -18,6 +19,7 @@ __all__ = [
     "LoggingConfig",
     "AgentConfig",
     "SubagentConfig",
+    "ToolSearchConfig",
     "LlmConfig",
     "TraceConfig",
     "PermissionConfig",

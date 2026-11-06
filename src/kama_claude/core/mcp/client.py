@@ -34,6 +34,13 @@ class McpToolDef:
     name: str
     description: str
     input_schema: dict[str, Any] = field(default_factory=dict)
+    raw_definition: dict[str, Any] = field(default_factory=dict)
+
+    # SDK 返回值完整保存，测试或独立构造时由明确字段生成同一格式。
+    def definition(self) -> dict[str, Any]:
+        return self.raw_definition or {
+            "name": self.name, "description": self.description, "inputSchema": self.input_schema,
+        }
 
 
 # 展开 SDK 任务组异常，保留真正的连接失败原因
@@ -149,6 +156,7 @@ class McpClient:
                 tools.extend(McpToolDef(
                     name=tool.name, description=tool.description or "",
                     input_schema=tool.input_schema,
+                    raw_definition=tool.model_dump(mode="json", by_alias=True, exclude_none=True),
                 ) for tool in page.tools)
                 cursor = page.next_cursor # 还有下一页就继续读取下一页的工具列表
                 if not cursor:

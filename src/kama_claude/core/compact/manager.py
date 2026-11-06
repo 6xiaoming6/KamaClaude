@@ -15,6 +15,7 @@ from kama_claude.core.bus.events import (
 from kama_claude.core.compact.compactor import CompactionResult, Compactor, write_summary
 from kama_claude.core.compact.estimator import TokenEstimator, estimate_bytes
 from kama_claude.core.config import CompactionConfig, MemoryConfig
+from kama_claude.core.discovery.exposure import visible_schemas
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.managed import ManagedProvider
 from kama_claude.core.memory.context import refresh_prompt
@@ -213,7 +214,7 @@ async def compact_session(
         manual=True,
         outputs_dir=run_path / "outputs",
         system=cp.run.system_prompt if cp.run else "",
-        tool_schemas=cp.run.tool_schemas if cp.run else [],
+        tool_schemas=visible_schemas(cp.run) if cp.run else [],
         provider_factory=summary_provider,
     )
     if result.compacted:
@@ -231,8 +232,9 @@ async def compact_session(
             else:
                 cp.run.memory_snapshot = snapshot
                 cp.run.system_prompt = system
-                counter = estimator.select(system, result.messages, cp.run.tool_schemas)
-                required = counter.request(system, result.messages, cp.run.tool_schemas)
+                schemas = visible_schemas(cp.run)
+                counter = estimator.select(system, result.messages, schemas)
+                required = counter.request(system, result.messages, schemas)
                 if required > config.input_limit:
                     result.reason = "context_budget_exceeded"
         if result.compacted:

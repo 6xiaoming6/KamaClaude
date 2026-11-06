@@ -3,13 +3,14 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import urlsplit
 
-from kama_claude.core.config.models import KamaConfig, McpServerConfig
+from kama_claude.core.config.models import KamaConfig, McpServerConfig, ToolSearchConfig
 
 
+# 校验顶层配置名，再委托各小节解析。
 def apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
     unknown = set(data.keys()) - {
         "core", "logging", "agent", "llm", "trace", "permission", "execution",
-        "compaction", "memory", "mcp", "subagent",
+        "compaction", "memory", "mcp", "subagent", "tool_search",
     }
     if unknown:
         raise SystemExit(f"Unknown top-level config keys: {', '.join(sorted(unknown))}")
@@ -36,6 +37,21 @@ def apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
         _apply_memory(config, data["memory"])
     if "mcp" in data:
         _apply_mcp(config, data["mcp"])
+    if "tool_search" in data:
+        _apply_tool_search(config, data["tool_search"])
+
+
+# 小节整体校验成功后再替换，避免配置只应用一半。
+def _apply_tool_search(config: KamaConfig, value: Any) -> None:
+    if not isinstance(value, dict):
+        raise SystemExit("Config error: [tool_search] must be a table")
+    unknown = set(value) - set(ToolSearchConfig.__dataclass_fields__)
+    if unknown:
+        raise SystemExit(f"Unknown [tool_search] keys: {', '.join(sorted(unknown))}")
+    try:
+        config.tool_search = ToolSearchConfig(**value)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"Config error: {exc}") from exc
 
 
 # 子任务只配置同一根 Run 的并发与总派生数量，不引入排队状态。

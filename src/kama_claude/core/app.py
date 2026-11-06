@@ -286,7 +286,7 @@ class CoreApp:
         store = SessionStore(sessions_root)
         assert self._config is not None
         config = self._config
-        self._mcp_manager = McpServerManager()
+        self._mcp_manager = McpServerManager(config.tool_search)
         if self._config.mcp.servers:
             logger.info("mcp: starting %d server(s)", len(self._config.mcp.servers))
             await self._mcp_manager.start_all(self._config.mcp.servers)

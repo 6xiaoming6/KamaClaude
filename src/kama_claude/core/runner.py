@@ -20,12 +20,16 @@ from kama_claude.core.checkpoint.checkpoint import Checkpoint, CheckpointError, 
 from kama_claude.core.checkpoint.persistence import RunPersistence
 from kama_claude.core.config import KamaConfig
 from kama_claude.core.context import ExecutionContext
+from kama_claude.core.discovery.exposure import load_tools
+from kama_claude.core.discovery.model import digest
+from kama_claude.core.discovery.tool import SearchTool
 from kama_claude.core.events.bus import EventBus, EventHandler
 from kama_claude.core.events.writer import EventWriter
 from kama_claude.core.llm.base import LLMProvider
 from kama_claude.core.llm.factory import ProviderFactory
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.mcp.server import McpServerManager
+from kama_claude.core.mcp.tool import McpTool
 from kama_claude.core.memory.context import DEFAULT_SYSTEM, build_memory_context, compose_system
 from kama_claude.core.memory.paths import project_root
 from kama_claude.core.memory.store import MemoryStore
@@ -171,9 +175,14 @@ class AgentRunner:
                 registry.register(AgentResultTool(self._task_registry, session_id))
         # mcp内提供的工具是否注册
         if self._mcp_manager is not None:
+            records = []
             for mcp_tool in self._mcp_manager.get_tools():
                 if _ok(mcp_tool.name):
                     registry.register(mcp_tool)
+                    records.append(mcp_tool.record)
+            if run is not None and run.tool_loading_mode == "on_demand" and records:
+                if _ok("search_tool"):
+                    registry.register(SearchTool(run, records, self._mcp_manager.retriever))
         return registry
 
 
@@ -197,6 +206,7 @@ class AgentRunner:
         persistence = RunPersistence(context, cp, session, store)
         # Manager 已加入真实输入；Skill 展开的 goal 不能冒充用户原文
         message = cp.messages[-1] if cp.messages else context.messages[0]
+        context.run.user_input = str(message["content"])
         persistence.record_message(message["role"], message["content"])
         persistence.save()
 
@@ -355,6 +365,9 @@ class AgentRunner:
             max_total_tokens=self._config.agent.max_total_tokens,
             repeat_failure_limit=self._config.agent.repeat_failure_limit,
             tool_whitelist=tool_whitelist,
+            user_input=goal,
+            tool_loading_mode="on_demand" if self._config.tool_search.enabled else "all",
+            max_loaded_schema_tokens=self._config.tool_search.max_loaded_schema_tokens,
         )
 
     # 新任务与恢复共用 Context 构建，已有系统提示优先使用冻结值
@@ -437,6 +450,11 @@ class AgentRunner:
         resuming: bool,
     ) -> None:
         schemas = registry.tool_schemas()
+        mcp_tools = [registry.get(str(schema["name"])) for schema in schemas]
+        definitions = {
+            tool.name: digest(tool.record.server_id + tool.record.definition_hash)
+            for tool in mcp_tools if isinstance(tool, McpTool)
+        }
         if (
             resuming and run.schemas_frozen
             and json.dumps(schemas, sort_keys=True) != json.dumps(run.tool_schemas, sort_keys=True)
@@ -448,7 +466,18 @@ class AgentRunner:
             if missing:
                 run.reason += "; missing: " + ", ".join(sorted(missing))
             raise RuntimeError(run.reason)
+        if resuming and run.mcp_definition_hashes and definitions != run.mcp_definition_hashes:
+            run.reason = "MCP tool definitions or server identity changed; cannot resume"
+            raise RuntimeError(run.reason)
         run.tool_schemas = schemas
+        if not run.schemas_frozen:
+            run.mcp_tool_names = list(definitions)
+            run.mcp_definition_hashes = definitions
+            if run.tool_loading_mode == "on_demand" and run.tool_whitelist is not None:
+                selected = [name for name in run.mcp_tool_names if name in run.tool_whitelist]
+                _, rejected = load_tools(run, selected)
+                if rejected:
+                    raise RuntimeError("explicit MCP whitelist exceeds schema budget")
         run.schemas_frozen = True
         if persistence is not None:
             persistence.save()

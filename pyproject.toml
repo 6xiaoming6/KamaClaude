@@ -23,7 +23,11 @@ dependencies = [
     "httpx2>=2.13,<3",    # 官方 MCP SDK 的 HTTP 客户端，请求头与超时由本项目配置
     "tree-sitter>=0.25,<0.27",       # Bash AST 解析运行时
     "tree-sitter-bash>=0.25,<0.26",  # Bash 语法，不用于解释 Windows cmd
+    "rank-bm25>=0.2.2,<0.3",       # MCP 工具关键词召回
 ]
+
+[project.optional-dependencies]
+retrieval = ["sentence-transformers>=5,<6"] # 离线 Embedding，普通安装不引入 PyTorch
 
 # 安装后可在 PATH 中执行的入口：`kama` / `kama-core` / `kama-tui`
 [project.scripts]

@@ -95,6 +95,28 @@ class MemoryConfig:
 
 
 @dataclass
+class ToolSearchConfig:
+    enabled: bool = True
+    db_path: str = "~/.kama/tool_catalog.sqlite3"
+    model_path: str = ""
+    top_k: int = 3
+    max_loaded_schema_tokens: int = 8_192
+
+    # 空模型路径使用官方模型缓存；未安装可选推理库时搜索仍可降级。
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool:
+            raise ValueError("tool_search.enabled must be a boolean")
+        if not isinstance(self.db_path, str) or not self.db_path.strip():
+            raise ValueError("tool_search.db_path must be a nonempty string")
+        if not isinstance(self.model_path, str):
+            raise ValueError("tool_search.model_path must be a string")
+        if type(self.top_k) is not int or not 1 <= self.top_k <= 5:
+            raise ValueError("tool_search.top_k must be between 1 and 5")
+        if type(self.max_loaded_schema_tokens) is not int or self.max_loaded_schema_tokens <= 0:
+            raise ValueError("tool_search.max_loaded_schema_tokens must be positive")
+
+
+@dataclass
 class McpServerConfig:
     name: str
     transport: str = "stdio"       # "stdio" | "streamable-http"
@@ -124,4 +146,5 @@ class KamaConfig:
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     compaction: CompactionConfig = field(default_factory=CompactionConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    tool_search: ToolSearchConfig = field(default_factory=ToolSearchConfig)
     mcp: McpConfig = field(default_factory=McpConfig)

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+from dataclasses import asdict
 
-from kama_claude.core.config.models import KamaConfig
+from kama_claude.core.config.models import KamaConfig, ToolSearchConfig
 
 
+# 按配置小节应用环境覆盖，各小节自行完成类型校验。
 def apply_env(config: KamaConfig) -> None:
     _apply_core(config)
     _apply_logging(config)
@@ -15,6 +17,31 @@ def apply_env(config: KamaConfig) -> None:
     _apply_permission(config)
     _apply_compaction(config)
     _apply_memory(config)
+    _apply_tool_search(config)
+
+
+# 环境变量沿用 TOML 的字段和验证规则，不读取远程模型地址或密钥。
+def _apply_tool_search(config: KamaConfig) -> None:
+    values = asdict(config.tool_search)
+    for key in values:
+        raw = os.environ.get(f"KAMA_TOOL_SEARCH_{key.upper()}")
+        if raw is None:
+            continue
+        if key == "enabled":
+            if raw.lower() not in {"true", "false", "1", "0"}:
+                raise SystemExit("Config error: KAMA_TOOL_SEARCH_ENABLED must be a boolean")
+            values[key] = raw.lower() in {"true", "1"}
+        elif key in {"top_k", "max_loaded_schema_tokens"}:
+            try:
+                values[key] = int(raw)
+            except ValueError as exc:
+                raise SystemExit(f"Config error: tool_search.{key} must be an integer") from exc
+        else:
+            values[key] = raw
+    try:
+        config.tool_search = ToolSearchConfig(**values)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"Config error: {exc}") from exc
 
 
 # 环境变量覆盖 TOML，零、负数和非整数都不能成为有效子任务限额。

@@ -28,6 +28,7 @@ class BaseTool(ABC):
     description: str
     input_schema: dict[str, object]
     retry_safe: ClassVar[bool] = False
+    timeout_s: ClassVar[float] = 120.0
     params_model: ClassVar[type[BaseModel] | None] = None
 
     # 执行工具调用，返回结果或错误

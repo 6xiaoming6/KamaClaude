@@ -23,6 +23,7 @@ def _param_summary(tool_name: str, params: dict[str, Any], max_len: int = 72) ->
         "bash": ("command",),
         "memory_read": ("scope", "key", "query"),
         "memory_write": ("scope", "key", "action"),
+        "search_tool": ("description",),
     }
     keys = keys_by_tool.get(tool_name, ())
     parts = [f"{key}={params[key]!r}" for key in keys if key in params]

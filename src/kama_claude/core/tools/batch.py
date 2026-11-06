@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from kama_claude.core.context import ExecutionContext
+from kama_claude.core.discovery.exposure import visible_schemas
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import ToolCallBlock
 from kama_claude.core.run_budget import BudgetExceeded, RunBudget
@@ -41,6 +42,12 @@ class ToolBatchExecutor:
         self._session_id = session_id
         self._subagents = subagents
 
+    # 预算检查、压缩与真实请求共用同一份可见定义。
+    def model_schemas(self) -> list[dict[str, object]]:
+        if self._context.run.schemas_frozen:
+            return visible_schemas(self._context.run)
+        return self.registry.tool_schemas()
+
     # 从游标继续执行，结果、历史和游标都在这里按顺序处理
     async def run_pending(self) -> bool:
         context = self._context
@@ -61,18 +68,27 @@ class ToolBatchExecutor:
             tool_call = ToolCallBlock(tool.id, tool.name, tool.input)
             started_at = time.monotonic()
             attempts_before = tool.attempts
-            result = await invoke_tool(
-                self.registry,
-                tool_call,
-                self._bus,
-                run.run_id,
-                permission_manager=self._permission_manager,
-                session_id=self._session_id,
-                workspace=Path(run.workspace),
-                # 审批前、真正执行前，调用 _save_tool_phase 保存状态
-                checkpoint_hook=self._save_tool_phase,
-                notify_result=False,
-            )
+            visible = {str(schema["name"]) for schema in self.model_schemas()}
+            if not tool.exposed or (
+                tool.name in run.mcp_tool_names and tool.name not in visible
+            ):
+                result = ToolResult(
+                    "Tool was not exposed on this model turn. Search and use it on the next turn.",
+                    is_error=True, error_type="schema_error",
+                )
+            else:
+                result = await invoke_tool(
+                    self.registry,
+                    tool_call,
+                    self._bus,
+                    run.run_id,
+                    permission_manager=self._permission_manager,
+                    session_id=self._session_id,
+                    workspace=Path(run.workspace),
+                    # 审批前、真正执行前，调用 _save_tool_phase 保存状态
+                    checkpoint_hook=self._save_tool_phase,
+                    notify_result=False,
+                )
 
             repeated = self._budget.record_tool_result(tool.name, tool.input, result)
             tool.result = asdict(result)

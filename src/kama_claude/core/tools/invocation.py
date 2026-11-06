@@ -29,7 +29,6 @@ if TYPE_CHECKING:
     from kama_claude.core.permissions.manager import PermissionManager
 
 type ToolCheckpointHook = Callable[[Literal["awaiting_approval", "executing"]], None]
-_DEFAULT_TIMEOUT: float = 120.0
 _MAX_RETRIES: int = 2
 _RETRY_BASE_S: float = 2.0
 _RETRYABLE = frozenset({"runtime_error", "rate_limited"})
@@ -82,7 +81,7 @@ async def invoke_tool(
     tool_call: ToolCallBlock,
     bus: EventBus,
     run_id: str,
-    timeout: float = _DEFAULT_TIMEOUT,
+    timeout: float | None = None,
     *,
     permission_manager: PermissionManager | None = None,
     session_id: str = "",
@@ -119,6 +118,8 @@ async def invoke_tool(
                 error_type="runtime_error",
             )
         )
+    # 调用者显式超时优先；搜索首次下载允许更长等待，整轮时间预算仍由外层约束。
+    timeout = tool.timeout_s if timeout is None else timeout
     if tool.params_model is not None:
         try:
             tool.params_model.model_validate(dict(tool_call.input))

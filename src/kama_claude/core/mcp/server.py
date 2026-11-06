@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
-from kama_claude.core.config import McpServerConfig
+from kama_claude.core.config import McpServerConfig, ToolSearchConfig
+from kama_claude.core.discovery.model import CatalogTool, server_identity
+from kama_claude.core.discovery.retrieval import ToolRetriever
+from kama_claude.core.discovery.store import CatalogError, CatalogStore
 from kama_claude.core.mcp.client import McpClient
 from kama_claude.core.mcp.tool import McpTool
 from kama_claude.core.tools.registry import ToolRegistry
@@ -13,23 +17,40 @@ log = logging.getLogger(__name__)
 # 管理所有 MCP server 连接的生命周期：启动、工具发现、注册、关闭
 class McpServerManager:
     # 只缓存成功连接及其工具，不保留启动失败的半成品
-    def __init__(self) -> None:
+    def __init__(self, config: ToolSearchConfig | None = None) -> None:
         self._clients: dict[str, McpClient] = {}
         self._tools: list[McpTool] = []
+        self.config = config or ToolSearchConfig()
+        self.catalog = CatalogStore(Path(self.config.db_path))
+        self.retriever = ToolRetriever(self.catalog, self.config)
 
     # 依次连接每个 MCP server，发现工具后缓存供后续 registry 使用；失败时记录日志并跳过
     async def start_all(self, servers: list[McpServerConfig]) -> None:
         for cfg in servers:
             client: McpClient | None = None
             try:
+                # 重连先撤销旧连接；新列表完整提交之前不暴露半份工具。
+                old = self._clients.pop(cfg.name, None)
+                self._tools = [tool for tool in self._tools if tool.server_name != cfg.name]
+                if old is not None:
+                    await old.close()
                 client = await self._connect(cfg)
                 tool_defs = await client.list_tools()
-                for tool_def in tool_defs:
-                    self._tools.append(McpTool(client, cfg.name, tool_def))
+                identity = server_identity(cfg, str(Path.cwd().resolve()))
+                records = [CatalogTool.from_definition(identity, cfg.name, tool.definition())
+                           for tool in tool_defs]
+                existing = {tool.name for tool in self._tools}
+                if any(record.public_name in existing for record in records):
+                    raise CatalogError("MCP tool public names collide across servers")
+                changed = self.catalog.sync(identity, records)
+                self._tools.extend(
+                    McpTool(client, cfg.name, definition, record=record, catalog=self.catalog)
+                    for definition, record in zip(tool_defs, records, strict=True)
+                )
                 self._clients[cfg.name] = client
                 log.info(
-                    "mcp: server '%s' connected, %d tool(s) discovered",
-                    cfg.name, len(tool_defs),
+                    "mcp: server '%s' connected, %d tool(s) discovered, %d catalog changes",
+                    cfg.name, len(tool_defs), changed,
                 )
             except BaseException as exc:
                 if client is not None:

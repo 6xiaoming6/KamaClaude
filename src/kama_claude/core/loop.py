@@ -103,7 +103,7 @@ class AgentLoop:
             "When the goal is fully achieved, respond with a final answer "
             "and do not call any more tools."
         )
-        schemas = self._tools.registry.tool_schemas()
+        schemas = self._tools.model_schemas()
         # 请求前准备
         if not await self._context_manager.prepare(system, schemas):
             return False
@@ -134,13 +134,13 @@ class AgentLoop:
             self._save_checkpoint()
             return False
         # 保存放在模型异常捕获之外，磁盘错误必须直接上抛
-        self._record_response(response)
+        self._record_response(response, {str(schema["name"]) for schema in schemas})
         if run.max_total_tokens and run.actual_tokens + run.estimated_tokens > run.max_total_tokens:
             raise BudgetExceeded("run_token_budget_exceeded")
         return True
 
     # 保存完整模型消息与工具批次，并根据停止原因设置下一阶段
-    def _record_response(self, response: LlmResponse) -> None:
+    def _record_response(self, response: LlmResponse, exposed: set[str]) -> None:
         context = self._context
         run = context.run
         blocks = response.content_blocks()
@@ -150,7 +150,8 @@ class AgentLoop:
         run.context_pct = response.usage.context_pct if response.usage else 0.0
         # 先登记完整工具批次并保存，之后才真正执行工具
         run.tools = [
-            ToolCheckpoint(id=t.id, name=t.name, input=t.input) for t in response.tool_calls
+            ToolCheckpoint(id=t.id, name=t.name, input=t.input, exposed=t.name in exposed)
+            for t in response.tool_calls
         ]
         run.tool_index = 0
         if response.stop_reason == "end_turn":
