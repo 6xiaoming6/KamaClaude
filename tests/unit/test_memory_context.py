@@ -4,9 +4,10 @@ from pathlib import Path
 
 import pytest
 
+from kama_claude.core.checkpoint.checkpoint import RunCheckpoint
 from kama_claude.core.compact.estimator import estimate_bytes
 from kama_claude.core.config import MemoryConfig
-from kama_claude.core.memory.context import build_memory_context, compose_system
+from kama_claude.core.memory.context import build_memory_context, initialize_prompt
 from kama_claude.core.memory.model import MemoryError
 from tests.unit.test_memory_store import memory, put
 
@@ -22,11 +23,16 @@ def test_four_sources_and_lazy_details(tmp_path: Path) -> None:
     put(store, summary="TOPIC_SUMMARY", content="PRIVATE_TOPIC_DETAILS")
     snapshot = build_memory_context(store)
     assert all(text in snapshot.text for text in (
-        "GLOBAL_USER_RULE", "GLOBAL_AUTO_KNOWLEDGE", "PROJECT_USER_RULE", "TOPIC_SUMMARY",
+        "GLOBAL_AUTO_KNOWLEDGE", "TOPIC_SUMMARY",
     ))
     assert "PRIVATE_TOPIC_DETAILS" not in snapshot.text
-    assert len(snapshot.sources) == 4 and snapshot.estimated_tokens == estimate_bytes(snapshot.text)
-    assert compose_system("SKILL", snapshot).startswith("SKILL")
+    assert len(snapshot.sources) == 2 and snapshot.estimated_tokens == estimate_bytes(snapshot.text)
+    run = RunCheckpoint(run_id="r", goal="g", model="fake", workspace=str(tmp_path), max_steps=10)
+    initialize_prompt(run, store, "SKILL")
+    assert run.system_prompt.startswith("SKILL")
+    assert "GLOBAL_USER_RULE" in run.system_prompt and "PROJECT_USER_RULE" in run.system_prompt
+    assert "GLOBAL_AUTO_KNOWLEDGE" not in run.system_prompt
+    assert "PROJECT_USER_RULE" not in snapshot.text
     assert "PRIVATE_TOPIC_DETAILS" in store.read("testing")["content"]
 
 
@@ -37,8 +43,12 @@ def test_rules_are_not_truncated(tmp_path: Path) -> None:
     rule = "USER_CONSTRAINT " * 300
     (tmp_path / "AGENTS.md").write_text(rule, encoding="utf-8")
     snapshot = build_memory_context(store)
-    assert rule.rstrip() in snapshot.text
-    assert compose_system("BASE", snapshot) == compose_system("BASE", build_memory_context(store))
+    run = RunCheckpoint(run_id="r", goal="g", model="fake", workspace=str(tmp_path), max_steps=10)
+    initialize_prompt(run, store, "BASE")
+    assert rule.rstrip() in run.system_prompt and rule.rstrip() not in snapshot.text
+    saved = run.system_prompt
+    initialize_prompt(run, store, "BASE")
+    assert saved == run.system_prompt
 
 
 # 功能：旧三层文件不再读取，缺失入口不创建规则文件。
@@ -64,4 +74,7 @@ def test_load_errors_are_explicit(tmp_path: Path) -> None:
     auto.unlink()
     (store.home / "AGENTS.md").write_bytes(b"\xff")
     with pytest.raises(MemoryError, match="cannot read"):
-        build_memory_context(store)
+        initialize_prompt(
+            RunCheckpoint(run_id="r", goal="g", model="fake", workspace=str(tmp_path), max_steps=1),
+            store, "BASE",
+        )

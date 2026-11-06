@@ -115,8 +115,8 @@ class KamaTuiApp(App[None]):
                 if len(desc) > 60:
                     desc = desc[:57] + "..."
                 items.append((skill.name, desc))
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("cannot load global skills: %s", exc)
         return items
 
     # 根据 / 前缀查询字符串挂载、更新或移除自动补全弹窗

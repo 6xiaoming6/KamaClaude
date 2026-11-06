@@ -1,106 +1,131 @@
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
-from kama_claude.core.skills.loader import Skill, SkillLoader
+from kama_claude.core.compact.estimator import estimate_bytes
+from kama_claude.core.skills.loader import BODY_TOKENS, CATALOG_TOKENS, SkillLoader, render_catalog
+from kama_claude.core.skills.model import SkillError
 
 
-# 功能：内建 review skill 应能被 SkillLoader 查找到
-# 设计：直接调用 resolve("review")，不依赖文件系统之外的任何状态
-def test_builtin_skill_found() -> None:
+def write_skill(root: Path, name: str = "custom", body: str = "CUSTOM_WORKFLOW", **kwargs) -> Path:
+    path = root / name / "SKILL.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    description = kwargs.get("description", "Use this workflow for a custom task")
+    path.write_text(f"---\nname: {name}\ndescription: {description}\n---\n{body}\n", encoding="utf-8")
+    return path
+
+
+def test_examples_only_seed_global_directory_and_never_overwrite(tmp_path: Path) -> None:
     loader = SkillLoader()
-    skill = loader.resolve("review")
-    assert skill is not None
-    assert skill.name == "review"
-    assert "审查" in skill.description or "review" in skill.description.lower()
-    assert skill.system_prompt_template != ""
+    custom = write_skill(loader.root, "review", "MY_REVIEW")
+    assert loader.root == (Path.home() / ".kama" / "skills").resolve()
+    loader.ensure_examples()
+    assert loader.load("review").body == "MY_REVIEW"
+    assert {entry.name for entry in loader.list_all_skills()} == {"review", "init", "summarize", "orchestrate"}
+    before = custom.read_bytes()
+    loader.ensure_examples()
+    assert custom.read_bytes() == before
+    assert not list(loader.root.glob("*/.skill-*"))
 
 
-# 功能：内建 init / summarize / orchestrate skill 均可找到
-# 设计：列举所有内建 skill 名，断言均能解析
-@pytest.mark.parametrize("name", ["init", "review", "summarize", "orchestrate"])
-def test_all_builtin_skills_found(name: str) -> None:
+def test_concurrent_bootstrap_is_complete(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda _: SkillLoader(root).ensure_examples(), range(8)))
+    assert len(SkillLoader(root).list_all_skills()) == 4
+    assert not list(root.glob("*/.skill-*"))
+
+
+def test_project_and_flat_files_are_not_discovered(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     loader = SkillLoader()
-    skill = loader.resolve(name)
-    assert skill is not None, f"builtin skill '{name}' not found"
-
-
-# 功能：不存在的 skill 名应返回 None
-# 设计：查找一个不存在的名称，断言 resolve 返回 None 而非抛异常
-def test_unknown_skill_returns_none() -> None:
-    loader = SkillLoader()
-    result = loader.resolve("nonexistent_skill_xyz")
-    assert result is None
-
-
-# 功能：render_prompt 应将 $ARGUMENTS 替换为传入的参数字符串
-# 设计：构造含 $ARGUMENTS 的 skill，验证 render_prompt 结果不含 "$ARGUMENTS" 且含参数值
-def test_arguments_substituted() -> None:
-    loader = SkillLoader()
-    skill = Skill(
-        name="test",
-        description="test skill",
-        system_prompt_template="Review this: $ARGUMENTS\nPlease be thorough.",
-        allowed_tools=[],
-    )
-    rendered = loader.render_prompt(skill, "src/foo.py")
-    assert "$ARGUMENTS" not in rendered
-    assert "src/foo.py" in rendered
-
-
-# 功能：frontmatter 中的 allowed_tools 列表应被正确解析
-# 设计：构造含 allowed_tools 的 Markdown 文件，通过 _parse_skill_file 解析并验证结果
-def test_frontmatter_parsed(tmp_path: Path) -> None:
-    from kama_claude.core.skills.loader import _parse_skill_file
-
-    content = """\
----
-name: custom
-description: 自定义 skill 测试
-allowed_tools:
-  - read_file
-  - bash
----
-你是一个测试助手，目标：$ARGUMENTS
-"""
-    p = tmp_path / "custom.md"
-    p.write_text(content, encoding="utf-8")
-    skill = _parse_skill_file(p)
-    assert skill.name == "custom"
-    assert skill.description == "自定义 skill 测试"
-    assert "read_file" in skill.allowed_tools
-    assert "bash" in skill.allowed_tools
-    assert "$ARGUMENTS" in skill.system_prompt_template
-
-
-# 功能：无 frontmatter 的 Markdown 文件仍可加载，allowed_tools 为空列表
-# 设计：写入纯正文 Markdown，断言解析成功且 allowed_tools=[]
-def test_no_frontmatter(tmp_path: Path) -> None:
-    from kama_claude.core.skills.loader import _parse_skill_file
-
-    content = "你是助手，请帮助用户完成任务：$ARGUMENTS\n"
-    p = tmp_path / "plain.md"
-    p.write_text(content, encoding="utf-8")
-    skill = _parse_skill_file(p)
-    assert skill.name == "plain"
-    assert skill.allowed_tools == []
-    assert "你是助手" in skill.system_prompt_template
-
-
-# 功能：项目本地 skill 应覆盖内建同名 skill
-# 设计：在 .kama/skills/ 中写入同名文件，用 monkeypatch 修改 cwd，断言加载到的是本地版本
-def test_project_overrides_global(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    local_skills = tmp_path / ".kama" / "skills"
-    local_skills.mkdir(parents=True)
-    (local_skills / "review.md").write_text(
-        "---\nname: review\ndescription: local override\n---\nlocal system prompt $ARGUMENTS\n",
-        encoding="utf-8",
-    )
+    loader.ensure_examples()
+    (loader.root / "flat.md").write_text("not loaded", encoding="utf-8")
+    write_skill(tmp_path / ".kama" / "skills", "review", "PROJECT_OVERRIDE")
     monkeypatch.chdir(tmp_path)
-    loader = SkillLoader()
-    skill = loader.resolve("review")
-    assert skill is not None
-    assert skill.description == "local override"
-    assert "local system prompt" in skill.system_prompt_template
+    assert loader.load("review").body != "PROJECT_OVERRIDE"
+    assert "flat" not in {entry.name for entry in loader.list_all_skills()}
+
+
+@pytest.mark.parametrize("name", ["", "../review", "/review", "a/b", "a\\b", "Review", "--bad", "a" * 65])
+def test_invalid_names_are_rejected(tmp_path: Path, name: str) -> None:
+    with pytest.raises(SkillError, match="invalid skill name"):
+        SkillLoader(tmp_path).load(name)
+
+
+def test_missing_corrupt_and_migration_errors(tmp_path: Path) -> None:
+    loader = SkillLoader(tmp_path)
+    with pytest.raises(SkillError, match="cannot read"):
+        loader.load("missing")
+    path = write_skill(tmp_path)
+    for content, error in [
+        ("plain body", "frontmatter"),
+        ("---\nname: custom\ndescription: [\n---\nbody", "frontmatter"),
+        ("---\nname: other\ndescription: d\n---\nbody", "match directory"),
+        ("---\nname: custom\ndescription: d\nallowed_tools: []\n---\nbody", "migration"),
+        ("---\nname: custom\ndescription: d\n---\n$ARGUMENTS", "migration"),
+        ("---\nname: custom\ndescription: d\n---\n  ", "empty skill"),
+        ("---\nname: custom\ndescription: !!python/object/apply:os.system ['echo forbidden']\n---\nbody", "frontmatter"),
+    ]:
+        path.write_text(content, encoding="utf-8")
+        with pytest.raises(SkillError, match=error):
+            loader.load("custom")
+    path.write_bytes(b"\xff")
+    with pytest.raises(SkillError, match="cannot read"):
+        loader.load("custom")
+
+
+def test_multiline_yaml_and_budgets(tmp_path: Path) -> None:
+    loader = SkillLoader(tmp_path)
+    path = write_skill(tmp_path)
+    path.write_text("---\nname: custom\ndescription: >\n  Read and inspect\n  Python code\n---\nWORKFLOW", encoding="utf-8")
+    entries = loader.list_all_skills()
+    assert next(entry for entry in entries if entry.name == "custom").description == "Read and inspect Python code"
+    assert loader.load("custom").body == "WORKFLOW"
+    write_skill(tmp_path, body="x" * ((BODY_TOKENS + 1) * 4))
+    with pytest.raises(SkillError, match="split references"):
+        loader.load("custom")
+    write_skill(tmp_path, description="x" * (CATALOG_TOKENS * 4))
+    with pytest.raises(SkillError, match="catalog exceeds"):
+        loader.list_all_skills()
+    assert estimate_bytes(render_catalog(entries)) < CATALOG_TOKENS
+
+
+def test_directory_link_cannot_escape_root(tmp_path: Path) -> None:
+    from tests.unit.test_workspace import directory_link as link_directory
+    from tests.unit.test_workspace import unlink_directory
+
+    root, outside = tmp_path / "skills", tmp_path / "outside"
+    root.mkdir()
+    write_skill(outside, "custom")
+    link = root / "custom"
+    link_directory(link, outside / "custom")
+    try:
+        with pytest.raises(SkillError, match="escapes"):
+            SkillLoader(root).load("custom")
+        # 示例名称的链接同样不能被初始化写入。
+        examples = tmp_path / "examples"
+        examples.mkdir()
+        example_link = examples / "review"
+        link_directory(example_link, outside / "custom")
+        try:
+            with pytest.raises(SkillError, match="escapes"):
+                SkillLoader(examples).ensure_examples()
+        finally:
+            unlink_directory(example_link)
+    finally:
+        unlink_directory(link)
+    assert not os.path.exists(outside / "custom" / ".skill-tmp")
+
+
+def test_deleted_example_is_not_regenerated_after_first_initialization(tmp_path: Path) -> None:
+    loader = SkillLoader(tmp_path / "skills")
+    loader.ensure_examples()
+    (loader.root / "review" / "SKILL.md").unlink()
+    loader.ensure_examples()
+    assert "review" not in {entry.name for entry in loader.list_all_skills()}
+    with pytest.raises(SkillError, match="cannot read"):
+        loader.load("review")

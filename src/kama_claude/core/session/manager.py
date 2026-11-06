@@ -29,6 +29,7 @@ from kama_claude.core.runs import new_run_id
 from kama_claude.core.session.model import Session, SessionMode
 from kama_claude.core.session.store import SessionStore
 from kama_claude.core.skills.loader import SkillLoader
+from kama_claude.core.skills.model import SkillError
 
 if TYPE_CHECKING:
     from kama_claude.core.llm.base import LLMProvider
@@ -122,22 +123,19 @@ class SessionManager:
                 raise HandlerError(RECOVERY_REQUIRED, "resume or abort the interrupted run first")
             was_waiting = session.status == "waiting_for_input"
             goal = content
-            system_prompt: str | None = None
-            tools: list[str] | None = None
             skill = None
             arguments = ""
 
-            # 如果检测到'/'开头，就说明指定了skill，就加载skill的内容
+            # 显式命令只选择流程，原始目标和基础 system 都保持不变。
             if content.startswith("/"):
                 parts = content[1:].split(None, 1)
                 if not parts:
                     raise HandlerError(-32602, "skill name is empty")
                 arguments = parts[1] if len(parts) > 1 else ""
-                skill = self._skill_loader.resolve(parts[0])
-                if skill is not None:
-                    goal = self._skill_loader.render_prompt(skill, arguments)
-                    system_prompt = goal
-                    tools = skill.allowed_tools or None
+                try:
+                    skill = self._skill_loader.load(parts[0])
+                except SkillError as exc:
+                    raise HandlerError(-32602, str(exc)) from exc
             cp.messages.append({"role": "user", "content": content})
 
             # session准备好了，状态设为active
@@ -152,9 +150,10 @@ class SessionManager:
             # 保存初始检查点，记录初始信息
             try:
                 runner.prepare_checkpoint(
-                    cp, session, goal, run_id, system_prompt, tools, self._store,
+                    cp, session, goal, run_id,
+                    system_prompt=None, tools=None, store=self._store, skill=skill,
                 )
-            except MemoryError as exc:
+            except (MemoryError, SkillError) as exc:
                 # 规则加载失败发生在任务登记前，回到磁盘中的原会话状态。
                 self._sessions[sid] = Session.from_dict(cp.session)
                 raise HandlerError(-32040, str(exc)) from exc
@@ -163,7 +162,6 @@ class SessionManager:
                 sid, run_id,
                 self._run_session(
                     sid, goal, run_id, runner=runner,
-                    system_prompt=system_prompt, tools=tools,
                 ),
             )
         if was_waiting:
@@ -196,8 +194,6 @@ class SessionManager:
         run_id: str,
         *,
         checkpoint: Checkpoint | None = None,
-        system_prompt: str | None = None,
-        tools: list[str] | None = None,
         runner: AgentRunner | None = None,
     ) -> str:
         # 获得该会话的锁
@@ -210,8 +206,6 @@ class SessionManager:
                 run_id=run_id,
                 session=session,
                 store=self._store,
-                system_prompt_override=system_prompt,
-                tool_whitelist=tools,
                 checkpoint=checkpoint,
             )
             # Runner 已提交 Run 和会话终态
@@ -369,7 +363,7 @@ class SessionManager:
                 memory_config=self._memory,
             )
 
-    # 仅在程序层不足时取得摘要 Provider，已有实例继续复用
+    # 仅在达到阈值、确实需要摘要时取得 Provider。
     def _get_compaction_provider(self) -> LLMProvider:
         if self._provider is None and self._provider_factory is not None:
             self._provider = self._provider_factory()

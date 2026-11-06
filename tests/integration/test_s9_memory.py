@@ -28,8 +28,8 @@ async def test_frozen_rules_and_removed_rpc_after_restart(tmp_path: Path, free_p
         ))
         await wait_file(tmp_path / "b-started")
         store = SessionStore(tmp_path / "sessions")
-        original = store.checkpoints.load(sid).run.memory_snapshot
-        assert "ORIGINAL_GLOBAL_RULE" in original.text
+        original = store.checkpoints.load(sid).run.system_prompt
+        assert "ORIGINAL_GLOBAL_RULE" in original
         daemon.kill()
         with pytest.raises(ConnectionError):
             await asyncio.wait_for(waiter, 3)
@@ -43,7 +43,7 @@ async def test_frozen_rules_and_removed_rpc_after_restart(tmp_path: Path, free_p
         with pytest.raises(IpcError) as error:
             await client.send_command("memory.inspect", {"session_id": sid})
         assert error.value.code == -32601
-        assert store.checkpoints.load(sid).run.memory_snapshot == original
+        assert store.checkpoints.load(sid).run.system_prompt == original
         assert path.read_bytes() == before and (tmp_path / "effects.txt").read_bytes() == effects
     finally:
         if waiter is not None and not waiter.done():

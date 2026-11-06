@@ -11,7 +11,9 @@ from kama_claude.core.bus.events import (
 )
 from kama_claude.core.checkpoint.checkpoint import CheckpointError, ToolCheckpoint
 from kama_claude.core.compact.manager import ContextManager
+from kama_claude.core.compact.request import assemble_messages
 from kama_claude.core.context import ExecutionContext
+from kama_claude.core.discovery.exposure import callable_names
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.base import LLMProvider
 from kama_claude.core.llm.types import LlmResponse
@@ -107,11 +109,14 @@ class AgentLoop:
         # 请求前准备
         if not await self._context_manager.prepare(system, schemas):
             return False
-        # 压缩可能刷新规则和索引，模型必须使用刚提交的完整提示。
+        # 规则 system 冻结；自动记忆由统一请求投影注入。
         system = run.system_prompt or system
+        exposed = callable_names(run, context.messages) if run.schemas_frozen else {
+            str(schema["name"]) for schema in schemas
+        }
         try:
             response = await self._provider.chat(
-                messages=context.messages,
+                messages=assemble_messages(run, context.messages),
                 tool_schemas=schemas,
                 bus=self._bus,
                 run_id=run.run_id,
@@ -134,7 +139,7 @@ class AgentLoop:
             self._save_checkpoint()
             return False
         # 保存放在模型异常捕获之外，磁盘错误必须直接上抛
-        self._record_response(response, {str(schema["name"]) for schema in schemas})
+        self._record_response(response, exposed)
         if run.max_total_tokens and run.actual_tokens + run.estimated_tokens > run.max_total_tokens:
             raise BudgetExceeded("run_token_budget_exceeded")
         return True
@@ -150,7 +155,10 @@ class AgentLoop:
         run.context_pct = response.usage.context_pct if response.usage else 0.0
         # 先登记完整工具批次并保存，之后才真正执行工具
         run.tools = [
-            ToolCheckpoint(id=t.id, name=t.name, input=t.input, exposed=t.name in exposed)
+            ToolCheckpoint(
+                id=t.id, name=t.name, input=t.input, exposed=t.name in exposed,
+                output_prepared=False,
+            )
             for t in response.tool_calls
         ]
         run.tool_index = 0

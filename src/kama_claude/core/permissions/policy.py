@@ -38,6 +38,7 @@ DEFAULT_POLICIES: dict[str, ToolPolicy] = {
     "memory_read": ToolPolicy(default=PermissionDecision.ALLOW),
     "memory_write": ToolPolicy(default=PermissionDecision.ALLOW),
     "search_tool": ToolPolicy(default=PermissionDecision.ALLOW),
+    "load_skill": ToolPolicy(default=PermissionDecision.ALLOW),
 }
 
 # 未在 DEFAULT_POLICIES 中登记的工具的兜底策略，总是询问用户是否执行
@@ -55,6 +56,7 @@ _PREVIEW_KEY: dict[str, str] = {
     "memory_read": "key",
     "memory_write": "key",
     "search_tool": "description",
+    "load_skill": "name",
 }
 _PREVIEW_MAX = 60
 

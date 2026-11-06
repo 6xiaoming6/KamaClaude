@@ -1,16 +1,10 @@
 ---
 name: review
 description: 对指定路径做代码审查，输出严重/建议/可选三级分类
-allowed_tools:
-  - read_file
-  - list_dir
-  - find_files
-  - search_text
-  - bash
 ---
 你是一位严格的代码审查员。请对以下目标路径进行全面的代码审查：
 
-$ARGUMENTS
+任务范围以当前用户消息为准。
 
 审查维度：
 - 正确性：逻辑错误、边界条件、异常处理

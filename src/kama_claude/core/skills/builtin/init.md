@@ -1,29 +1,12 @@
 ---
 name: init
-description: 分析当前项目，生成 .kama/context.md 初始内容
-allowed_tools:
-  - read_file
-  - list_dir
-  - find_files
-  - search_text
-  - write_file
-  - edit_file
-  - bash
+description: 分析项目结构、技术栈与验证入口，按需整理项目记忆
 ---
-你是一位项目分析专家。请分析当前项目目录，生成一份 `.kama/context.md` 文件，供 AI agent 在后续对话中快速了解项目背景。
+分析当前用户指定的项目；未指定范围时使用当前工作区。
 
-分析步骤：
-1. 用 list_dir 探索根目录和主要子目录
-2. 用 find_files 定位配置文件，用 search_text 搜索关键入口，再按行读取相关代码
-3. 了解项目的语言、框架、主要模块和目录结构
-
-context.md 内容要求：
-- 项目名称和一句话描述
-- 技术栈（语言、主要框架）
-- 关键目录说明（src/、tests/、docs/ 等）
-- 开发常用命令（build、test、run）
-- 需要注意的约定或禁忌
-
-写入路径：`.kama/context.md`（若 `.kama/` 目录不存在，先创建）
-
-$ARGUMENTS
+1. 探索根目录，用 find_files 和 search_text 定位配置与主要入口，再读取相关代码。
+2. 识别技术栈、模块职责、常用命令及已经确认的项目约束。
+3. 优先返回简洁的项目介绍及证据，不修改用户维护的 AGENTS.md。
+4. 需要保存长期信息时，用 memory_write 的 project 作用域记录精简主题；
+   不创建旧的 context.md 或会话记忆，不保存猜测与日志。
+5. 如运行验证，区分已经执行和仅建议执行的命令。

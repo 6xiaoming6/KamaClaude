@@ -368,7 +368,6 @@ async def test_compacted_snapshot_survives_restart(
     def factory() -> AgentRunner:
         runner = original_factory()
         runner._config.compaction.auto_threshold = 0.1
-        runner._config.compaction.prune_target_ratio = 0.05
         return runner
 
     mgr._runner_factory = factory
@@ -633,19 +632,20 @@ async def test_resume_uses_frozen_system_prompt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = SessionStore(tmp_path)
-    monkeypatch.setattr("kama_claude.core.runner.build_memory_context", lambda *a, **k: MemorySnapshot(text="original memory"))
+    monkeypatch.setattr("kama_claude.core.memory.context.build_memory_context", lambda *a, **k: MemorySnapshot(text="original memory"))
     provider = Provider([Crash(), LlmResponse("end_turn", text="done")])
     mgr = manager(store, provider, [])
     session = await mgr.create("chat")
     with pytest.raises(Crash):
         await mgr.send_message(session.id, "goal")
-    monkeypatch.setattr("kama_claude.core.runner.build_memory_context", lambda *a, **k: MemorySnapshot(text="changed memory"))
+    monkeypatch.setattr("kama_claude.core.memory.context.build_memory_context", lambda *a, **k: MemorySnapshot(text="changed memory"))
     restored = manager(store, provider, [])
     opened = await restored.open(session.id)
     await restored.resume(session.id, opened["revision"])
     await finish(restored, session.id)
     assert provider.calls[0]["system"] == provider.calls[1]["system"]
-    assert "original memory" in provider.calls[1]["system"]
+    assert "original memory" in json.dumps(provider.calls[1]["messages"])
+    assert "changed memory" not in json.dumps(provider.calls[1]["messages"])
 
 
 # 功能：验证旧会话首次打开可导入历史，并以检查点作为后续权威状态

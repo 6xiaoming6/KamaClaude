@@ -197,9 +197,14 @@ def _apply_compaction(config: KamaConfig, value: Any) -> None:
         raise SystemExit("Config error: [compaction] must be a table")
     positive_keys = {
         "tool_result_limit", "tool_result_keep", "context_window_tokens",
-        "output_reserve_tokens", "keep_recent_groups", "summary_max_tokens",
+        "output_reserve_tokens", "keep_recent_turns", "recent_token_budget", "summary_max_tokens",
     }
-    unknown_comp = set(comp) - {"auto_threshold", "prune_target_ratio", *positive_keys}
+    if {"prune_target_ratio", "keep_recent_groups"} & set(comp):
+        raise SystemExit(
+            "Config migration: remove prune_target_ratio; replace keep_recent_groups with "
+            "keep_recent_turns and recent_token_budget"
+        )
+    unknown_comp = set(comp) - {"auto_threshold", *positive_keys}
     if unknown_comp:
         raise SystemExit(f"Unknown [compaction] keys: {', '.join(sorted(unknown_comp))}")
     if "auto_threshold" in comp:
@@ -207,11 +212,6 @@ def _apply_compaction(config: KamaConfig, value: Any) -> None:
         if not isinstance(val, (int, float)) or not (0.0 <= val <= 1.0):
             raise SystemExit("Config error: compaction.auto_threshold must be between 0 and 1")
         config.compaction.auto_threshold = float(val)
-    if "prune_target_ratio" in comp:
-        val = comp["prune_target_ratio"]
-        if type(val) not in (int, float) or not 0 < val < 1:
-            raise SystemExit("Config error: prune_target_ratio must be between 0 and 1")
-        config.compaction.prune_target_ratio = float(val)
     for key in positive_keys:
         if key in comp:
             val = comp[key]

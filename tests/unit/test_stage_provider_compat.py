@@ -35,7 +35,7 @@ async def test_manual_compaction_creates_provider_on_demand(tmp_path: Path) -> N
         store, Mock(), EventBus(), provider_factory=factory,
         compaction=CompactionConfig(
             context_window_tokens=8_192, output_reserve_tokens=512,
-            auto_threshold=0.1, prune_target_ratio=0.05, summary_max_tokens=256,
+            auto_threshold=0.1, summary_max_tokens=256,
         ),
     )
     session = await manager.create("chat")
@@ -56,7 +56,7 @@ async def test_manual_compaction_creates_provider_on_demand(tmp_path: Path) -> N
         for message in (await manager.open(session.id))["messages"]
     ] == history()
     assert not list(store.session_dir(session.id).glob("thread_*.jsonl.bak"))
-    assert "项目约定" in provider.chat.call_args.kwargs["messages"][0]["content"]
+    assert "项目约定" in provider.chat.call_args.kwargs["messages"][-1]["content"]
 
     second_session = await manager.create("chat")
     for message in history():

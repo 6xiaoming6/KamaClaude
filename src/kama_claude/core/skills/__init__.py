@@ -1,3 +1,1 @@
-from kama_claude.core.skills.loader import Skill, SkillLoader
-
-__all__ = ["Skill", "SkillLoader"]
+"""全局 Skill 目录、加载工具与活动说明快照。"""

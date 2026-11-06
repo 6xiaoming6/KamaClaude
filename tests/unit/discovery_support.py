@@ -4,6 +4,7 @@ from copy import deepcopy
 from unittest.mock import AsyncMock
 
 from kama_claude.core.discovery.model import CatalogTool
+from kama_claude.core.llm.provider import DeepseekProvider
 from kama_claude.core.mcp.client import McpClient, McpToolDef
 
 
@@ -72,3 +73,14 @@ class ScriptedProvider:
         if isinstance(response, BaseException):
             raise response
         return response
+
+
+class NativeScriptedProvider(DeepseekProvider):
+    # 保留真实 Provider 身份，仅替换模型推理；序列化另由真实 SDK 测试覆盖。
+    def __init__(self, responses):
+        super().__init__("test-model", client=object())
+        self.script = ScriptedProvider(responses)
+        self.requests = self.script.requests
+
+    async def chat(self, *args, **kwargs):
+        return await self.script.chat(*args, **kwargs)

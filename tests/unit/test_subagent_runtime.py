@@ -466,7 +466,7 @@ async def test_child_summary_is_managed_and_charged(tmp_path: Path) -> None:
     ])
     outcome = await background_result(spawn_tool(tmp_path, model, compaction=CompactionConfig(
         context_window_tokens=12_000, output_reserve_tokens=512, summary_max_tokens=128,
-        keep_recent_groups=1, auto_threshold=0.5,
+        keep_recent_turns=1, recent_token_budget=2_000, auto_threshold=0.5,
     )))
     summaries = [call for call in model.calls if call["run_id"] == "compact"]
     assert outcome.status == "success" and summaries

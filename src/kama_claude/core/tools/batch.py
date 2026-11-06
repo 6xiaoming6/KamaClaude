@@ -5,8 +5,11 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+from kama_claude.core.checkpoint.checkpoint import ToolCheckpoint
+from kama_claude.core.compact.output import ToolOutputPreparer
+from kama_claude.core.config import CompactionConfig
 from kama_claude.core.context import ExecutionContext
-from kama_claude.core.discovery.exposure import visible_schemas
+from kama_claude.core.discovery.exposure import callable_names, request_schemas
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import ToolCallBlock
 from kama_claude.core.run_budget import BudgetExceeded, RunBudget
@@ -32,6 +35,7 @@ class ToolBatchExecutor:
         persistence: RunPersistence | None = None,
         session_id: str = "",
         subagents: SubagentTracker | None = None,
+        output_preparer: ToolOutputPreparer | None = None,
     ) -> None:
         self._context = context
         self.registry = registry
@@ -41,17 +45,24 @@ class ToolBatchExecutor:
         self._persistence = persistence
         self._session_id = session_id
         self._subagents = subagents
+        self._outputs = output_preparer or ToolOutputPreparer(CompactionConfig(), None)
 
     # 预算检查、压缩与真实请求共用同一份可见定义。
     def model_schemas(self) -> list[dict[str, object]]:
         if self._context.run.schemas_frozen:
-            return visible_schemas(self._context.run)
+            return request_schemas(self._context.run)
         return self.registry.tool_schemas()
 
     # 从游标继续执行，结果、历史和游标都在这里按顺序处理
     async def run_pending(self) -> bool:
         context = self._context
         run = context.run
+        # 已保存结果但归档未完成：只重试整理，不再次执行有副作用的工具。
+        for completed in run.tools[:run.tool_index]:
+            if not self._prepare_output(completed):
+                return False
+        if run.repeat_failure_limit and run.repeated_failures >= run.repeat_failure_limit:
+            raise BudgetExceeded("repeated_tool_failure")
         # 开始按上次记录的顺序执行工具
         while run.tool_index < len(run.tools):
             self._budget.check()
@@ -68,7 +79,7 @@ class ToolBatchExecutor:
             tool_call = ToolCallBlock(tool.id, tool.name, tool.input)
             started_at = time.monotonic()
             attempts_before = tool.attempts
-            visible = {str(schema["name"]) for schema in self.model_schemas()}
+            visible = callable_names(run, context.messages)
             if not tool.exposed or (
                 tool.name in run.mcp_tool_names and tool.name not in visible
             ):
@@ -92,13 +103,16 @@ class ToolBatchExecutor:
 
             repeated = self._budget.record_tool_result(tool.name, tool.input, result)
             tool.result = asdict(result)
+            tool.output_prepared = False  # 本次新结果必须整理，不能继承旧快照的默认标记。
             if result.outcome_unknown:
                 # 结果未知时保留当前位置，等待用户核实后决定
                 tool.status = "unknown"
                 context.mark_interrupted("unknown_tool_result")
             else:
                 tool.status = "completed"
-                block = context.add_tool_result(tool.id, result.content, is_error=result.is_error)
+                block = context.add_tool_result(
+                    tool.id, result.message_content(), is_error=result.is_error,
+                )
                 if self._persistence is not None:
                     # 逐工具记录完整结果，之后的裁剪或摘要只改变工作历史
                     self._persistence.record_message("user", [block])
@@ -108,6 +122,8 @@ class ToolBatchExecutor:
             if self._subagents is not None:
                 self._subagents.record_result(tool, result)
             self._save_checkpoint()
+            if tool.status == "completed" and not self._prepare_output(tool):
+                return False
             await publish_tool_result(
                 self._bus,
                 run.run_id,
@@ -122,6 +138,30 @@ class ToolBatchExecutor:
                 return False
         self._finish_tool_batch()
         return True
+
+    def _prepare_output(self, tool: ToolCheckpoint) -> bool:
+        if tool.output_prepared:
+            return True
+        if tool.result is None:
+            raise ValueError("completed tool has no result")
+        try:
+            preview = self._outputs.prepare(tool.id, ToolResult(**tool.result))
+        except OSError as exc:
+            self._context.mark_interrupted(f"tool_output_preparation_failed: {exc}")
+            self._save_checkpoint()
+            return False
+        # 全文已随结果与完整历史提交；这里只替换模型工作历史中的那一块。
+        for message in reversed(self._context.messages):
+            content = message.get("content")
+            if message.get("role") != "user" or not isinstance(content, list):
+                continue
+            for block in content:
+                if block.get("type") == "tool_result" and block.get("tool_use_id") == tool.id:
+                    block["content"] = preview
+                    tool.output_prepared = True
+                    self._save_checkpoint()
+                    return True
+        raise ValueError(f"completed tool result missing from working history: {tool.id}")
 
     # 只保存审批前和执行前的状态，不处理结果、消息或游标
     def _save_tool_phase(self, phase: Literal["awaiting_approval", "executing"]) -> None:
@@ -162,6 +202,7 @@ class ToolBatchExecutor:
                 )
                 tool.result = asdict(result)
                 tool.status = "completed"
+                tool.output_prepared = True
                 block = context.add_tool_result(tool.id, result.content, is_error=True)
                 if self._persistence is not None:
                     self._persistence.record_message("user", [block])

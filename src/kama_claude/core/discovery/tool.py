@@ -61,4 +61,6 @@ class SearchTool(BaseTool):
                 else "Tools are available on the next model turn." if selected
                 else "No matching tools; try a more specific capability or server name."
             ),
-        }, ensure_ascii=False))
+        }, ensure_ascii=False), tool_references=(
+            selected if self._run.tool_loading_mode == "deferred" else []
+        ))

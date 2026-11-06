@@ -27,3 +27,31 @@ async def test_search_result_can_be_viewed_in_tui(monkeypatch):
         detail = str(block.query_one(".detail", Static).render())
         assert "Find addition tool" in summary
         assert "keyword_only" in detail and "remote__add" in detail and "remote__large" in detail
+
+
+# 打开历史会话时结构化引用不显示成 Python 列表，仍能展开查看搜索说明。
+async def test_native_search_history_remains_readable(monkeypatch):
+    from kama_claude.core.tools.base import ToolResult
+
+    monkeypatch.setattr(KamaTuiApp, "_socket_loop", idle_socket)
+    app = KamaTuiApp("127.0.0.1", 1)
+    output = json.dumps({"method": "hybrid", "loaded": ["remote__add"]})
+    messages = [
+        {"role": "assistant", "run_id": "run-native", "content": [
+            {"type": "tool_use", "id": "search", "name": "search_tool",
+             "input": {"description": "Find addition tool"}},
+        ]},
+        {"role": "user", "run_id": "run-native", "content": [
+            {"type": "tool_result", "tool_use_id": "search",
+             "content": ToolResult(output, tool_references=["remote__add"]).message_content()},
+        ]},
+    ]
+    async with app.run_test(size=(110, 40)) as pilot:
+        app._view.render_history(messages)
+        await pilot.pause()
+        block = app._view.query_one(ToolCallBlock)
+        block.on_click()
+        await pilot.pause()
+        detail = str(block.query_one(".detail", Static).render())
+        assert "hybrid" in detail and "remote__add" in detail
+        assert "tool_reference" not in detail and "'type':" not in detail

@@ -1,133 +1,142 @@
 from __future__ import annotations
 
+import hashlib
+import os
 import re
-from dataclasses import dataclass, field
+import tempfile
 from pathlib import Path
 
+import yaml
+from pydantic import ValidationError
 
-@dataclass
-class Skill:
-    name: str
-    description: str
-    system_prompt_template: str
-    allowed_tools: list[str] = field(default_factory=list)
+from kama_claude.core.compact.estimator import estimate_bytes
+from kama_claude.core.skills.model import NAME_PATTERN, SkillEntry, SkillError, SkillSnapshot
 
-
-_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+CATALOG_TOKENS = 2_048
+BODY_TOKENS = 4_000
 
 
-# 解析 Markdown skill 文件，提取 frontmatter 和正文 system prompt
-def _parse_skill_file(path: Path) -> Skill:
-    text = path.read_text(encoding="utf-8")
-    name = path.stem
-    description = ""
-    allowed_tools: list[str] = []
-    body = text
-
-    m = _FRONTMATTER_RE.match(text)
-    if m:
-        front = m.group(1)
-        body = text[m.end():]
-        lines = front.splitlines()
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            stripped = line.strip()
-            if stripped.startswith("name:"):
-                name = stripped[len("name:"):].strip().strip('"').strip("'")
-            elif stripped.startswith("description:"):
-                val = stripped[len("description:"):].strip().strip('"').strip("'")
-                # YAML 块标量：> (折叠) 或 | (保留换行)，后续缩进行是内容
-                if val in (">", "|"):
-                    fold = val == ">"
-                    parts: list[str] = []
-                    i += 1
-                    while i < len(lines) and (lines[i].startswith(" ") or lines[i].startswith("\t")):
-                        parts.append(lines[i].strip())
-                        i += 1
-                    description = (" ".join(parts) if fold else "\n".join(parts)).strip()
-                    continue
-                else:
-                    description = val
-            elif stripped.startswith("allowed_tools:"):
-                pass
-            elif stripped.startswith("- "):
-                allowed_tools.append(stripped[2:].strip())
-            i += 1
-
-    return Skill(
-        name=name,
-        description=description,
-        system_prompt_template=body.strip(),
-        allowed_tools=allowed_tools,
-    )
+def _resolved(path: Path) -> Path:
+    resolved = str(path.resolve())
+    # Windows 并发创建文件时 resolve 可能保留长路径前缀；比较前统一表示。
+    if os.name == "nt":
+        if resolved.startswith("\\\\?\\UNC\\"):
+            resolved = "\\\\" + resolved[8:]
+        elif resolved.startswith("\\\\?\\") and resolved[5:7] == ":\\":
+            resolved = resolved[4:]
+    return Path(resolved)
 
 
-# 按三级优先级（项目本地 > 用户全局 > 内建）查找并解析 skill
 class SkillLoader:
-    _BUILTIN_DIR = Path(__file__).parent / "builtin"
+    # 运行时唯一目录；包内文件只作为首次补齐的示例源。
+    def __init__(self, root: Path | None = None) -> None:
+        self.root = _resolved((root or Path.home() / ".kama" / "skills").expanduser())
 
-    # 按优先级查找 skill 文件；未找到返回 None
-    def resolve(self, name: str) -> Skill | None:
-        for path in self._search_paths(name):
-            if path.exists():
+    def _path(self, name: str) -> Path:
+        if len(name) > 64 or re.fullmatch(NAME_PATTERN, name) is None:
+            raise SkillError("invalid skill name: use 1-64 lowercase letters, digits and hyphens")
+        try:
+            path = _resolved(self.root / name / "SKILL.md")
+            if not path.is_relative_to(self.root):
+                raise SkillError(f"skill path escapes global skills directory: {name}")
+            return path
+        except (OSError, RuntimeError) as exc:
+            raise SkillError(f"cannot resolve skill {name}: {exc}") from exc
+
+    def ensure_examples(self) -> None:
+        marker = self.root / ".examples-initialized"
+        if os.path.lexists(marker):
+            return
+        # 先写完整临时文件，再以硬链接原子创建目标；并发初始化也不会覆盖用户内容。
+        for source in sorted((Path(__file__).parent / "builtin").glob("*.md")):
+            target = self._path(source.stem)
+            if os.path.lexists(target):
+                continue
+            temporary: str | None = None
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", newline="", dir=target.parent,
+                    prefix=".skill-", delete=False,
+                ) as file:
+                    temporary = file.name
+                    file.write(source.read_text(encoding="utf-8"))
+                    file.flush()
+                    os.fsync(file.fileno())
                 try:
-                    return _parse_skill_file(path)
-                except Exception:
-                    return None
-        return None
+                    os.link(temporary, target)
+                except FileExistsError:
+                    pass
+            except (OSError, UnicodeError) as exc:
+                raise SkillError(f"cannot initialize skill example {source.stem}: {exc}") from exc
+            finally:
+                if temporary is not None:
+                    Path(temporary).unlink(missing_ok=True)
 
-    # 返回候选路径列表，同时支持扁平文件（name.md）和目录式（name/SKILL.md）两种格式
-    def _search_paths(self, name: str) -> list[Path]:
-        dirs = [
-            Path(".kama/skills"),
-            Path("~/.kama/skills").expanduser(),
-            self._BUILTIN_DIR,
-        ]
-        paths: list[Path] = []
-        for d in dirs:
-            paths.append(d / f"{name}.md")
-            paths.append(d / name / "SKILL.md")
-        return paths
+        # 只在首次使用补齐。用户后来删除某个示例时，不再反复生成它。
+        try:
+            with marker.open("x", encoding="utf-8"):
+                pass
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise SkillError(f"cannot record skill initialization: {exc}") from exc
 
-    # 列出所有可用 skill 名称（内建 + 用户全局 + 项目本地，去重后以项目本地覆盖为准）
-    def list_all(self) -> list[str]:
-        seen: dict[str, None] = {}
-        for d in [
-            self._BUILTIN_DIR,
-            Path("~/.kama/skills").expanduser(),
-            Path(".kama/skills"),
-        ]:
-            if d.exists():
-                for f in sorted(d.glob("*.md")):
-                    seen[f.stem] = None
-                for f in sorted(d.glob("*/SKILL.md")):
-                    seen[f.parent.name] = None
-        return list(seen)
+    def _read(self, name: str) -> tuple[SkillEntry, SkillSnapshot]:
+        path = self._path(name)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise SkillError(f"cannot read skill {name}: {exc}") from exc
+        lines = text.splitlines()
+        if not lines or lines[0].strip() != "---":
+            raise SkillError(f"skill {name} requires YAML name and description frontmatter")
+        try:
+            end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
+            metadata = yaml.safe_load("\n".join(lines[1:end]))
+            if isinstance(metadata, dict) and {"allowed_tools", "allowed-tools"} & metadata.keys():
+                raise SkillError(
+                    "Skill migration: remove allowed_tools; skills no longer change permissions"
+                )
+            entry = SkillEntry.model_validate(metadata)
+        except (StopIteration, yaml.YAMLError, ValidationError) as exc:
+            raise SkillError(f"invalid skill frontmatter for {name}: {exc}") from exc
+        if not entry.description.strip():
+            raise SkillError(f"empty skill description: {name}")
+        if entry.name != name:
+            raise SkillError(f"skill name must match directory: {name}")
+        body = "\n".join(lines[end + 1:]).strip()
+        if "$ARGUMENTS" in body:
+            raise SkillError("Skill migration: remove $ARGUMENTS; use the current user request")
+        if not body:
+            raise SkillError(f"empty skill body: {name}")
+        if estimate_bytes(body) > BODY_TOKENS:
+            raise SkillError(
+                f"skill {name} exceeds {BODY_TOKENS} estimated tokens; split references"
+            )
+        return entry, SkillSnapshot(
+            name=name, body=body, directory=str(path.parent),
+            digest=hashlib.sha256(body.encode("utf-8")).hexdigest(),
+        )
 
-    # 列出所有可用 Skill 对象（含描述），项目本地覆盖同名内建
-    def list_all_skills(self) -> list[Skill]:
-        seen: dict[str, Skill] = {}
-        for d in [
-            self._BUILTIN_DIR,
-            Path("~/.kama/skills").expanduser(),
-            Path(".kama/skills"),
-        ]:
-            if d.exists():
-                for f in sorted(d.glob("*.md")):
-                    try:
-                        skill = _parse_skill_file(f)
-                        seen[skill.name] = skill
-                    except Exception:
-                        pass
-                for f in sorted(d.glob("*/SKILL.md")):
-                    try:
-                        skill = _parse_skill_file(f)
-                        seen[skill.name] = skill
-                    except Exception:
-                        pass
-        return list(seen.values())
+    def list_all_skills(self) -> list[SkillEntry]:
+        self.ensure_examples()
+        try:
+            names = sorted(path.name for path in self.root.iterdir()
+                           if (path / "SKILL.md").exists())
+        except OSError as exc:
+            raise SkillError(f"cannot list global skills: {exc}") from exc
+        entries = [self._read(name)[0] for name in names]
+        if estimate_bytes(render_catalog(entries)) > CATALOG_TOKENS:
+            raise SkillError(
+                f"skill catalog exceeds {CATALOG_TOKENS} estimated tokens; shorten descriptions"
+            )
+        return entries
 
-    # 将 $ARGUMENTS 替换为用户传入的参数字符串
-    def render_prompt(self, skill: Skill, arguments: str) -> str:
-        return skill.system_prompt_template.replace("$ARGUMENTS", arguments)
+    def load(self, name: str) -> SkillSnapshot:
+        self.ensure_examples()
+        return self._read(name)[1]
+
+
+def render_catalog(entries: list[SkillEntry]) -> str:
+    return "\n".join(f"- {entry.name}: {entry.description}" for entry in entries)

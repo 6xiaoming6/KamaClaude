@@ -10,6 +10,7 @@ from typing import Any, Literal, Self
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from kama_claude.core.memory.model import MemorySnapshot
+from kama_claude.core.skills.model import SkillEntry, SkillSnapshot
 
 
 class CheckpointError(RuntimeError):
@@ -33,6 +34,7 @@ class ToolCheckpoint(BaseModel):
     status: Literal["pending", "awaiting_approval", "executing", "unknown", "completed"] = "pending"
     result: dict[str, Any] | None = None
     attempts: int = 0
+    output_prepared: bool = True  # 旧快照已在历史中；新调用显式设为 False。
     exposed: bool = True  # 回复产生时是否展示过此工具，防止同批先搜索再越过加载步骤。
 
 # 一次 Run 的检查点：目标、当前步骤和状态
@@ -44,16 +46,19 @@ class RunCheckpoint(BaseModel):
     provider: str = "deepseek"
     workspace: str
     system_prompt: str = ""
-    # 与规则、记忆分开保存，压缩后可安全重建完整提示。
+    # 单独保存基础提示；本轮 system 冻结，摘要只刷新自动记忆快照。
     base_system_prompt: str = ""
+    prompt_layout: Literal["legacy", "stable_v1"] = "legacy"
     memory_project_root: str = ""
     # 仅记录本轮真正注入的内容，长期记忆仍以 Markdown 为准
     memory_snapshot: MemorySnapshot | None = None
+    skill_catalog: list[SkillEntry] | None = None  # None 是旧 Run，不在恢复中插入新工具。
+    active_skill: SkillSnapshot | None = None
     tool_whitelist: list[str] | None = None
     tool_schemas: list[dict[str, Any]] = Field(default_factory=list)
     schemas_frozen: bool = False
-    user_input: str = ""  # Skill 展开前的真实输入，工具检索不从 role=user 猜测。
-    tool_loading_mode: Literal["all", "on_demand"] = "all"
+    user_input: str = ""  # 真实用户原文，不从工具结果或补充上下文猜测。
+    tool_loading_mode: Literal["all", "on_demand", "deferred"] = "all"
     mcp_tool_names: list[str] = Field(default_factory=list)
     mcp_definition_hashes: dict[str, str] = Field(default_factory=dict)
     loaded_tool_names: list[str] = Field(default_factory=list)
@@ -82,7 +87,7 @@ class RunCheckpoint(BaseModel):
     @model_validator(mode="after")
     # 恢复时拒绝损坏的可见列表，不能静默删掉或加载冻结目录外工具。
     def validate_loaded_tools(self) -> Self:
-        if self.schemas_frozen and self.tool_loading_mode == "on_demand":
+        if self.schemas_frozen and self.tool_loading_mode in ("on_demand", "deferred"):
             names = {str(schema["name"]) for schema in self.tool_schemas}
             if len(set(self.loaded_tool_names)) != len(self.loaded_tool_names):
                 raise ValueError("duplicate loaded tool names")

@@ -6,13 +6,14 @@ from typing import TYPE_CHECKING
 from kama_claude.core.compact.compactor import Compactor
 from kama_claude.core.compact.estimator import TokenEstimator
 from kama_claude.core.compact.manager import ContextManager
+from kama_claude.core.compact.output import ToolOutputPreparer
 from kama_claude.core.config import CompactionConfig, MemoryConfig
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.base import LLMProvider
 from kama_claude.core.llm.managed import ManagedProvider
 from kama_claude.core.loop import AgentLoop
-from kama_claude.core.memory.context import DEFAULT_SYSTEM, build_memory_context, compose_system
+from kama_claude.core.memory.context import DEFAULT_SYSTEM, initialize_prompt
 from kama_claude.core.memory.store import MemoryStore
 from kama_claude.core.run_budget import RunBudget
 from kama_claude.core.tools.batch import ToolBatchExecutor
@@ -38,12 +39,7 @@ def create_agent_loop(
         project=Path(context.run.memory_project_root) if context.run.memory_project_root else None,
     )
     if not context.run.system_prompt:
-        context.run.memory_project_root = str(memory.project_root)
-        context.run.base_system_prompt = context.system_prompt_override or DEFAULT_SYSTEM
-        context.run.memory_snapshot = build_memory_context(memory)
-        context.run.system_prompt = compose_system(
-            context.run.base_system_prompt, context.run.memory_snapshot,
-        )
+        initialize_prompt(context.run, memory, context.system_prompt_override or DEFAULT_SYSTEM)
     estimator = TokenEstimator(
         context.run.provider, context.run.model,
         persistence.checkpoint.token_estimation if persistence else None,
@@ -61,6 +57,7 @@ def create_agent_loop(
     tools = ToolBatchExecutor(
         context, registry, bus, budget, permission_manager=permission_manager,
         persistence=persistence, session_id=session_id, subagents=subagents,
+        output_preparer=ToolOutputPreparer(compaction, run_path),
     )
     return AgentLoop(
         managed, bus, context=context, tools=tools, context_manager=context_manager,

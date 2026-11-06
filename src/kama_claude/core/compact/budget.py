@@ -54,7 +54,7 @@ def _archive_output(path: Path, text: str) -> None:
             os.unlink(temporary)
 
 
-# 根据调用 ID 与全文生成归档位置，短结果在去重或遮蔽前也可复用
+# 根据调用 ID 与全文生成归档位置，重复整理复用相同全文。
 def archive_tool_output(tool_id: str, text: str, outputs_dir: Path) -> Path:
     digest = hashlib.sha256((tool_id + "\0" + text).encode("utf-8")).hexdigest()
     path = outputs_dir.resolve() / f"{digest}.txt"

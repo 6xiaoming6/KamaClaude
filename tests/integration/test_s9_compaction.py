@@ -5,12 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from kama_claude.core.compact.budget import ARCHIVED_RESULT_MARKER
 from kama_claude.core.compact.compactor import SUMMARY_MARKER
 from kama_claude.core.session.store import SessionStore
 from tests.integration.test_s8_recovery import Daemon, close, connect, wait_file, wait_status
+from tests.unit.context_support import tool_history
 from tests.unit.test_compactor import history
-from tests.unit.test_layered_compaction import results, tool_history
 
 
 @pytest.mark.parametrize("mode", ["llm", "programmatic"])
@@ -37,11 +36,7 @@ async def test_compaction_checkpoint_survives_real_process_restart(
         ))
         await wait_file(tmp_path / "s9-model-waiting")
         saved = store.checkpoints.load(sid)
-        if mode == "llm":
-            assert saved.messages[0]["content"].startswith(SUMMARY_MARKER)
-        else:
-            assert any(b["content"].startswith(ARCHIVED_RESULT_MARKER) for b in results(saved.messages))
-            assert not (tmp_path / "summary-calls.txt").exists()
+        assert saved.messages[0]["content"].startswith(SUMMARY_MARKER)
         assert saved.run.step == 1 and saved.run.phase == "llm"
         full_history = store.read_history(sid)
         assert full_history == original + [{"role": "user", "content": "continue existing task"}]
@@ -66,12 +61,8 @@ async def test_compaction_checkpoint_survives_real_process_restart(
         assert final["messages"][:len(display_history)] == display_history
         assert final["messages"] == store.read_history(sid, include_metadata=True)
         working = store.checkpoints.load(sid).messages
-        if mode == "llm":
-            assert working[0]["content"].startswith(SUMMARY_MARKER)
-            assert (tmp_path / "summary-calls.txt").read_text(encoding="utf-8").splitlines() == ["summary"]
-        else:
-            assert any(b["content"].startswith(ARCHIVED_RESULT_MARKER) for b in results(working))
-            assert not (tmp_path / "summary-calls.txt").exists()
+        assert working[0]["content"].startswith(SUMMARY_MARKER)
+        assert (tmp_path / "summary-calls.txt").read_text(encoding="utf-8").splitlines() == ["summary"]
         assert (tmp_path / "effects.txt").read_text(encoding="utf-8").splitlines() == ["a", "b"]
     finally:
         if waiter is not None and not waiter.done():

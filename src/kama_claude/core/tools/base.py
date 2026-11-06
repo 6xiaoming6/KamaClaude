@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar
 
@@ -21,6 +21,17 @@ class ToolResult:
     # 错误类型与副作用确定性分开：业务失败不等于结果未知
     error_type: str | None = None
     outcome_unknown: bool = False
+    # 发现工具的结构化引用；content 继续用于日志、事件和界面展示。
+    tool_references: list[str] = field(default_factory=list)
+    preserve_in_context: bool = False  # 有独立预算的流程说明，不能再裁成头尾预览。
+
+    def message_content(self) -> str | list[dict[str, object]]:
+        if not self.tool_references or self.is_error:
+            return self.content
+        blocks: list[dict[str, object]] = [{"type": "text", "text": self.content}]
+        blocks.extend({"type": "tool_reference", "tool_name": name}
+                      for name in self.tool_references)
+        return blocks
 
 
 class BaseTool(ABC):

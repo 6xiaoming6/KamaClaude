@@ -13,7 +13,7 @@ class ExecutionContext:
     # 所有运行字段共用这一份 run，messages 只保存模型工作历史
     run: RunCheckpoint
     messages: list[dict[str, Any]] = field(default_factory=list)
-    # skill 或 subagent 角色可覆盖默认 system prompt
+    # 子 Agent 角色可覆盖默认提示；Skill 正文独立放在工作历史中。
     system_prompt_override: str | None = None
 
     # 复制输入历史，新会话则以当前 Run 目标建立第一条消息
@@ -35,7 +35,7 @@ class ExecutionContext:
 
     # 将工具调用结果追加为 user 消息；同一步的多个结果共享同一条消息
     def add_tool_result(
-        self, tool_use_id: str, content: str, is_error: bool = False
+        self, tool_use_id: str, content: str | list[dict[str, object]], is_error: bool = False
     ) -> dict[str, Any]:
         block: dict[str, Any] = {
             "type": "tool_result",

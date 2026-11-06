@@ -43,6 +43,8 @@ class FileProbe(BaseTool):
             (self.root / "b-started").touch()
             while not (self.root / "release-b").exists():
                 await asyncio.sleep(0.02)
+        if name == "a" and (self.root / "long-output").exists():
+            return ToolResult(content="HEAD" + "x" * 10_000 + "TAIL")
         return ToolResult(content=name + " complete")
 
 
@@ -77,6 +79,17 @@ class Provider:
 # 运行真实 Core handler、检查点与 TCP，只替换模型和有副作用工具
 async def main(root: Path, port: int) -> None:
     root.mkdir(parents=True, exist_ok=True)
+    if (root / "long-output").exists():
+        from kama_claude.core.compact import budget
+
+        original_archive = budget._archive_output
+
+        def controlled_archive(path: Path, text: str) -> None:
+            if (root / "archive-fail").exists():
+                raise OSError("controlled archive failure")
+            original_archive(path, text)
+
+        budget._archive_output = controlled_archive
     app = CoreApp()
     app._broadcaster = IpcEventBroadcaster()
     app._bus.subscribe(app._broadcaster.handle)
@@ -91,9 +104,10 @@ async def main(root: Path, port: int) -> None:
     config = KamaConfig()
     if (root / "s9-mode").exists():
         config.compaction.auto_threshold = 0.05
-        config.compaction.prune_target_ratio = 0.02
     if (root / "s9-program-mode").exists():
-        config.compaction.context_window_tokens = 8_192
+        config.compaction.context_window_tokens = 65_536
+        config.compaction.auto_threshold = 0.05
+        config.compaction.recent_token_budget = 2_000
         config.compaction.output_reserve_tokens = 512
         config.compaction.summary_max_tokens = 256
     app._sessions = SessionManager(

@@ -572,6 +572,7 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
 | `reason` | `string` | no |
 | `applied_stages` | `array` | no |
 | `llm_used` | `boolean` | no |
+| `preserved_messages` | `integer` | no |
 
 ```json
 {
@@ -615,6 +616,11 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
       "default": false,
       "title": "Llm Used",
       "type": "boolean"
+    },
+    "preserved_messages": {
+      "default": 0,
+      "title": "Preserved Messages",
+      "type": "integer"
     }
   },
   "required": [
@@ -1151,6 +1157,7 @@ Events sent over the IPC socket (daemon → client).
 | `remaining_tokens` | `integer` | no |
 | `applied_stages` | `array` | no |
 | `llm_used` | `boolean` | no |
+| `preserved_messages` | `integer` | no |
 | `ts` | `string` | yes |
 
 ```json
@@ -1194,6 +1201,11 @@ Events sent over the IPC socket (daemon → client).
       "default": false,
       "title": "Llm Used",
       "type": "boolean"
+    },
+    "preserved_messages": {
+      "default": 0,
+      "title": "Preserved Messages",
+      "type": "integer"
     },
     "ts": {
       "title": "Ts",

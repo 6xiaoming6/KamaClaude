@@ -152,6 +152,11 @@ def _apply_permission(config: KamaConfig) -> None:
 
 
 def _apply_compaction(config: KamaConfig) -> None:
+    if any(key in os.environ for key in ("KAMA_COMPACT_KEEP_GROUPS", "KAMA_COMPACT_PRUNE_TARGET")):
+        raise SystemExit(
+            "Config migration: remove KAMA_COMPACT_PRUNE_TARGET; use KAMA_COMPACT_KEEP_TURNS "
+            "and KAMA_COMPACT_RECENT_TOKENS instead of KAMA_COMPACT_KEEP_GROUPS"
+        )
     compact_threshold = os.environ.get("KAMA_COMPACT_THRESHOLD")
     if compact_threshold is not None:
         try:
@@ -201,7 +206,8 @@ def _apply_compaction(config: KamaConfig) -> None:
     for suffix, key in {
         "WINDOW_TOKENS": "context_window_tokens",
         "OUTPUT_TOKENS": "output_reserve_tokens",
-        "KEEP_GROUPS": "keep_recent_groups",
+        "KEEP_TURNS": "keep_recent_turns",
+        "RECENT_TOKENS": "recent_token_budget",
         "SUMMARY_TOKENS": "summary_max_tokens",
     }.items():
         name = "KAMA_COMPACT_" + suffix
@@ -215,12 +221,6 @@ def _apply_compaction(config: KamaConfig) -> None:
         if parsed <= 0:
             raise SystemExit(f"Config error: {name} must be a positive integer")
         setattr(config.compaction, key, parsed)
-    prune_target = os.environ.get("KAMA_COMPACT_PRUNE_TARGET")
-    if prune_target is not None:
-        try:
-            config.compaction.prune_target_ratio = float(prune_target)
-        except ValueError as exc:
-            raise SystemExit("Config error: KAMA_COMPACT_PRUNE_TARGET must be a number") from exc
 
 
 def _apply_memory(config: KamaConfig) -> None:

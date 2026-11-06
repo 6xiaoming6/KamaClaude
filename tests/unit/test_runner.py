@@ -263,9 +263,10 @@ async def test_session_history_and_memory_injected(tmp_path: Path, monkeypatch: 
 
     await runner.run_and_capture("remember python", run_id="run-new", session=session, store=store)
 
-    assert provider.messages == [{"role": "user", "content": "remember python"}]
+    assert provider.messages[-1:] == [{"role": "user", "content": "remember python"}]
+    assert "Python 3.12" in str(provider.messages[0])
     assert provider.system is not None
-    assert "Python 3.12" in provider.system
+    assert "Python 3.12" not in provider.system
     assert (store.runs_dir("sess-1") / "run-new" / "events.jsonl").exists()
     assert not (tmp_path / "runs" / "run-new").exists()
 

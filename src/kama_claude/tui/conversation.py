@@ -79,11 +79,18 @@ class ConversationView(VerticalScroll):
                     result_block = self.pending_tools.pop(key, None)
                     if result_block is not None:
                         result_block.set_result(
-                            str(item.get("content", "")),
+                            self._tool_result_text(item.get("content", "")),
                             0,
                             is_error=bool(item.get("is_error")),
                         )
                         self.completed_tools.add(key)
+
+    @staticmethod
+    def _tool_result_text(content: Any) -> str:
+        if isinstance(content, list):
+            return "\n".join(str(block.get("text", "")) for block in content
+                             if block.get("type") == "text")
+        return str(content)
 
     def handle_event(self, event: dict[str, Any]) -> None:
         prefix = str(event.get("type", "")).split(".", 1)[0]
@@ -324,7 +331,7 @@ class ConversationView(VerticalScroll):
         if t == "context.compaction_started":
             self.append(
                 Static(
-                    "[dim]⚡ 正在整理上下文，先尝试程序处理…[/dim]",
+                    "[dim]⚡ 正在摘要旧历史，保留近期原文…[/dim]",
                     classes="log-line",
                 )
             )
@@ -333,7 +340,7 @@ class ConversationView(VerticalScroll):
                 "no_old_history": "没有需要压缩的旧历史",
                 "incomplete_tool_batch": "工具消息尚未完整配对",
                 "recent_context_too_large": "必须保留的近期原文过大",
-                "summary_input_too_large": "旧历史超出单次摘要请求预算",
+                "summary_input_too_large": "完整摘要请求超出输入预算",
                 "summary_request_failed": "摘要请求失败",
                 "summary_incomplete": "摘要输出未完整结束",
                 "empty_summary": "摘要为空",
@@ -343,11 +350,11 @@ class ConversationView(VerticalScroll):
                 "required_context_too_large": "固定提示与必须保留的近期原文已超预算",
                 "provider_unavailable": "需要摘要，但模型配置不可用",
                 "below_threshold": "空间充足，无需继续压缩",
-                "auto_disabled": "自动压力处理已关闭",
+                "auto_disabled": "自动摘要已关闭",
             }
             reason = reasons.get(str(event.get("reason")), str(event.get("reason", "")))
             retained = (
-                "程序化缩减已保存，未采用新摘要"
+                "候选未采用"
                 if event.get("applied_stages")
                 else "未替换工作历史"
             )
@@ -364,9 +371,6 @@ class ConversationView(VerticalScroll):
             summary = event.get("summary_tokens", 0)
             remaining = event.get("remaining_tokens", summary)
             stage_names = {
-                "tool_preview": "长结果预览",
-                "deduplicate": "重复结果去重",
-                "tool_archive": "旧结果归档",
                 "llm_summary": "LLM 摘要",
             }
             stages = " → ".join(stage_names.get(s, s) for s in event.get("applied_stages", []))
@@ -375,7 +379,8 @@ class ConversationView(VerticalScroll):
             )
             self.append(
                 Static(
-                    f"⚡ {label}  history≈{orig} → {remaining} tokens; summary≈{summary}"
+                    f"⚡ {label}  input≈{orig} → {remaining} tokens; summary≈{summary}"
+                    + f"  保留 {event.get('preserved_messages', 0)} 条消息"
                     + (f"  {stages}" if stages else ""),
                     classes="log-line",
                     markup=False,

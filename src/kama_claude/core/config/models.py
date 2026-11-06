@@ -66,13 +66,13 @@ class ExecutionConfig:
 
 @dataclass
 class CompactionConfig:
-    auto_threshold: float = 0.8  # 请求前按估算输入触发，0 表示关闭压力层
-    prune_target_ratio: float = 0.65  # 程序层尽量降到软阈值以下，减少反复整理
+    auto_threshold: float = 0.8  # 请求前按估算输入触发，0 表示关闭自动摘要
     tool_result_limit: int = 8_000  # tool_result 截断触发字符数
     tool_result_keep: int = 4_000  # 头尾保留的总字符数
     context_window_tokens: int = 65_536  # 按实际模型配置，并非模型能力声明
     output_reserve_tokens: int = 8_192
-    keep_recent_groups: int = 2
+    keep_recent_turns: int = 3
+    recent_token_budget: int = 16_384
     summary_max_tokens: int = 2_048
 
     @property

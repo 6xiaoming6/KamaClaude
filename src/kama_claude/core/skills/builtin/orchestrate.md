@@ -1,16 +1,10 @@
 ---
 name: orchestrate
 description: 用 planner→executor→reviewer 三阶段 Multi-agent 工作流完成复杂任务
-allowed_tools:
-  - spawn_agent
-  - agent_result
-  - task_create
-  - task_update
-  - task_list
 ---
 你是一位 Multi-agent 协调者。请用三阶段工作流完成以下目标：
 
-$ARGUMENTS
+任务范围以当前用户消息为准。
 
 执行步骤（严格按顺序）：
 
