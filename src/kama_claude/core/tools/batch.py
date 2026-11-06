@@ -63,6 +63,11 @@ class ToolBatchExecutor:
                 return False
         if run.repeat_failure_limit and run.repeated_failures >= run.repeat_failure_limit:
             raise BudgetExceeded("repeated_tool_failure")
+        # 结束调用必须独占一批；整批拒绝，不能先执行写入再发现结束协议错误。
+        mixed_finish = len(run.tools) != 1 and any(
+            (registered := self.registry.get(tool.name)) is not None and registered.ends_run
+            for tool in run.tools
+        )
         # 开始按上次记录的顺序执行工具
         while run.tool_index < len(run.tools):
             self._budget.check()
@@ -80,7 +85,13 @@ class ToolBatchExecutor:
             started_at = time.monotonic()
             attempts_before = tool.attempts
             visible = callable_names(run, context.messages)
-            if not tool.exposed or (
+            if mixed_finish:
+                result = ToolResult(
+                    "No tool in this batch was executed: finish must be the only tool call. "
+                    "Execute business tools first, observe their results, then finish separately.",
+                    is_error=True, error_type="invalid_operation",
+                )
+            elif not tool.exposed or (
                 tool.name in run.mcp_tool_names and tool.name not in visible
             ):
                 result = ToolResult(
@@ -117,6 +128,10 @@ class ToolBatchExecutor:
                     # 逐工具记录完整结果，之后的裁剪或摘要只改变工作历史
                     self._persistence.record_message("user", [block])
                 run.tool_index += 1
+                if result.ends_run and not result.is_error:
+                    run.result = result.content
+                    context.mark_success()
+                    tool.output_prepared = True
 
             # 先一起保存结果、消息和游标，再通知前端；保存失败就停在这里
             if self._subagents is not None:
@@ -135,7 +150,7 @@ class ToolBatchExecutor:
             if repeated:
                 raise BudgetExceeded("repeated_tool_failure")
             if context.is_done():
-                return False
+                return run.status == "success"
         self._finish_tool_batch()
         return True
 

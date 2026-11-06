@@ -14,6 +14,7 @@ from kama_claude.core.runner import AgentRunner
 from kama_claude.core.session.manager import SessionManager
 from kama_claude.core.session.store import SessionStore
 from kama_claude.core.tools.base import BaseTool, ToolResult
+from kama_claude.core.tools.builtin.finish import FinishTool
 from kama_claude.core.tools.registry import ToolRegistry
 from kama_claude.core.transport.ipc_broadcaster import IpcEventBroadcaster
 from kama_claude.core.transport.socket_server import SocketServer
@@ -66,6 +67,10 @@ class Provider:
         messages = kwargs["messages"]
         last = messages[-1]["content"]
         if isinstance(last, list) and any(b.get("type") == "tool_result" for b in last):
+            if any(schema["name"] == "finish" for schema in kwargs["tool_schemas"]):
+                return LlmResponse("tool_use", tool_calls=[ToolCallBlock(
+                    "finish-test", "finish", {"result": "done"},
+                )])
             return LlmResponse("end_turn", text="done")
         return LlmResponse(
             "tool_use",
@@ -99,6 +104,9 @@ async def main(root: Path, port: int) -> None:
         def _build_registry(self, task_manager: Any, **kwargs: Any) -> ToolRegistry:
             registry = ToolRegistry()
             registry.register(FileProbe(root))
+            run = kwargs.get("run")
+            if run is not None and run.completion_mode == "explicit":
+                registry.register(FinishTool())
             return registry
 
     config = KamaConfig()

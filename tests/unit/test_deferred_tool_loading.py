@@ -102,7 +102,7 @@ async def test_native_whitelist_still_defers_mcp(tmp_path, monkeypatch):
         "goal", tool_whitelist=["remote__get_issue"],
     )
     schemas = provider.requests[0]["schemas"]
-    assert {s["name"] for s in schemas} == {"remote__get_issue", "search_tool"}
+    assert {s["name"] for s in schemas} == {"remote__get_issue", "search_tool", "finish"}
     assert next(s for s in schemas if s["name"] == "remote__get_issue")["defer_loading"]
     await manager.stop_all()
 

@@ -4,6 +4,7 @@ import hashlib
 from typing import TYPE_CHECKING
 
 from kama_claude.core.compact.estimator import estimate_bytes
+from kama_claude.core.completion import FINISH_INSTRUCTIONS
 from kama_claude.core.memory.files import read_optional
 from kama_claude.core.memory.model import MemorySnapshot, MemorySource
 from kama_claude.core.memory.store import MemoryStore
@@ -74,6 +75,8 @@ def initialize_prompt(run: RunCheckpoint, store: MemoryStore, base: str) -> None
     automatic = build_memory_context(store)
     run.base_system_prompt = base
     run.system_prompt = compose_system(base, rules)
+    if run.completion_mode == "explicit":
+        run.system_prompt += FINISH_INSTRUCTIONS
     run.memory_snapshot = automatic
     run.memory_project_root = str(store.project_root)
     run.prompt_layout = "stable_v1"

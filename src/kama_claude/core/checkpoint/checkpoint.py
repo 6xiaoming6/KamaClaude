@@ -44,6 +44,8 @@ class RunCheckpoint(BaseModel):
     goal: str
     model: str
     provider: str = "deepseek"
+    completion_mode: Literal["legacy", "explicit"] = "legacy"  # 旧 Run 保留原冻结结束协议。
+    finish_reminders: int = Field(default=0, ge=0, le=1)  # 遗漏 finish 最多提醒一次，恢复不重置。
     workspace: str
     system_prompt: str = ""
     # 单独保存基础提示；本轮 system 冻结，摘要只刷新自动记忆快照。

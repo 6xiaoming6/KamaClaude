@@ -15,6 +15,7 @@ from kama_claude.core.memory.store import MemoryStore
 from kama_claude.core.runner import AgentRunner
 from kama_claude.core.session.model import Session
 from kama_claude.core.session.store import SessionStore
+from tests.unit.completion_support import submit_response
 
 # --- mock provider -----------------------------------------------------------
 
@@ -33,7 +34,7 @@ class _EndTurnProvider:
         system: str | None = None,
         max_output_tokens: int = 8_192,
     ) -> LlmResponse:
-        return LlmResponse(stop_reason="end_turn", text="done")
+        return submit_response(LlmResponse("end_turn", text="done"), tool_schemas, run_id, step)
 
 
 class _LoopingProvider:
@@ -79,7 +80,7 @@ class _CapturingProvider:
     ) -> LlmResponse:
         self.messages = [dict(m) for m in messages]
         self.system = system
-        return self.response
+        return submit_response(self.response, tool_schemas, run_id, step)
 
 
 # --- helpers -----------------------------------------------------------------
@@ -308,7 +309,9 @@ async def test_session_registers_memory_write_tool(tmp_path: Path, monkeypatch: 
                         )
                     ],
                 )
-            return LlmResponse(stop_reason="end_turn", text="noted")
+            return submit_response(
+                LlmResponse("end_turn", text="noted"), tool_schemas, run_id, step,
+            )
 
     store = SessionStore(tmp_path / "sessions")
     session = Session(

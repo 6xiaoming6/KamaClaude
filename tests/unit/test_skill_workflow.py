@@ -96,7 +96,7 @@ async def test_explicit_skill_keeps_system_original_user_and_tools(tmp_path: Pat
     assert "Coding Agent" in model.calls[0]["system"]
     assert any(m.get("content") == render_skill(cp.run.active_skill) for m in model.calls[0]["messages"])
     assert store.read_history(session.id)[0] == {"role": "user", "content": "/review src"}
-    assert len(store.read_history(session.id)) == 2
+    assert len(store.read_history(session.id)) == 3
     assert sum(is_user_request(message) for message in cp.messages) == 1
     await manager.send_message(session.id, "new task")
     assert store.checkpoints.load(session.id).run.active_skill is None

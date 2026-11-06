@@ -1687,6 +1687,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | `status` | `string` | yes |
 | `reason` | `string | null` | no |
 | `steps` | `integer` | yes |
+| `result` | `string` | no |
 | `ts` | `string` | yes |
 
 ```json
@@ -1721,6 +1722,11 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "steps": {
       "title": "Steps",
       "type": "integer"
+    },
+    "result": {
+      "default": "",
+      "title": "Result",
+      "type": "string"
     },
     "ts": {
       "title": "Ts",

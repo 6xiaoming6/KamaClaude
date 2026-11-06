@@ -23,6 +23,7 @@ class ToolResult:
     outcome_unknown: bool = False
     # 发现工具的结构化引用；content 继续用于日志、事件和界面展示。
     tool_references: list[str] = field(default_factory=list)
+    ends_run: bool = False  # 结束控制信号，只有后端工具能产生，不来自模型输入。
     preserve_in_context: bool = False  # 有独立预算的流程说明，不能再裁成头尾预览。
 
     def message_content(self) -> str | list[dict[str, object]]:
@@ -39,6 +40,7 @@ class BaseTool(ABC):
     description: str
     input_schema: dict[str, object]
     retry_safe: ClassVar[bool] = False
+    ends_run: ClassVar[bool] = False
     timeout_s: ClassVar[float] = 120.0
     params_model: ClassVar[type[BaseModel] | None] = None
 

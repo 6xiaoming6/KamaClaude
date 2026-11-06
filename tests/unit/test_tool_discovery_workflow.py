@@ -170,9 +170,10 @@ async def test_explicit_whitelist_is_preserved(tmp_path, monkeypatch, whitelist)
     await AgentRunner(config, provider=provider, mcp_manager=manager,
                       runs_dir=tmp_path / "runs").run_and_capture("goal", tool_whitelist=whitelist)
     names = {schema["name"] for schema in provider.requests[0]["schemas"]}
-    assert names <= set(whitelist)
+    assert names - {"finish"} <= set(whitelist)
+    assert "finish" in names
     if "remote__get_issue" in whitelist:
-        assert names == {"remote__get_issue"}
+        assert names == {"remote__get_issue", "finish"}
     await manager.stop_all()
 
 

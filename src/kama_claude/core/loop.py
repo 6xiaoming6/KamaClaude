@@ -12,6 +12,7 @@ from kama_claude.core.bus.events import (
 from kama_claude.core.checkpoint.checkpoint import CheckpointError, ToolCheckpoint
 from kama_claude.core.compact.manager import ContextManager
 from kama_claude.core.compact.request import assemble_messages
+from kama_claude.core.completion import FINISH_INSTRUCTIONS, FINISH_REMINDER
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.discovery.exposure import callable_names
 from kama_claude.core.events.bus import EventBus
@@ -101,9 +102,11 @@ class AgentLoop:
         await self._bus.publish_safe(StepStartedEvent(run_id=run.run_id, step=run.step, ts=_now()))
         system = run.system_prompt or context.system_prompt(
             "You are a helpful AI assistant. "
-            "Use the available tools to complete the user's goal. "
-            "When the goal is fully achieved, respond with a final answer "
-            "and do not call any more tools."
+            "Use the available tools to complete the user's goal. " + (
+                FINISH_INSTRUCTIONS if run.completion_mode == "explicit"
+                else "When the goal is fully achieved, respond with a final answer "
+                "and do not call any more tools."
+            )
         )
         schemas = self._tools.model_schemas()
         # 请求前准备
@@ -162,9 +165,16 @@ class AgentLoop:
             for t in response.tool_calls
         ]
         run.tool_index = 0
-        if response.stop_reason == "end_turn":
-            run.result = response.text or ""
-            context.mark_success()
+        if response.stop_reason == "end_turn" and not response.tool_calls:
+            if run.completion_mode == "legacy":
+                run.result = response.text or ""
+                context.mark_success()
+            elif run.finish_reminders:
+                context.mark_failed("missing_finish")
+            else:
+                run.finish_reminders = 1
+                context.messages.append({"role": "user", "content": FINISH_REMINDER})
+                run.phase = "ready"
         elif response.stop_reason == "tool_use":
             run.phase = "tools"
         else:

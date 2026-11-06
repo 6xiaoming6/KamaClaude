@@ -16,6 +16,7 @@ from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock
 from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.runner import AgentRunner
+from tests.unit.completion_support import submit_response
 
 # ── stub providers ────────────────────────────────────────────────────────────
 
@@ -42,7 +43,7 @@ class _SingleBashProvider:
         if self._step == 1:
             tc = ToolCallBlock(id="tc1", name="bash", input={"command": self._command})
             return LlmResponse(stop_reason="tool_use", tool_calls=[tc])
-        return LlmResponse(stop_reason="end_turn", text="done")
+        return submit_response(LlmResponse("end_turn", text="done"), tool_schemas, run_id, step)
 
 
 class _TwoBashProvider:
@@ -69,7 +70,7 @@ class _TwoBashProvider:
         if self._step == 2:
             tc = ToolCallBlock(id="tc2", name="bash", input={"command": "echo second"})
             return LlmResponse(stop_reason="tool_use", tool_calls=[tc])
-        return LlmResponse(stop_reason="end_turn", text="done")
+        return submit_response(LlmResponse("end_turn", text="done"), tool_schemas, run_id, step)
 
 
 # ── helper ────────────────────────────────────────────────────────────────────
@@ -132,7 +133,8 @@ async def test_permission_deny_once_tool_not_executed(tmp_path: Path) -> None:
 
     async def collect(e: BaseModel) -> None:
         t = getattr(e, "type", "")
-        event_types.append(t)
+        if getattr(e, "tool_name", "") != "finish":
+            event_types.append(t)
         if t == "permission.requested":
             manager.respond(e.request_id, "deny_once", session_id=e.session_id, run_id=e.run_id)
         if t == "tool.call_failed":

@@ -50,6 +50,7 @@ from kama_claude.core.tools.builtin import (
     MemoryReadTool,
     MemoryWriteTool,
 )
+from kama_claude.core.tools.builtin.finish import FinishTool
 from kama_claude.core.tools.factory import builtin_tools
 from kama_claude.core.tools.registry import ToolRegistry
 from kama_claude.core.trace.writer import TraceWriter
@@ -135,6 +136,9 @@ class AgentRunner:
         ):
             if _ok(memory_tool.name):
                 registry.register(memory_tool)
+
+        if run is not None and run.completion_mode == "explicit":
+            registry.register(FinishTool())
 
         if run is not None and run.skill_catalog is not None and _ok("load_skill"):
             registry.register(LoadSkillTool(run))
@@ -300,10 +304,12 @@ class AgentRunner:
                 # 正常取消，比如ctrl + c取消后，会出现这个异常
                 except asyncio.CancelledError:
                     cancelled = True
-                    if persistence is not None:
-                        context.mark_interrupted("core_stopped")
-                    else:
-                        context.mark_failed("cancelled")
+                    # finish 已提交终态后取消通知，不能把磁盘上的成功降级为中断。
+                    if not context.is_done():
+                        if persistence is not None:
+                            context.mark_interrupted("core_stopped")
+                        else:
+                            context.mark_failed("cancelled")
                 except Exception:
                     logging.getLogger(__name__).exception(
                         "agent run failed run_id=%s", context.run.run_id,
@@ -369,7 +375,7 @@ class AgentRunner:
     ) -> RunCheckpoint:
         provider, model = self._providers.identity()
         return RunCheckpoint(
-            run_id=run_id, goal=goal, provider=provider, model=model,
+            run_id=run_id, goal=goal, provider=provider, model=model, completion_mode="explicit",
             skill_catalog=(SkillLoader().list_all_skills()
                            if tool_whitelist is None or "load_skill" in tool_whitelist else []),
             workspace=str(Path.cwd().resolve()),
@@ -544,6 +550,10 @@ class AgentRunner:
             await bus.publish_safe(
                 RunFinishedEvent(
                     run_id=run.run_id, status=run.status, reason=run.reason,
+                    result=(
+                        run.result if run.completion_mode == "explicit" and run.status == "success"
+                        else ""
+                    ),
                     steps=run.step, ts=_now(),
                 )
             )

@@ -15,6 +15,8 @@ class StdoutPrinter:
     def __init__(self) -> None:
         self._inline = False  # True while LLM tokens are mid-line
         self._run_start: float = 0.0
+        self._finished_runs: set[str] = set()
+        self._streamed: dict[str, str] = {}
 
     # 若当前行有未换行的 token，补一个换行符
     def _ensure_newline(self) -> None:
@@ -28,22 +30,30 @@ class StdoutPrinter:
 
         if t == "run.started":
             self._run_start = time.monotonic()
+            self._streamed[str(event.get("run_id", ""))] = ""
             print(f"[run] {event.get('run_id', '')}")
 
         elif t == "step.started":
+            self._streamed[str(event.get("run_id", ""))] = ""
             self._ensure_newline()
             print(f"[step {event.get('step')}] planning...")
 
         elif t == "llm.token":
+            run_id = str(event.get("run_id", ""))
+            self._streamed[run_id] = self._streamed.get(run_id, "") + str(event.get("token", ""))
             print(event.get("token", ""), end="", flush=True)
             self._inline = True
 
         elif t == "tool.call_started":
+            if event.get("tool_name") == "finish":
+                return
             self._ensure_newline()
             params_str = json.dumps(event.get("params", {}), ensure_ascii=False)
             print(f"[tool] {event.get('tool_name', '')} {params_str}")
 
         elif t == "tool.call_finished":
+            if event.get("tool_name") == "finish":
+                return
             print(f"[tool] {event.get('tool_name', '')} ✓  {event.get('elapsed_ms')}ms")
 
         elif t == "tool.call_failed":
@@ -65,9 +75,20 @@ class StdoutPrinter:
             )
 
         elif t == "run.finished":
+            run_id = str(event.get("run_id", ""))
+            if run_id in self._finished_runs:
+                return
+            self._finished_runs.add(run_id)
             self._ensure_newline()
+            result = str(event.get("result") or "")
+            if result and not self._streamed.get(run_id, "").rstrip().endswith(result.rstrip()):
+                print(result)
             elapsed = time.monotonic() - self._run_start
-            print(f"[run] {event.get('status', '')}  {event.get('steps')} steps  {elapsed:.1f}s")
+            status = (
+                "submitted" if result and event.get("status") == "success"
+                else event.get("status", "")
+            )
+            print(f"[run] {status}  {event.get('steps')} steps  {elapsed:.1f}s")
 
 
 # 异步核心：连接 daemon，订阅事件，触发 run，等待 run.finished

@@ -15,7 +15,9 @@ def is_user_request(message: dict[str, Any]) -> bool:
         return False
     content = message.get("content")
     if isinstance(content, str):
-        return not content.startswith((SUMMARY_MARKER, SKILL_MARKER))
+        return not content.startswith((
+            SUMMARY_MARKER, SKILL_MARKER, "[KamaClaude finish protocol]",
+        ))
     return isinstance(content, list) and bool(content) and all(
         block.get("type") != "tool_result" for block in content
     )

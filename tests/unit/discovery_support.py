@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 from kama_claude.core.discovery.model import CatalogTool
 from kama_claude.core.llm.provider import DeepseekProvider
 from kama_claude.core.mcp.client import McpClient, McpToolDef
+from tests.unit.completion_support import submit_response
 
 
 # 构造带真实 Schema 的工具记录，避免测试只有名称而没有参数信息。
@@ -72,7 +73,7 @@ class ScriptedProvider:
         response = next(self.responses)
         if isinstance(response, BaseException):
             raise response
-        return response
+        return submit_response(response, tool_schemas, run_id, kwargs.get("step", 0))
 
 
 class NativeScriptedProvider(DeepseekProvider):

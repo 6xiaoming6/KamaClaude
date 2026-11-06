@@ -405,6 +405,8 @@ class SessionManager:
                         status=cp.run.status,
                         reason=cp.run.reason,
                         steps=cp.run.step,
+                        result=(cp.run.result if cp.run.completion_mode == "explicit"
+                                and cp.run.status == "success" else ""),
                         ts=_now(),
                     )
                 )

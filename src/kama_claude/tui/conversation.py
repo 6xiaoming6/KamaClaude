@@ -24,6 +24,9 @@ class ConversationView(VerticalScroll):
         self.pending_tools: dict[tuple[str, str], ToolCallBlock] = {}
         self.completed_tools: set[tuple[str, str]] = set()
         self.completed_runs: set[str] = set()
+        self.final_replies: set[str] = set()
+        self.finish_calls: set[tuple[str, str]] = set()
+        self.streamed_text: dict[str, str] = {}
         self.subagent_runs: dict[str, str] = {}
         self.subagent_start_times: dict[str, float] = {}
         self.last_context_pct = 0.0
@@ -53,11 +56,15 @@ class ConversationView(VerticalScroll):
                 continue
             if message["role"] == "assistant":
                 legacy_batch = {}
+                self.streamed_text[str(message.get("run_id", ""))] = ""
             run_id = str(message.get("run_id", ""))
             # 旧记录没有归属信息时，只生成本地显示键，不猜测真实 Run。
             display_id = run_id or f"legacy:{message.get('id', index)}"
             for item in content or []:
                 if item.get("type") == "text":
+                    self.streamed_text[display_id] = (
+                        self.streamed_text.get(display_id, "") + str(item.get("text", ""))
+                    )
                     block = LLMStreamBlock()
                     block.append_token(item.get("text", ""))
                     block.finalize_markdown()
@@ -65,6 +72,9 @@ class ConversationView(VerticalScroll):
                 elif item.get("type") == "tool_use":
                     key = (display_id, item["id"])
                     legacy_batch[item["id"]] = key
+                    if item["name"] == "finish":
+                        self.finish_calls.add(key)
+                        continue
                     tool = ToolCallBlock(item["name"], item.get("input", {}))
                     self.pending_tools[key] = tool
                     self.append(tool)
@@ -76,6 +86,18 @@ class ConversationView(VerticalScroll):
                             item["tool_use_id"], (display_id, item["tool_use_id"])
                         )
                     )
+                    if key in self.finish_calls:
+                        self.finish_calls.remove(key)
+                        text = self._tool_result_text(item.get("content", ""))
+                        if item.get("is_error"):
+                            self.append(Static(
+                                "结束提交未通过：" + text,
+                                markup=False, classes="log-line",
+                            ))
+                        else:
+                            self._show_final_reply(key[0], text)
+                        self.completed_tools.add(key)
+                        continue
                     result_block = self.pending_tools.pop(key, None)
                     if result_block is not None:
                         result_block.set_result(
@@ -84,6 +106,20 @@ class ConversationView(VerticalScroll):
                             is_error=bool(item.get("is_error")),
                         )
                         self.completed_tools.add(key)
+
+    # 实时终态与历史重放共用，参数、工具输出和重连事件不再各显示一遍答案。
+    def _show_final_reply(self, run_id: str, text: str) -> None:
+        if not text or run_id in self.final_replies:
+            return
+        self.final_replies.add(run_id)
+        self.break_stream()
+        previous = self.streamed_text.get(run_id, "").rstrip()
+        if previous and previous.endswith(text.rstrip()):
+            return
+        block = LLMStreamBlock()
+        block.append_token(text)
+        block.finalize_markdown()
+        self.append(block)
 
     @staticmethod
     def _tool_result_text(content: Any) -> str:
@@ -118,6 +154,8 @@ class ConversationView(VerticalScroll):
                 self.break_stream()
                 self.current_llm_run_id = event.get("run_id")
             token = event.get("token", "")
+            run_id = str(event.get("run_id", ""))
+            self.streamed_text[run_id] = self.streamed_text.get(run_id, "") + str(token)
             if self.current_llm is None:
                 llm_block = LLMStreamBlock()
                 self.append(llm_block)
@@ -165,9 +203,11 @@ class ConversationView(VerticalScroll):
             steps = event.get("steps", 0)
             reason = event.get("reason") or ""
             if status == "success":
+                self._show_final_reply(run_id, str(event.get("result") or ""))
+                label = "本轮已提交" if event.get("result") else "completed"
                 self.append(
                     Static(
-                        f"[bold green]✓ completed[/bold green]  [dim]{steps} steps[/dim]",
+                        f"[bold green]✓ {label}[/bold green]  [dim]{steps} steps[/dim]",
                         classes="run-ok",
                     )
                 )
@@ -278,6 +318,7 @@ class ConversationView(VerticalScroll):
         t = event.get("type", "")
         if t == "step.started":
             run_id = event.get("run_id", "")
+            self.streamed_text[str(run_id)] = ""
             if run_id in self.subagent_runs:
                 return
             step = event.get("step", "")
@@ -290,6 +331,13 @@ class ConversationView(VerticalScroll):
 
     def _handle_tool(self, event: dict[str, Any]) -> None:
         t = event.get("type", "")
+        if event.get("tool_name") == "finish":
+            if t == "tool.call_failed" and not event.get("retrying"):
+                self.append(Static(
+                    "结束提交未通过：" + str(event.get("error_message", "")),
+                    markup=False, classes="log-line",
+                ))
+            return
         if t == "tool.call_started":
             tool_use_id = str(event.get("tool_use_id", ""))
             key = (str(event.get("run_id", "")), tool_use_id)
