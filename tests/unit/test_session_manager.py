@@ -11,12 +11,16 @@ from kama_claude.core.llm.types import LlmResponse
 from kama_claude.core.runner import AgentRunner
 from kama_claude.core.session.manager import SESSION_CLOSED, SESSION_NOT_FOUND, SessionManager
 from kama_claude.core.session.store import SessionStore
+from tests.unit.completion_support import submit_response
 
 
 class _Provider:
     # 返回固定回复，不访问外部模型
     async def chat(self, **kwargs: object) -> LlmResponse:
-        return LlmResponse(stop_reason="end_turn", text="done")
+        return submit_response(
+            LlmResponse("end_turn", text="done"), kwargs["tool_schemas"], kwargs["run_id"],
+            kwargs["step"],
+        )
 
 
 class _Runner(AgentRunner):

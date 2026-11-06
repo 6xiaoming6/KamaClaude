@@ -28,7 +28,7 @@ def make_loop(
 ) -> tuple[AgentLoop, ExecutionContext, list[Any]]:
     config = config or CompactionConfig(
         context_window_tokens=8_192, output_reserve_tokens=512,
-        summary_max_tokens=256, auto_threshold=0.1, prune_target_ratio=0.05,
+        summary_max_tokens=256, auto_threshold=0.1,
     )
     context = ExecutionContext(
         run=RunCheckpoint(
@@ -104,12 +104,12 @@ async def test_failed_auto_compaction_obeys_hard_budget(tmp_path: Path, hard_lim
     model.chat.side_effect = [RuntimeError("offline"), LlmResponse("end_turn", text="done")]
     config = CompactionConfig(
         context_window_tokens=4_096 if hard_limit else 8_192,
-        output_reserve_tokens=1_024, summary_max_tokens=256, auto_threshold=0.1, prune_target_ratio=0.05,
+        output_reserve_tokens=1_024, summary_max_tokens=256, auto_threshold=0.1,
     )
     original = history()
     loop, context, events = make_loop(tmp_path, copy.deepcopy(original), model, config)
     await loop.run()
-    assert model.chat.call_count == (1 if hard_limit else 2)
+    assert model.chat.call_count == (0 if hard_limit else 2)
     assert context.run.status == ("interrupted" if hard_limit else "success")
     assert context.messages[:len(original)] == original
     assert sum(e.type == "context.compaction_failed" for e in events) == 1
@@ -181,11 +181,13 @@ async def test_archive_failure_preserves_completed_tool(
     loop._tools.registry.register(tool)
     original_archive = budget._archive_output
     monkeypatch.setattr(budget, "_archive_output", Mock(side_effect=OSError("disk full")))
-    with pytest.raises(OSError):
-        await loop.run()
+    await loop.run()
+    assert context.run.status == "interrupted"
+    assert not context.run.tools[0].output_prepared
     assert tool.calls == 1 and context.run.tools[0].status == "completed"
-    assert context.run.phase == "llm" and context.run.step == 2
+    assert context.run.phase == "tools" and context.run.step == 1
     monkeypatch.setattr(budget, "_archive_output", original_archive)
+    context.run.status = "running"
     await loop.run()
     assert tool.calls == 1 and context.run.step == 2 and context.run.status == "success"
     archived = list((tmp_path / "outputs").glob("*.txt"))
@@ -197,16 +199,19 @@ async def test_archive_failure_preserves_completed_tool(
 # 功能：验证本批多个新工具结果先归档再参与预算，触发不依赖旧 API 占比
 # 设计：同一回复两个长结果，其中一个失败，检查配对、错误标志与两份全文都保留
 async def test_new_multi_tool_results_are_archived_before_budget(tmp_path: Path) -> None:
-    call = {"role": "assistant", "content": [
-        {"type": "tool_use", "id": name, "name": "read", "input": {}} for name in ("a", "b")
-    ]}
-    results = {"role": "user", "content": [
-        {"type": "tool_result", "tool_use_id": name, "content": name * 12_000, "is_error": name == "b"}
-        for name in ("a", "b")
-    ]}
+    class ResultTool(LargeTool):
+        async def invoke(self, params):
+            result = await super().invoke(params)
+            result.is_error = True
+            return result
+
     model = provider()
-    model.chat.side_effect = [LlmResponse("end_turn", text="summary"), LlmResponse("end_turn", text="done")]
-    loop, context, _ = make_loop(tmp_path, [*history(), call, results], model)
+    model.chat.side_effect = [
+        LlmResponse("tool_use", tool_calls=[ToolCallBlock(name, "large", {}) for name in ("a", "b")]),
+        LlmResponse("end_turn", text="done"),
+    ]
+    loop, context, _ = make_loop(tmp_path, [{"role": "user", "content": "goal"}], model)
+    loop._tools.registry.register(ResultTool())
     await loop.run()
     assert context.run.status == "success" and model.chat.call_count == 2
     assert len(list((tmp_path / "outputs").glob("*.txt"))) == 2
@@ -225,7 +230,7 @@ async def test_manual_matches_auto_and_notifies_after_commit(tmp_path: Path) -> 
 
     config = CompactionConfig(
         context_window_tokens=8_192, output_reserve_tokens=512,
-        summary_max_tokens=256, auto_threshold=0.1, prune_target_ratio=0.05,
+        summary_max_tokens=256, auto_threshold=0.1,
     )
     store = SessionStore(tmp_path / "sessions")
     bus = EventBus()
@@ -267,7 +272,7 @@ async def test_manual_save_failure_preserves_disk_history(
         store, Mock(), EventBus(), provider=provider(),
         compaction=CompactionConfig(
             context_window_tokens=8_192, output_reserve_tokens=512,
-            summary_max_tokens=256, auto_threshold=0.1, prune_target_ratio=0.05,
+            summary_max_tokens=256, auto_threshold=0.1,
         ),
     )
     session = await manager.create("chat")
@@ -307,7 +312,7 @@ def test_tui_compaction_feedback_is_session_scoped(monkeypatch: pytest.MonkeyPat
         "type": "context.compaction_failed", "reason": "empty_summary", **base,
     })
     assert len(content) == 3
-    assert "正在整理上下文" in content[0]
+    assert "正在摘要旧历史" in content[0]
     assert "1000 → 400" in content[1]
     assert "摘要为空" in content[2]
     app._handle_event({"type": "context.compaction_started", "session_id": "other"})
@@ -329,14 +334,14 @@ def test_compaction_configuration(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         "[compaction]\ncontext_window_tokens=32768\noutput_reserve_tokens=1024\n"
-        "keep_recent_groups=3\nsummary_max_tokens=512\n", encoding="utf-8",
+        "keep_recent_turns=3\nrecent_token_budget=16384\nsummary_max_tokens=512\n", encoding="utf-8",
     )
     monkeypatch.setenv("KAMA_CONFIG", str(config_path))
     monkeypatch.setenv("KAMA_COMPACT_WINDOW_TOKENS", "16384")
     config = get_config().compaction
     assert config.auto_threshold == 0.8
     assert config.context_window_tokens == 16384 and config.input_limit == 14336
-    assert config.keep_recent_groups == 3 and config.summary_max_tokens == 512
+    assert config.keep_recent_turns == 3 and config.summary_max_tokens == 512
     monkeypatch.setenv("KAMA_COMPACT_THRESHOLD", "0")
     assert get_config().compaction.auto_threshold == 0
     monkeypatch.setenv("KAMA_COMPACT_OUTPUT_TOKENS", "20000")

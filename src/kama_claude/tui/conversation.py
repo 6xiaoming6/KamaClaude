@@ -24,6 +24,9 @@ class ConversationView(VerticalScroll):
         self.pending_tools: dict[tuple[str, str], ToolCallBlock] = {}
         self.completed_tools: set[tuple[str, str]] = set()
         self.completed_runs: set[str] = set()
+        self.final_replies: set[str] = set()
+        self.finish_calls: set[tuple[str, str]] = set()
+        self.streamed_text: dict[str, str] = {}
         self.subagent_runs: dict[str, str] = {}
         self.subagent_start_times: dict[str, float] = {}
         self.last_context_pct = 0.0
@@ -53,11 +56,15 @@ class ConversationView(VerticalScroll):
                 continue
             if message["role"] == "assistant":
                 legacy_batch = {}
+                self.streamed_text[str(message.get("run_id", ""))] = ""
             run_id = str(message.get("run_id", ""))
             # 旧记录没有归属信息时，只生成本地显示键，不猜测真实 Run。
             display_id = run_id or f"legacy:{message.get('id', index)}"
             for item in content or []:
                 if item.get("type") == "text":
+                    self.streamed_text[display_id] = (
+                        self.streamed_text.get(display_id, "") + str(item.get("text", ""))
+                    )
                     block = LLMStreamBlock()
                     block.append_token(item.get("text", ""))
                     block.finalize_markdown()
@@ -65,6 +72,9 @@ class ConversationView(VerticalScroll):
                 elif item.get("type") == "tool_use":
                     key = (display_id, item["id"])
                     legacy_batch[item["id"]] = key
+                    if item["name"] == "finish":
+                        self.finish_calls.add(key)
+                        continue
                     tool = ToolCallBlock(item["name"], item.get("input", {}))
                     self.pending_tools[key] = tool
                     self.append(tool)
@@ -76,14 +86,47 @@ class ConversationView(VerticalScroll):
                             item["tool_use_id"], (display_id, item["tool_use_id"])
                         )
                     )
+                    if key in self.finish_calls:
+                        self.finish_calls.remove(key)
+                        text = self._tool_result_text(item.get("content", ""))
+                        if item.get("is_error"):
+                            self.append(Static(
+                                "结束提交未通过：" + text,
+                                markup=False, classes="log-line",
+                            ))
+                        else:
+                            self._show_final_reply(key[0], text)
+                        self.completed_tools.add(key)
+                        continue
                     result_block = self.pending_tools.pop(key, None)
                     if result_block is not None:
                         result_block.set_result(
-                            str(item.get("content", "")),
+                            self._tool_result_text(item.get("content", "")),
                             0,
                             is_error=bool(item.get("is_error")),
                         )
                         self.completed_tools.add(key)
+
+    # 实时终态与历史重放共用，参数、工具输出和重连事件不再各显示一遍答案。
+    def _show_final_reply(self, run_id: str, text: str) -> None:
+        if not text or run_id in self.final_replies:
+            return
+        self.final_replies.add(run_id)
+        self.break_stream()
+        previous = self.streamed_text.get(run_id, "").rstrip()
+        if previous and previous.endswith(text.rstrip()):
+            return
+        block = LLMStreamBlock()
+        block.append_token(text)
+        block.finalize_markdown()
+        self.append(block)
+
+    @staticmethod
+    def _tool_result_text(content: Any) -> str:
+        if isinstance(content, list):
+            return "\n".join(str(block.get("text", "")) for block in content
+                             if block.get("type") == "text")
+        return str(content)
 
     def handle_event(self, event: dict[str, Any]) -> None:
         prefix = str(event.get("type", "")).split(".", 1)[0]
@@ -111,6 +154,8 @@ class ConversationView(VerticalScroll):
                 self.break_stream()
                 self.current_llm_run_id = event.get("run_id")
             token = event.get("token", "")
+            run_id = str(event.get("run_id", ""))
+            self.streamed_text[run_id] = self.streamed_text.get(run_id, "") + str(token)
             if self.current_llm is None:
                 llm_block = LLMStreamBlock()
                 self.append(llm_block)
@@ -158,9 +203,11 @@ class ConversationView(VerticalScroll):
             steps = event.get("steps", 0)
             reason = event.get("reason") or ""
             if status == "success":
+                self._show_final_reply(run_id, str(event.get("result") or ""))
+                label = "本轮已提交" if event.get("result") else "completed"
                 self.append(
                     Static(
-                        f"[bold green]✓ completed[/bold green]  [dim]{steps} steps[/dim]",
+                        f"[bold green]✓ {label}[/bold green]  [dim]{steps} steps[/dim]",
                         classes="run-ok",
                     )
                 )
@@ -271,6 +318,7 @@ class ConversationView(VerticalScroll):
         t = event.get("type", "")
         if t == "step.started":
             run_id = event.get("run_id", "")
+            self.streamed_text[str(run_id)] = ""
             if run_id in self.subagent_runs:
                 return
             step = event.get("step", "")
@@ -283,6 +331,13 @@ class ConversationView(VerticalScroll):
 
     def _handle_tool(self, event: dict[str, Any]) -> None:
         t = event.get("type", "")
+        if event.get("tool_name") == "finish":
+            if t == "tool.call_failed" and not event.get("retrying"):
+                self.append(Static(
+                    "结束提交未通过：" + str(event.get("error_message", "")),
+                    markup=False, classes="log-line",
+                ))
+            return
         if t == "tool.call_started":
             tool_use_id = str(event.get("tool_use_id", ""))
             key = (str(event.get("run_id", "")), tool_use_id)
@@ -324,7 +379,7 @@ class ConversationView(VerticalScroll):
         if t == "context.compaction_started":
             self.append(
                 Static(
-                    "[dim]⚡ 正在整理上下文，先尝试程序处理…[/dim]",
+                    "[dim]⚡ 正在摘要旧历史，保留近期原文…[/dim]",
                     classes="log-line",
                 )
             )
@@ -333,7 +388,7 @@ class ConversationView(VerticalScroll):
                 "no_old_history": "没有需要压缩的旧历史",
                 "incomplete_tool_batch": "工具消息尚未完整配对",
                 "recent_context_too_large": "必须保留的近期原文过大",
-                "summary_input_too_large": "旧历史超出单次摘要请求预算",
+                "summary_input_too_large": "完整摘要请求超出输入预算",
                 "summary_request_failed": "摘要请求失败",
                 "summary_incomplete": "摘要输出未完整结束",
                 "empty_summary": "摘要为空",
@@ -343,11 +398,11 @@ class ConversationView(VerticalScroll):
                 "required_context_too_large": "固定提示与必须保留的近期原文已超预算",
                 "provider_unavailable": "需要摘要，但模型配置不可用",
                 "below_threshold": "空间充足，无需继续压缩",
-                "auto_disabled": "自动压力处理已关闭",
+                "auto_disabled": "自动摘要已关闭",
             }
             reason = reasons.get(str(event.get("reason")), str(event.get("reason", "")))
             retained = (
-                "程序化缩减已保存，未采用新摘要"
+                "候选未采用"
                 if event.get("applied_stages")
                 else "未替换工作历史"
             )
@@ -364,9 +419,6 @@ class ConversationView(VerticalScroll):
             summary = event.get("summary_tokens", 0)
             remaining = event.get("remaining_tokens", summary)
             stage_names = {
-                "tool_preview": "长结果预览",
-                "deduplicate": "重复结果去重",
-                "tool_archive": "旧结果归档",
                 "llm_summary": "LLM 摘要",
             }
             stages = " → ".join(stage_names.get(s, s) for s in event.get("applied_stages", []))
@@ -375,7 +427,8 @@ class ConversationView(VerticalScroll):
             )
             self.append(
                 Static(
-                    f"⚡ {label}  history≈{orig} → {remaining} tokens; summary≈{summary}"
+                    f"⚡ {label}  input≈{orig} → {remaining} tokens; summary≈{summary}"
+                    + f"  保留 {event.get('preserved_messages', 0)} 条消息"
                     + (f"  {stages}" if stages else ""),
                     classes="log-line",
                     markup=False,

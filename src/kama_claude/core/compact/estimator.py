@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from kama_claude.core.checkpoint.checkpoint import UsageAnchor
+from kama_claude.core.llm.tool_loading import expand_references
 
 
 # 文本按 UTF-8 字节数除以四向上取整；消息先规范序列化，计入结构字段
@@ -35,16 +36,22 @@ def _matches(
 @dataclass(frozen=True)
 class TokenCounter:
     anchor: UsageAnchor | None = None
+    schemas: list[dict[str, Any]] = field(default_factory=list)
 
     # 片段和压缩前后比较统一使用字节粗估。
-    def count(self, value: Any) -> int:
-        return estimate_bytes(value)
+    def count(self, value: Any, *, schemas: list[dict[str, Any]] | None = None) -> int:
+        schemas = self.schemas if schemas is None else schemas
+        definitions = {str(schema["name"]): schema for schema in schemas if "name" in schema}
+        return estimate_bytes(expand_references(value, definitions))
 
     # 首次请求或旧前缀失效时，重新估算完整输入。
     def raw_request(
         self, system: str, messages: list[dict[str, Any]], schemas: list[dict[str, Any]],
     ) -> int:
-        return self.count({"system": system, "messages": messages, "tools": schemas})
+        # 延迟目录不占初始上下文；引用展开的完整定义在消息位置计入。
+        return self.count({"system": system, "messages": messages, "tools": [
+            schema for schema in schemas if not schema.get("defer_loading", False)
+        ]}, schemas=schemas)
 
     # 锚点覆盖上次输入及回复，只估算之后新增的用户消息和工具结果。
     def request(
@@ -53,7 +60,7 @@ class TokenCounter:
         if self.anchor is not None and _matches(self.anchor, system, messages, schemas):
             tail = messages[self.anchor.message_count:]
             return self.anchor.input_tokens + self.anchor.output_tokens + (
-                self.count(tail) if tail else 0
+                self.count(tail, schemas=schemas) if tail else 0
             )
         return self.raw_request(system, messages, schemas)
 
@@ -75,7 +82,7 @@ class TokenEstimator:
 
     # 普通请求与摘要隔离，切换模型或估算版本不会混用旧 Usage
     def _key(self, kind: str) -> str:
-        return json.dumps(["bytes-v2", self.provider, self.model, kind], separators=(",", ":"))
+        return json.dumps(["bytes-v3", self.provider, self.model, kind], separators=(",", ":"))
 
     # 只检查锚点覆盖的前缀；历史或提示变化时直接回退全文估算。
     def select(
@@ -84,8 +91,8 @@ class TokenEstimator:
     ) -> TokenCounter:
         anchor = self.anchors.get(self._key(kind))
         if anchor is None or not _matches(anchor, system, messages, schemas):
-            return TokenCounter()
-        return TokenCounter(anchor)
+            return TokenCounter(schemas=schemas)
+        return TokenCounter(anchor, schemas)
 
     # 在上次回复末尾记录有效输入及输出 Usage；缺失用量时不推进覆盖边界。
     def observe(

@@ -37,6 +37,9 @@ DEFAULT_POLICIES: dict[str, ToolPolicy] = {
     "edit_file": ToolPolicy(default=PermissionDecision.ASK),
     "memory_read": ToolPolicy(default=PermissionDecision.ALLOW),
     "memory_write": ToolPolicy(default=PermissionDecision.ALLOW),
+    "search_tool": ToolPolicy(default=PermissionDecision.ALLOW),
+    "load_skill": ToolPolicy(default=PermissionDecision.ALLOW),
+    "finish": ToolPolicy(default=PermissionDecision.ALLOW),
 }
 
 # 未在 DEFAULT_POLICIES 中登记的工具的兜底策略，总是询问用户是否执行
@@ -53,6 +56,9 @@ _PREVIEW_KEY: dict[str, str] = {
     "edit_file": "path",
     "memory_read": "key",
     "memory_write": "key",
+    "search_tool": "description",
+    "load_skill": "name",
+    "finish": "result",
 }
 _PREVIEW_MAX = 60
 

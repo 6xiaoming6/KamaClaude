@@ -27,6 +27,7 @@ class RunFinishedEvent(BaseModel):
     status: str  # "success" | "failed"
     reason: str | None = None  # "exceeded_max_steps" | "cancelled" | "llm_error" | ...
     steps: int
+    result: str = ""  # 显式结束工具提交的完整回复；不代表业务自动验收通过。
     ts: str
 
 
@@ -209,6 +210,7 @@ class ContextCompactedEvent(BaseModel):
     remaining_tokens: int = 0
     applied_stages: list[str] = Field(default_factory=list)
     llm_used: bool = False
+    preserved_messages: int = 0  # 摘要外保留的近期消息及必要发现记录数。
     ts: str
 
 

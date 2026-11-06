@@ -22,7 +22,9 @@ from kama_claude.core.runner import AgentRunner
 from kama_claude.core.session.manager import SessionManager
 from kama_claude.core.session.store import SessionStore
 from kama_claude.core.tools.base import BaseTool, ToolResult
+from kama_claude.core.tools.builtin.finish import FinishTool
 from kama_claude.core.tools.registry import ToolRegistry
+from tests.unit.completion_support import submit_response
 
 
 class Crash(BaseException):
@@ -69,7 +71,7 @@ class Provider:
         response = self.responses.pop(0)
         if isinstance(response, BaseException):
             raise response
-        return response
+        return submit_response(response, kwargs["tool_schemas"], kwargs["run_id"], kwargs["step"])
 
 
 # 构造使用真实 Runner 和存储、仅替换外部模型及工具的管理器
@@ -88,6 +90,9 @@ def manager(
             registry = ToolRegistry()
             for tool in tools:
                 registry.register(tool)
+            run = kwargs.get("run")
+            if run is not None and run.completion_mode == "explicit":
+                registry.register(FinishTool())
             return registry
 
     return SessionManager(
@@ -207,7 +212,7 @@ async def test_resume_model_call_preserves_step(tmp_path: Path) -> None:
     await restored.resume(session.id, opened["revision"])
     await finish(restored, session.id)
     assert [call["step"] for call in provider.calls] == [1, 1]
-    assert len(store.read_messages(session.id)) == 2
+    assert len(store.read_messages(session.id)) == 3
 
 
 # 功能：验证原子替换失败时保留旧快照及修订号
@@ -368,7 +373,6 @@ async def test_compacted_snapshot_survives_restart(
     def factory() -> AgentRunner:
         runner = original_factory()
         runner._config.compaction.auto_threshold = 0.1
-        runner._config.compaction.prune_target_ratio = 0.05
         return runner
 
     mgr._runner_factory = factory
@@ -399,10 +403,10 @@ async def test_compacted_snapshot_survives_restart(
     await finish(restored, session.id)
     assert model.calls[0]["messages"][0]["content"].startswith(SUMMARY_MARKER)
     assert model.calls[0]["step"] == 1 and a.calls == 1
-    assert store.read_messages(session.id)[-1]["content"][0]["text"] == "done"
+    assert store.read_messages(session.id)[-1]["content"][0]["content"] == "done"
     await restored.send_message(session.id, "followup")
     assert model.calls[-1]["messages"][0]["content"].startswith(SUMMARY_MARKER)
-    assert store.read_messages(session.id)[-1]["content"][0]["text"] == "followed"
+    assert store.read_messages(session.id)[-1]["content"][0]["content"] == "followed"
 
 
 # 功能：验证未完成子任务阻止续跑，但仍允许用户结束原 Run
@@ -633,19 +637,20 @@ async def test_resume_uses_frozen_system_prompt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = SessionStore(tmp_path)
-    monkeypatch.setattr("kama_claude.core.runner.build_memory_context", lambda *a, **k: MemorySnapshot(text="original memory"))
+    monkeypatch.setattr("kama_claude.core.memory.context.build_memory_context", lambda *a, **k: MemorySnapshot(text="original memory"))
     provider = Provider([Crash(), LlmResponse("end_turn", text="done")])
     mgr = manager(store, provider, [])
     session = await mgr.create("chat")
     with pytest.raises(Crash):
         await mgr.send_message(session.id, "goal")
-    monkeypatch.setattr("kama_claude.core.runner.build_memory_context", lambda *a, **k: MemorySnapshot(text="changed memory"))
+    monkeypatch.setattr("kama_claude.core.memory.context.build_memory_context", lambda *a, **k: MemorySnapshot(text="changed memory"))
     restored = manager(store, provider, [])
     opened = await restored.open(session.id)
     await restored.resume(session.id, opened["revision"])
     await finish(restored, session.id)
     assert provider.calls[0]["system"] == provider.calls[1]["system"]
-    assert "original memory" in provider.calls[1]["system"]
+    assert "original memory" in json.dumps(provider.calls[1]["messages"])
+    assert "changed memory" not in json.dumps(provider.calls[1]["messages"])
 
 
 # 功能：验证旧会话首次打开可导入历史，并以检查点作为后续权威状态
@@ -830,7 +835,8 @@ async def test_tool_notification_observes_committed_result(
 
     # 记录通知当时的已提交状态，避免 publish_safe 吞掉测试断言
     async def observe(event: Any) -> None:
-        if event.type in ("tool.call_finished", "tool.call_failed"):
+        if (event.type in ("tool.call_finished", "tool.call_failed")
+                and event.tool_name == "a"):
             snapshots.append((event.type, store.checkpoints.load(session.id)))
 
     bus.subscribe(observe)

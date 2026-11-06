@@ -1,6 +1,7 @@
 from kama_claude.core.tools.builtin.bash import BashTool
 from kama_claude.core.tools.builtin.edit_file import EditFileTool
 from kama_claude.core.tools.builtin.find_files import FindFilesTool
+from kama_claude.core.tools.builtin.finish import FinishTool
 from kama_claude.core.tools.builtin.list_dir import ListDirTool
 from kama_claude.core.tools.builtin.memory import MemoryReadTool, MemoryWriteTool
 from kama_claude.core.tools.builtin.read_file import ReadFileTool
@@ -15,6 +16,7 @@ __all__ = [
     "BashTool",
     "EditFileTool",
     "FindFilesTool",
+    "FinishTool",
     "SearchTextTool",
     "ListDirTool",
     "MemoryReadTool",

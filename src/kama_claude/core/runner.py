@@ -20,19 +20,28 @@ from kama_claude.core.checkpoint.checkpoint import Checkpoint, CheckpointError, 
 from kama_claude.core.checkpoint.persistence import RunPersistence
 from kama_claude.core.config import KamaConfig
 from kama_claude.core.context import ExecutionContext
+from kama_claude.core.discovery.exposure import load_tools
+from kama_claude.core.discovery.model import digest
+from kama_claude.core.discovery.tool import SearchTool
 from kama_claude.core.events.bus import EventBus, EventHandler
 from kama_claude.core.events.writer import EventWriter
 from kama_claude.core.llm.base import LLMProvider
 from kama_claude.core.llm.factory import ProviderFactory
+from kama_claude.core.llm.tool_loading import referenced_tools
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.mcp.server import McpServerManager
-from kama_claude.core.memory.context import DEFAULT_SYSTEM, build_memory_context, compose_system
+from kama_claude.core.mcp.tool import McpTool
+from kama_claude.core.memory.context import DEFAULT_SYSTEM, initialize_prompt
 from kama_claude.core.memory.paths import project_root
 from kama_claude.core.memory.store import MemoryStore
 from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.runs import RUNS_DIR, new_run_id
 from kama_claude.core.session.model import Session
 from kama_claude.core.session.store import SessionStore
+from kama_claude.core.skills.context import retain_skill
+from kama_claude.core.skills.loader import SkillLoader
+from kama_claude.core.skills.model import SkillSnapshot
+from kama_claude.core.skills.tool import LoadSkillTool
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
 from kama_claude.core.subagent.tool import AgentResultTool, SpawnAgentTool
 from kama_claude.core.subagent.tracking import SubagentTracker
@@ -41,6 +50,7 @@ from kama_claude.core.tools.builtin import (
     MemoryReadTool,
     MemoryWriteTool,
 )
+from kama_claude.core.tools.builtin.finish import FinishTool
 from kama_claude.core.tools.factory import builtin_tools
 from kama_claude.core.tools.registry import ToolRegistry
 from kama_claude.core.trace.writer import TraceWriter
@@ -127,6 +137,12 @@ class AgentRunner:
             if _ok(memory_tool.name):
                 registry.register(memory_tool)
 
+        if run is not None and run.completion_mode == "explicit":
+            registry.register(FinishTool())
+
+        if run is not None and run.skill_catalog is not None and _ok("load_skill"):
+            registry.register(LoadSkillTool(run))
+
         # 创建子agent的工具是否注册
         if provider is not None and bus is not None and run_id is not None:
             runs_dir = child_runs_dir or self._runs_dir
@@ -171,9 +187,15 @@ class AgentRunner:
                 registry.register(AgentResultTool(self._task_registry, session_id))
         # mcp内提供的工具是否注册
         if self._mcp_manager is not None:
+            records = []
             for mcp_tool in self._mcp_manager.get_tools():
                 if _ok(mcp_tool.name):
                     registry.register(mcp_tool)
+                    records.append(mcp_tool.record)
+            if run is not None and run.tool_loading_mode in ("on_demand", "deferred") and records:
+                # MCP 全部延迟时搜索入口必需，检索范围仍严格受 MCP 白名单约束。
+                if run.tool_loading_mode == "deferred" or _ok("search_tool"):
+                    registry.register(SearchTool(run, records, self._mcp_manager.retriever))
         return registry
 
 
@@ -187,6 +209,7 @@ class AgentRunner:
         system_prompt: str | None,
         tools: list[str] | None,
         store: SessionStore,
+        *, skill: SkillSnapshot | None = None,
     ) -> None:
         context = self._create_context(
             self._new_run_state(goal, run_id, tools),
@@ -195,9 +218,12 @@ class AgentRunner:
             system_prompt_override=system_prompt,
         )
         persistence = RunPersistence(context, cp, session, store)
-        # Manager 已加入真实输入；Skill 展开的 goal 不能冒充用户原文
+        # 先登记 Manager 加入的真实输入，再附加 Skill 说明。
         message = cp.messages[-1] if cp.messages else context.messages[0]
+        context.run.user_input = str(message["content"])
         persistence.record_message(message["role"], message["content"])
+        context.run.active_skill = skill
+        context.messages = retain_skill(context.messages, skill)
         persistence.save()
 
     # 执行一次完整 Run，忽略返回的文字结果
@@ -278,10 +304,12 @@ class AgentRunner:
                 # 正常取消，比如ctrl + c取消后，会出现这个异常
                 except asyncio.CancelledError:
                     cancelled = True
-                    if persistence is not None:
-                        context.mark_interrupted("core_stopped")
-                    else:
-                        context.mark_failed("cancelled")
+                    # finish 已提交终态后取消通知，不能把磁盘上的成功降级为中断。
+                    if not context.is_done():
+                        if persistence is not None:
+                            context.mark_interrupted("core_stopped")
+                        else:
+                            context.mark_failed("cancelled")
                 except Exception:
                     logging.getLogger(__name__).exception(
                         "agent run failed run_id=%s", context.run.run_id,
@@ -347,7 +375,9 @@ class AgentRunner:
     ) -> RunCheckpoint:
         provider, model = self._providers.identity()
         return RunCheckpoint(
-            run_id=run_id, goal=goal, provider=provider, model=model,
+            run_id=run_id, goal=goal, provider=provider, model=model, completion_mode="explicit",
+            skill_catalog=(SkillLoader().list_all_skills()
+                           if tool_whitelist is None or "load_skill" in tool_whitelist else []),
             workspace=str(Path.cwd().resolve()),
             memory_project_root=str(project_root(Path.cwd())),
             max_steps=self._config.agent.max_steps,
@@ -355,6 +385,12 @@ class AgentRunner:
             max_total_tokens=self._config.agent.max_total_tokens,
             repeat_failure_limit=self._config.agent.repeat_failure_limit,
             tool_whitelist=tool_whitelist,
+            user_input=goal,
+            tool_loading_mode=(
+                ("deferred" if provider in ("anthropic", "deepseek") else "on_demand")
+                if self._config.tool_search.enabled else "all"
+            ),
+            max_loaded_schema_tokens=self._config.tool_search.max_loaded_schema_tokens,
         )
 
     # 新任务与恢复共用 Context 构建，已有系统提示优先使用冻结值
@@ -374,9 +410,7 @@ class AgentRunner:
         # 没有冻结提示才重新构建，已有值不随记忆文件变化而覆盖
         if not run.system_prompt:
             run.memory_project_root = str(memory_store.project_root)
-            run.base_system_prompt = system_prompt_override or DEFAULT_SYSTEM
-            run.memory_snapshot = build_memory_context(memory_store)
-            run.system_prompt = compose_system(run.base_system_prompt, run.memory_snapshot)
+            initialize_prompt(run, memory_store, system_prompt_override or DEFAULT_SYSTEM)
         return context
 
 
@@ -418,6 +452,11 @@ class AgentRunner:
                     frozen_registry.register(tool)
             registry = frozen_registry
         self._save_tool_schemas(context.run, registry, persistence, resuming=resuming)
+        if context.run.tool_loading_mode == "deferred":
+            # 新 Run 可继承同会话中尚在工作历史里的引用，并计入本轮 Schema 额度。
+            _, rejected = load_tools(context.run, referenced_tools(context.messages))
+            if rejected:
+                raise RuntimeError("historical tool references exceed schema budget; compact first")
         return create_agent_loop(
             provider, registry, bus, context=context, compaction=self._config.compaction,
             permission_manager=self._permission_manager, persistence=persistence,
@@ -437,6 +476,11 @@ class AgentRunner:
         resuming: bool,
     ) -> None:
         schemas = registry.tool_schemas()
+        mcp_tools = [registry.get(str(schema["name"])) for schema in schemas]
+        definitions = {
+            tool.name: digest(tool.record.server_id + tool.record.definition_hash)
+            for tool in mcp_tools if isinstance(tool, McpTool)
+        }
         if (
             resuming and run.schemas_frozen
             and json.dumps(schemas, sort_keys=True) != json.dumps(run.tool_schemas, sort_keys=True)
@@ -448,7 +492,18 @@ class AgentRunner:
             if missing:
                 run.reason += "; missing: " + ", ".join(sorted(missing))
             raise RuntimeError(run.reason)
+        if resuming and run.mcp_definition_hashes and definitions != run.mcp_definition_hashes:
+            run.reason = "MCP tool definitions or server identity changed; cannot resume"
+            raise RuntimeError(run.reason)
         run.tool_schemas = schemas
+        if not run.schemas_frozen:
+            run.mcp_tool_names = list(definitions)
+            run.mcp_definition_hashes = definitions
+            if run.tool_loading_mode == "on_demand" and run.tool_whitelist is not None:
+                selected = [name for name in run.mcp_tool_names if name in run.tool_whitelist]
+                _, rejected = load_tools(run, selected)
+                if rejected:
+                    raise RuntimeError("explicit MCP whitelist exceeds schema budget")
         run.schemas_frozen = True
         if persistence is not None:
             persistence.save()
@@ -495,6 +550,10 @@ class AgentRunner:
             await bus.publish_safe(
                 RunFinishedEvent(
                     run_id=run.run_id, status=run.status, reason=run.reason,
+                    result=(
+                        run.result if run.completion_mode == "explicit" and run.status == "success"
+                        else ""
+                    ),
                     steps=run.step, ts=_now(),
                 )
             )

@@ -39,8 +39,6 @@ def get_config() -> KamaConfig:
 
     apply_env(config)
     comp = config.compaction
-    if not 0 < comp.prune_target_ratio < (comp.auto_threshold or 0.8):
-        raise SystemExit("Config error: prune_target_ratio must be below the active threshold")
     if comp.tool_result_keep > comp.tool_result_limit:
         raise SystemExit("Config error: tool_result_keep must not exceed tool_result_limit")
     if comp.input_limit <= 0 or comp.context_window_tokens <= comp.summary_max_tokens + 1_024:

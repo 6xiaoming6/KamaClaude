@@ -134,7 +134,7 @@ async def test_full_history_survives_preview_and_next_run(tmp_path: Path) -> Non
     session = await mgr.create("chat")
     await mgr.send_message(session.id, "读取全文")
     first = await mgr.open(session.id)
-    assert len(first["messages"]) == 4
+    assert len(first["messages"]) == 5
     assert first["messages"][1]["content"][0] == response.thinking_blocks[0]
     full_result = first["messages"][2]["content"][0]["content"]
     assert full_result == "HEAD" + "中" * 12_000 + "TAIL"
@@ -142,12 +142,12 @@ async def test_full_history_survives_preview_and_next_run(tmp_path: Path) -> Non
     assert "chars omitted" in model_result and len(model_result) < len(full_result)
     await mgr.send_message(session.id, "继续追问")
     reopened = await manager(SessionStore(tmp_path), provider, [tool]).open(session.id)
-    assert reopened["messages"][:4] == first["messages"]
-    assert reopened["messages"][-2]["role"] == "user"
-    assert reopened["messages"][-2]["content"] == "继续追问"
-    assert reopened["messages"][-2]["id"]
-    assert reopened["messages"][-2]["run_id"] == reopened["run"]["run_id"]
-    assert reopened["messages"][-1]["content"] == [{"type": "text", "text": "第二轮完整答复"}]
+    assert reopened["messages"][:5] == first["messages"]
+    assert reopened["messages"][-3]["role"] == "user"
+    assert reopened["messages"][-3]["content"] == "继续追问"
+    assert reopened["messages"][-3]["id"]
+    assert reopened["messages"][-3]["run_id"] == reopened["run"]["run_id"]
+    assert reopened["messages"][-1]["content"][0]["content"] == "第二轮完整答复"
     assert await mgr.get_history(session.id) == [
         {"role": message["role"], "content": message["content"]}
         for message in reopened["messages"]
@@ -203,7 +203,7 @@ async def test_history_append_failure_preserves_completed_tool(
         if isinstance(message["content"], list)
         for block in message["content"] if block["type"] == "tool_result"
     ]
-    assert ids == ["id-a", "id-b"]
+    assert ids == ["id-a", "id-b", "finish-2"]
 
 
 # 功能：验证中断后终止的配对说明也进入完整历史，重开不会重复追加

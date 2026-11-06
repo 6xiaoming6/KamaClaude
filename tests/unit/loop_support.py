@@ -5,6 +5,7 @@ from typing import Any
 
 from kama_claude.core.compact.estimator import TokenEstimator
 from kama_claude.core.compact.manager import ContextManager
+from kama_claude.core.compact.output import ToolOutputPreparer
 from kama_claude.core.config import CompactionConfig
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.run_budget import RunBudget
@@ -24,6 +25,7 @@ def make_loop(
     tools = ToolBatchExecutor(
         context, registry, bus, budget, permission_manager=permission_manager,
         session_id=session_id, persistence=persistence,
+        output_preparer=ToolOutputPreparer(config, run_path),
     )
     context_manager = ContextManager(
         context, bus, config, estimator, compactor=compactor, provider=provider,

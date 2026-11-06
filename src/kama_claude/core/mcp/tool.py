@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from kama_claude.core.discovery.model import CatalogTool
+from kama_claude.core.discovery.store import CatalogError, CatalogStore
 from kama_claude.core.mcp.client import (
     McpClient,
     McpServerUnavailableError,
@@ -17,10 +19,17 @@ class McpTool(BaseTool):
     params_model = None  # input_schema 来自 MCP tool_def，不使用 pydantic model
 
     # 初始化 MCP 工具包装器，工具名以 server_name__ 为前缀防止命名冲突
-    def __init__(self, client: McpClient, server_name: str, tool_def: McpToolDef) -> None:
+    def __init__(
+        self, client: McpClient, server_name: str, tool_def: McpToolDef, *,
+        record: CatalogTool | None = None, catalog: CatalogStore | None = None,
+    ) -> None:
         self._client = client
         self._server_name = server_name
         self._tool_def = tool_def
+        self.server_name = server_name
+        self.record = record or CatalogTool.from_definition(server_name, server_name,
+                                                           tool_def.definition())
+        self._catalog = catalog
         self.name = f"{server_name}__{tool_def.name}"
         self.description = tool_def.description or f"MCP tool from {server_name}"
         self.input_schema: dict[str, Any] = (
@@ -29,6 +38,15 @@ class McpTool(BaseTool):
 
     # 调用 MCP server 上的工具，连接不可用或工具执行失败时返回 is_error=True
     async def invoke(self, params: dict[str, object]) -> ToolResult:
+        # 已加载工具在重连后定义改变时，不能拿旧参数静默执行新版本。
+        if self._catalog is not None:
+            try:
+                current = self._catalog.current_hash(self.record.server_id, self._tool_def.name)
+                if current != self.record.definition_hash:
+                    return ToolResult("MCP tool definition changed; start a new run or restore it.",
+                                      is_error=True, error_type="schema_error")
+            except CatalogError as exc:
+                return ToolResult(str(exc), is_error=True, error_type="runtime_error")
         try:
             content = await self._client.call_tool(self._tool_def.name, dict(params))
             return ToolResult(content=content)

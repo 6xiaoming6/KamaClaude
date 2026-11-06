@@ -148,7 +148,7 @@ async def test_loop_stops_repeated_failures_and_pairs_remaining_tools():
 # 设计：构造必须摘要的历史，但主 Run 的额度不足以发起摘要请求
 async def test_summary_budget_error_propagates():
     from tests.unit.test_compactor import history
-    config = CompactionConfig(auto_threshold=0.01, prune_target_ratio=0.005)
+    config = CompactionConfig(auto_threshold=0.01)
     inner = provider(LlmResponse("end_turn", text="unused"))
     estimator = TokenEstimator()
     managed = ManagedProvider(inner, estimator, config, budget=RunBudget(run_state(max_total_tokens=1)))

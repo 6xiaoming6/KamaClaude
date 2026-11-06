@@ -106,6 +106,7 @@ class SessionCompactResult(BaseModel):
     reason: str = ""
     applied_stages: list[str] = Field(default_factory=list)
     llm_used: bool = False
+    preserved_messages: int = 0  # 摘要外保留的近期消息及必要发现记录数。
 
 
 class SessionListCommand(BaseModel):

@@ -10,6 +10,7 @@ import anthropic
 
 from kama_claude.core.bus.events import LlmModelSelectedEvent, LlmTokenEvent, LlmUsageEvent
 from kama_claude.core.events.bus import EventBus
+from kama_claude.core.llm.tool_loading import project_references
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock, UsageStats
 
 _MODEL_CONTEXT_WINDOWS: dict[str, int] = {
@@ -36,6 +37,23 @@ _SYSTEM_PROMPT = (
 # 返回当前 UTC 时间的 ISO 8601 字符串
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _conversation_cache_point(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # messages 已是请求副本；不能把缓存标记写回检查点或完整历史。
+    for message in reversed(messages):
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            message["content"] = [{
+                "type": "text", "text": content, "cache_control": {"type": "ephemeral"},
+            }]
+            break
+        if isinstance(content, list):
+            for block in reversed(content):
+                if block.get("type") in ("text", "tool_result", "tool_use"):
+                    block["cache_control"] = {"type": "ephemeral"}
+                    return messages
+    return messages
 
 
 class AnthropicProvider:
@@ -76,16 +94,18 @@ class AnthropicProvider:
         ]
 
         tools: list[dict[str, object]] = list(tool_schemas)
-        if tools:
-            last = dict(tools[-1])
-            last["cache_control"] = {"type": "ephemeral"}
-            tools = tools[:-1] + [last]
+        # 缓存点放在常驻工具末尾，不把延迟目录误当作已进入模型的内容。
+        for index in range(len(tools) - 1, -1, -1):
+            if not tools[index].get("defer_loading", False):
+                tools[index] = {**tools[index], "cache_control": {"type": "ephemeral"}}
+                break
 
         kwargs: dict[str, object] = {
             "model": self._model,
             "max_tokens": max_output_tokens,
             "system": system_blocks,
-            "messages": messages,
+            "messages": _conversation_cache_point(project_references(messages, tools))
+            if type(self) is AnthropicProvider else project_references(messages, tools),
         }
         if tools:
             kwargs["tools"] = tools
@@ -206,7 +226,13 @@ class OpenaiProvider:
                         {
                             "role": "tool",
                             "tool_call_id": block["tool_use_id"],
-                            "content": block["content"],
+                            # Chat Completions 不接受 Anthropic 引用块；跨 Run 历史投影成文字。
+                            "content": block["content"] if isinstance(block["content"], str)
+                            else "\n".join(
+                                str(item.get("text", "")) if item.get("type") == "text"
+                                else f"Discovered tool: {item.get('tool_name', '')}"
+                                for item in block["content"]
+                            ),
                         }
                     )
                 else:

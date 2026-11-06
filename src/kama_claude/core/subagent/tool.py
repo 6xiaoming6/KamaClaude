@@ -27,6 +27,8 @@ from kama_claude.core.events.writer import EventWriter
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.memory.store import MemoryStore
 from kama_claude.core.runs import new_run_id
+from kama_claude.core.skills.loader import SkillLoader
+from kama_claude.core.skills.tool import LoadSkillTool
 from kama_claude.core.subagent.registry import (
     ActiveSubagent,
     BackgroundTaskRegistry,
@@ -35,6 +37,7 @@ from kama_claude.core.subagent.registry import (
 from kama_claude.core.subagent.report import HANDOFF_INSTRUCTIONS
 from kama_claude.core.subagent.result import PENDING_RESULT
 from kama_claude.core.tools.base import BaseTool, ToolParams, ToolResult
+from kama_claude.core.tools.builtin.finish import FinishTool
 from kama_claude.core.tools.builtin.memory import MemoryReadTool, MemoryWriteTool
 from kama_claude.core.tools.factory import builtin_tools
 from kama_claude.core.tools.registry import ToolRegistry
@@ -159,6 +162,7 @@ class SpawnAgentTool(BaseTool):
                 run=RunCheckpoint(
                     run_id=child_run_id, goal=p.prompt, max_steps=self._agent_config.max_steps,
                     model=model, provider=self._provider_name, workspace=str(self._workspace),
+                    completion_mode="explicit",
                     max_run_seconds=self._agent_config.max_run_seconds,
                     max_total_tokens=self._agent_config.max_total_tokens,
                     repeat_failure_limit=self._agent_config.repeat_failure_limit,
@@ -179,6 +183,7 @@ class SpawnAgentTool(BaseTool):
             child_bus.subscribe(_bridge)
             child_registry = self._build_child_registry(
                 child_bus, child_run_id, profile, provider=provider, model=model,
+                run=child_context.run,
             )
             child_run_path = self._runs_dir / child_run_id
             child_run_path.mkdir(parents=True, exist_ok=True)
@@ -260,6 +265,7 @@ class SpawnAgentTool(BaseTool):
         child_run_id: str,
         profile: AgentProfile | None,
         *, provider: LLMProvider | None = None, model: str | None = None,
+        run: RunCheckpoint | None = None,
     ) -> ToolRegistry:
         from kama_claude.core.task.manager import TaskManager
 
@@ -312,6 +318,14 @@ class SpawnAgentTool(BaseTool):
                 registry.register(nested)
             if _allowed("agent_result"):
                 registry.register(AgentResultTool(self._task_registry, self._session_id))
+
+        if run is not None:
+            if run.completion_mode == "explicit":
+                registry.register(FinishTool())
+            run.tool_whitelist = sorted(allowed) if allowed is not None else None
+            run.skill_catalog = SkillLoader().list_all_skills() if _allowed("load_skill") else []
+            if _allowed("load_skill"):
+                registry.register(LoadSkillTool(run))
 
         return registry
 

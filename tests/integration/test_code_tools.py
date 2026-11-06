@@ -16,6 +16,7 @@ from kama_claude.core.runner import AgentRunner
 from kama_claude.core.session.manager import SessionManager
 from kama_claude.core.session.store import SessionStore
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
+from tests.unit.completion_support import submit_response
 from tests.unit.test_command_executor import python_command
 
 
@@ -66,7 +67,10 @@ async def test_locate_read_edit_verify_pipeline(tmp_path: Path, monkeypatch: pyt
             ]
             if step == len(operations):
                 calls.append("finished")
-                return LlmResponse("end_turn", text="verified", usage=UsageStats(100, 10))
+                return submit_response(
+                    LlmResponse("end_turn", text="verified", usage=UsageStats(100, 10)),
+                    kwargs["tool_schemas"], kwargs["run_id"], kwargs["step"],
+                )
             name, params = operations[step]
             calls.append(name)
             return LlmResponse("tool_use", tool_calls=[ToolCallBlock(
@@ -92,5 +96,5 @@ async def test_locate_read_edit_verify_pipeline(tmp_path: Path, monkeypatch: pyt
     history = store.read_history(session.id)
     results = [block for message in history if isinstance(message["content"], list)
                for block in message["content"] if block.get("type") == "tool_result"]
-    assert len(results) == 5 and not any(result.get("is_error") for result in results)
+    assert len(results) == 6 and not any(result.get("is_error") for result in results)
     await manager.shutdown()

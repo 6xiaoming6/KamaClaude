@@ -19,6 +19,8 @@ class ChatPrinter:
     # 初始化 chat 模式的流式输出状态和待审批权限请求
     def __init__(self) -> None:
         self._inline = False
+        self._finished_runs: set[str] = set()
+        self._streamed: dict[str, str] = {}
         self.pending_permissions: dict[str, dict[str, Any]] = {}
 
     # 若当前 LLM token 尚未换行，则补一个换行
@@ -63,12 +65,22 @@ class ChatPrinter:
     # 按事件类型打印 chat 输出、等待提示和权限审批请求
     async def handle(self, event: dict[str, Any]) -> None:
         t = event.get("type", "")
-        if t == "llm.token":
+        if t in ("run.started", "step.started"):
+            self._streamed[str(event.get("run_id", ""))] = ""
+        elif t == "llm.token":
+            run_id = str(event.get("run_id", ""))
+            self._streamed[run_id] = self._streamed.get(run_id, "") + str(event.get("token", ""))
             print(event.get("token", ""), end="", flush=True)
             self._inline = True
         elif t == "tool.call_started":
+            if event.get("tool_name") == "finish":
+                return
             self._ensure_newline()
             print(f"[tool] {event.get('tool_name', '')}")
+        elif t == "tool.call_failed":
+            self._ensure_newline()
+            print(f"[tool] {event.get('tool_name', '')} failed: {event.get('error_message', '')}",
+                  file=sys.stderr)
         elif t == "permission.requested":
             self._ensure_newline()
             request_id = str(event["request_id"])
@@ -76,6 +88,15 @@ class ChatPrinter:
             self.show_pending_permission()
         elif t in {"permission.denied", "permission.granted"}:
             self.resolve_permission(str(event.get("request_id", "")))
+        elif t == "run.finished":
+            run_id = str(event.get("run_id", ""))
+            if run_id in self._finished_runs:
+                return
+            self._finished_runs.add(run_id)
+            result = str(event.get("result") or "")
+            self._ensure_newline()
+            if result and not self._streamed.get(run_id, "").rstrip().endswith(result.rstrip()):
+                print(result)
         elif t == "session.waiting_for_input":
             self._ensure_newline()
             print("[waiting for input]")
@@ -110,7 +131,9 @@ async def _chat_async(config: KamaConfig) -> int:
         await client.send_command(
             "event.subscribe",
             {
-                "topics": ["session.*", "run.*", "tool.*", "llm.token", "permission.*"],
+                "topics": [
+                    "session.*", "run.*", "step.started", "tool.*", "llm.token", "permission.*",
+                ],
                 "scope": f"session:{session_id}",
             },
         )

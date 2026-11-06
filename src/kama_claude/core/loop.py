@@ -11,7 +11,10 @@ from kama_claude.core.bus.events import (
 )
 from kama_claude.core.checkpoint.checkpoint import CheckpointError, ToolCheckpoint
 from kama_claude.core.compact.manager import ContextManager
+from kama_claude.core.compact.request import assemble_messages
+from kama_claude.core.completion import FINISH_INSTRUCTIONS, FINISH_REMINDER
 from kama_claude.core.context import ExecutionContext
+from kama_claude.core.discovery.exposure import callable_names
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.base import LLMProvider
 from kama_claude.core.llm.types import LlmResponse
@@ -99,19 +102,24 @@ class AgentLoop:
         await self._bus.publish_safe(StepStartedEvent(run_id=run.run_id, step=run.step, ts=_now()))
         system = run.system_prompt or context.system_prompt(
             "You are a helpful AI assistant. "
-            "Use the available tools to complete the user's goal. "
-            "When the goal is fully achieved, respond with a final answer "
-            "and do not call any more tools."
+            "Use the available tools to complete the user's goal. " + (
+                FINISH_INSTRUCTIONS if run.completion_mode == "explicit"
+                else "When the goal is fully achieved, respond with a final answer "
+                "and do not call any more tools."
+            )
         )
-        schemas = self._tools.registry.tool_schemas()
+        schemas = self._tools.model_schemas()
         # 请求前准备
         if not await self._context_manager.prepare(system, schemas):
             return False
-        # 压缩可能刷新规则和索引，模型必须使用刚提交的完整提示。
+        # 规则 system 冻结；自动记忆由统一请求投影注入。
         system = run.system_prompt or system
+        exposed = callable_names(run, context.messages) if run.schemas_frozen else {
+            str(schema["name"]) for schema in schemas
+        }
         try:
             response = await self._provider.chat(
-                messages=context.messages,
+                messages=assemble_messages(run, context.messages),
                 tool_schemas=schemas,
                 bus=self._bus,
                 run_id=run.run_id,
@@ -134,13 +142,13 @@ class AgentLoop:
             self._save_checkpoint()
             return False
         # 保存放在模型异常捕获之外，磁盘错误必须直接上抛
-        self._record_response(response)
+        self._record_response(response, exposed)
         if run.max_total_tokens and run.actual_tokens + run.estimated_tokens > run.max_total_tokens:
             raise BudgetExceeded("run_token_budget_exceeded")
         return True
 
     # 保存完整模型消息与工具批次，并根据停止原因设置下一阶段
-    def _record_response(self, response: LlmResponse) -> None:
+    def _record_response(self, response: LlmResponse, exposed: set[str]) -> None:
         context = self._context
         run = context.run
         blocks = response.content_blocks()
@@ -150,12 +158,23 @@ class AgentLoop:
         run.context_pct = response.usage.context_pct if response.usage else 0.0
         # 先登记完整工具批次并保存，之后才真正执行工具
         run.tools = [
-            ToolCheckpoint(id=t.id, name=t.name, input=t.input) for t in response.tool_calls
+            ToolCheckpoint(
+                id=t.id, name=t.name, input=t.input, exposed=t.name in exposed,
+                output_prepared=False,
+            )
+            for t in response.tool_calls
         ]
         run.tool_index = 0
-        if response.stop_reason == "end_turn":
-            run.result = response.text or ""
-            context.mark_success()
+        if response.stop_reason == "end_turn" and not response.tool_calls:
+            if run.completion_mode == "legacy":
+                run.result = response.text or ""
+                context.mark_success()
+            elif run.finish_reminders:
+                context.mark_failed("missing_finish")
+            else:
+                run.finish_reminders = 1
+                context.messages.append({"role": "user", "content": FINISH_REMINDER})
+                run.phase = "ready"
         elif response.stop_reason == "tool_use":
             run.phase = "tools"
         else:

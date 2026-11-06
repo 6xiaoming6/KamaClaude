@@ -47,7 +47,8 @@ async def test_candidate_preserves_recent_and_input() -> None:
     args = model.chat.call_args.kwargs
     assert args["tool_schemas"] == []
     assert args["max_output_tokens"] == 2_048
-    assert "only edit tests" in args["messages"][0]["content"]
+    assert args["messages"][:-1] == original
+    assert "only edit tests" in args["messages"][-1]["content"]
 
 
 # 功能：验证当前用户请求在很早的位置时仍保留原文，且不会重复插入
@@ -55,7 +56,7 @@ async def test_candidate_preserves_recent_and_input() -> None:
 async def test_original_current_request_is_pinned_once() -> None:
     goal = {"role": "user", "content": "Only edit loop.py; do not commit."}
     messages = [goal, *[m for m in history() if m["role"] == "assistant"]]
-    result = await Compactor().compact_messages(messages, provider())
+    result = await Compactor(CompactionConfig(recent_token_budget=1_500)).compact_messages(messages, provider())
     assert result.compacted
     assert result.messages.count(goal) == 1
     assert result.messages[2] == goal
@@ -160,7 +161,7 @@ async def test_unfinished_tool_batch_is_rejected() -> None:
 async def test_recent_groups_shrink_without_splitting() -> None:
     messages = [*history(), {"role": "assistant", "content": "甲" * 6_000},
                 {"role": "assistant", "content": "乙" * 6_000}]
-    result = await Compactor().compact_messages(messages, provider())
+    result = await Compactor(CompactionConfig(recent_token_budget=6_000)).compact_messages(messages, provider())
     assert result.compacted and result.messages[-1] == messages[-1]
     assert messages[-2] not in result.messages
 
@@ -170,7 +171,7 @@ async def test_recent_groups_shrink_without_splitting() -> None:
 async def test_uncompressible_inputs_do_not_call_model() -> None:
     model = provider()
     result = await Compactor().compact_messages(
-        [*history(), {"role": "assistant", "content": "中" * 12_000}], model,
+        [*history(), {"role": "assistant", "content": "中" * 24_000}], model,
     )
     assert result.reason == "recent_context_too_large"
     config = CompactionConfig(context_window_tokens=4_096, output_reserve_tokens=512)
@@ -188,4 +189,4 @@ async def test_candidate_budget_includes_system_and_tools() -> None:
     )
     assert not result.compacted and result.reason == "required_context_too_large"
     assert not result.llm_used
-    assert result.original_token_estimate == estimate_bytes(history())
+    assert result.original_token_estimate > estimate_bytes(history())

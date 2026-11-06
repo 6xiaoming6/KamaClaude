@@ -14,7 +14,7 @@ from kama_claude.core.config.environment import apply_env
 from kama_claude.core.config.toml import apply_toml
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock
-from kama_claude.core.memory.context import build_memory_context, compose_system
+from kama_claude.core.memory.context import initialize_prompt
 from kama_claude.core.memory.store import MemoryStore
 from kama_claude.core.permissions.policy import PermissionDecision, ToolPolicy, evaluate
 from kama_claude.core.runner import AgentRunner
@@ -54,11 +54,12 @@ async def test_new_run_reads_new_index(tmp_path: Path, monkeypatch: pytest.Monke
     assert "INDEX_ONLY_DECISION" not in model.calls[0]["system"]
     assert model.calls[0]["system"] == model.calls[1]["system"]
     await manager.send_message(session.id, "continue")
-    assert "INDEX_ONLY_DECISION" in model.calls[2]["system"]
+    assert "INDEX_ONLY_DECISION" in json.dumps(model.calls[2]["messages"])
+    assert "INDEX_ONLY_DECISION" not in model.calls[2]["system"]
     assert "DETAIL_ONLY_TEXT" not in model.calls[2]["system"]
     assert "Project memory index" not in json.dumps(store.read_history(session.id))
     cp = store.checkpoints.load(session.id)
-    assert cp.run.base_system_prompt and cp.run.memory_snapshot.text in cp.run.system_prompt
+    assert cp.run.base_system_prompt and cp.run.memory_snapshot.text not in cp.run.system_prompt
 
 
 # 功能：恢复沿用已提交提示，不重新读取规则或记忆文件。
@@ -74,7 +75,7 @@ async def test_resume_keeps_saved_snapshot(tmp_path: Path, monkeypatch: pytest.M
     (tmp_path / "AGENTS.md").write_text("CHANGED_RULE", encoding="utf-8")
     _, restored = setup_manager(tmp_path, model)
     opened = await restored.open(session.id)
-    with patch("kama_claude.core.runner.build_memory_context", side_effect=AssertionError("reload")):
+    with patch("kama_claude.core.memory.context.build_memory_context", side_effect=AssertionError("reload")):
         await restored.resume(session.id, opened["revision"])
         await finish(restored, session.id)
     assert model.calls[0]["system"] == model.calls[1]["system"]
@@ -172,16 +173,17 @@ async def test_protected_alias_rejected_before_execution(tmp_path: Path) -> None
 # 构造确定的程序压缩候选，隔离摘要质量，只验证刷新与提交链路。
 def refreshing_loop(path: Path, persistence=None):
     model = Mock(chat=AsyncMock(return_value=LlmResponse("end_turn", text="done")))
-    original = [{"role": "user", "content": "original history"}]
+    original = [{"role": "user", "content": "original history " * 200}]
     loop, context, events = make_loop(path, original, model, persistence=persistence)
     memory = MemoryStore(path)
-    context.run.base_system_prompt = "BASE"
-    context.run.memory_snapshot = build_memory_context(memory)
-    context.run.system_prompt = compose_system("BASE", context.run.memory_snapshot)
+    memory.home.mkdir(parents=True, exist_ok=True)
+    memory.global_path().write_text("OLD_AUTO", encoding="utf-8")
+    initialize_prompt(context.run, memory, "BASE")
+    loop._context_manager.config.auto_threshold = 0.001
     loop._context_manager._memory = memory
     candidate = CompactionResult(
-        [{"role": "user", "content": "short history"}], 100, 10,
-        compacted=True, applied_stages=["prune_results"],
+        [{"role": "user", "content": "short history"}], 10_000, 10,
+        compacted=True, applied_stages=["llm_summary"],
     )
     loop._context_manager._compactor = Mock(prepare_context=AsyncMock(return_value=candidate))
     return loop, context, model, events
@@ -195,11 +197,13 @@ async def test_compaction_refreshes_actual_model_prompt(tmp_path: Path) -> None:
     persistence = Mock()
     loop, context, model, _ = refreshing_loop(tmp_path, persistence)
     rule.write_text("NEW_RULE", encoding="utf-8")
+    loop._context_manager._memory.global_path().write_text("NEW_AUTO", encoding="utf-8")
     await loop.run()
     system = model.chat.call_args.kwargs["system"]
-    assert "NEW_RULE" in system and "OLD_RULE" not in system
+    assert "OLD_RULE" in system and "NEW_RULE" not in system
     assert system.count("Project user rules") == 1
     assert context.run.system_prompt == system and persistence.save.called
+    assert json.dumps(model.chat.call_args.kwargs["messages"]).count("NEW_AUTO") == 1
 
 
 # 功能：刷新失败保留旧历史和快照并中断，保存失败不调用模型或通知成功。
@@ -217,7 +221,7 @@ async def test_refresh_failures_stop_execution(tmp_path: Path, save_failure: boo
         with pytest.raises(CheckpointError):
             await loop.run()
     else:
-        rule.write_bytes(b"\xff")
+        loop._context_manager._memory.global_path().write_bytes(b"\xff")
         await loop.run()
         assert context.run.status == "interrupted" and "memory_refresh_failed" in context.run.reason
         assert context.messages == old_messages and context.run.system_prompt == old_system
@@ -235,11 +239,14 @@ async def test_refreshed_prompt_rechecks_budget_and_anchor(tmp_path: Path) -> No
     schemas = loop._tools.registry.tool_schemas()
     estimator.observe(context.run.system_prompt, context.messages, schemas, 1)
     assert estimator.select(context.run.system_prompt, context.messages, schemas).method == "usage_anchor"
-    rule.write_text("NEW_LARGE_RULE " * 10_000, encoding="utf-8")
+    memory = loop._context_manager._memory
+    memory.config.global_auto_tokens = 100_000
+    memory.global_path().write_text("NEW_LARGE_AUTO " * 10_000, encoding="utf-8")
     await loop.run()
     assert context.run.reason == "context_budget_exceeded" and context.run.step == 3
-    assert "NEW_LARGE_RULE" in context.run.system_prompt
-    assert estimator.select(context.run.system_prompt, context.messages, schemas).method == "bytes"
+    assert "NEW_LARGE_AUTO" not in context.run.memory_snapshot.text
+    assert "OLD_RULE" in context.run.system_prompt
+    assert estimator.select(context.run.system_prompt, context.messages, schemas).method == "usage_anchor"
     model.chat.assert_not_called()
     assert not any(event.type == "context.compacted" for event in events)
 
@@ -272,16 +279,19 @@ async def test_manual_compaction_refresh_and_commit(
     original = store.checkpoints.load(session.id)
     original_history = store.read_history(session.id)
     rule.write_text("NEW_RULE", encoding="utf-8")
+    auto = MemoryStore(tmp_path).global_path()
+    auto.parent.mkdir(parents=True, exist_ok=True)
+    auto.write_text("NEW_AUTO", encoding="utf-8")
     if mode == "read_failure":
-        rule.write_bytes(b"\xff")
+        auto.write_bytes(b"\xff")
     if mode == "hard_budget":
         manager._compaction = CompactionConfig(
             context_window_tokens=2_048, output_reserve_tokens=512, summary_max_tokens=256,
         )
         rule.write_text("NEW_RULE " * 1_000, encoding="utf-8")
     candidate = CompactionResult(
-        [{"role": "user", "content": "short history"}], 100, 10,
-        compacted=True, applied_stages=["prune_results"],
+        [{"role": "user", "content": "short history"}], 10_000, 10,
+        compacted=True, applied_stages=["llm_summary"],
     )
     events = []
 
@@ -289,7 +299,7 @@ async def test_manual_compaction_refresh_and_commit(
     async def collect(event) -> None:
         events.append(event)
         if event.type == "context.compacted":
-            assert "NEW_RULE" in store.checkpoints.load(session.id).run.system_prompt
+            assert "NEW_AUTO" in store.checkpoints.load(session.id).run.memory_snapshot.text
 
     manager._bus.subscribe(collect)
     with patch("kama_claude.core.compact.manager.Compactor.prepare_context", AsyncMock(return_value=candidate)):
@@ -299,14 +309,15 @@ async def test_manual_compaction_refresh_and_commit(
                     await manager.compact(session.id)
         else:
             result = await manager.compact(session.id)
-            assert result.compacted == (mode != "read_failure")
+            assert result.compacted == (mode == "success")
             if mode == "hard_budget":
                 assert result.reason == "context_budget_exceeded"
     saved = store.checkpoints.load(session.id)
-    if mode in ("read_failure", "save_failure"):
+    if mode != "success":
         assert saved.messages == original.messages and saved.run.system_prompt == original.run.system_prompt
     else:
-        assert "NEW_RULE" in saved.run.system_prompt
+        assert "OLD_RULE" in saved.run.system_prompt
+        assert "NEW_AUTO" in saved.run.memory_snapshot.text
     if mode != "success":
         assert not any(event.type == "context.compacted" for event in events)
     assert store.read_history(session.id) == original_history and len(model.calls) == 1

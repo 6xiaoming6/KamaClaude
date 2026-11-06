@@ -25,6 +25,7 @@ from kama_claude.core.subagent.registry import ActiveSubagent, BackgroundTaskReg
 from kama_claude.core.subagent.result import SubagentResult
 from kama_claude.core.subagent.tool import AgentResultTool, SpawnAgentTool
 from kama_claude.core.tools.builtin.read_file import ReadFileTool
+from tests.unit.completion_support import submit_response
 
 
 # 构造记录输入的假模型，默认返回真实形状的 Usage，不访问网络
@@ -44,7 +45,8 @@ class Provider:
         )
         if isinstance(response, BaseException):
             raise response
-        return await response() if callable(response) else response
+        response = await response() if callable(response) else response
+        return submit_response(response, kwargs["tool_schemas"], kwargs["run_id"], kwargs["step"])
 
 
 # 构造共享同一个注册表、固定工作区的独立委派工具
@@ -299,7 +301,10 @@ async def test_background_task_survives_new_runner(
     async def chat(**kwargs: Any) -> LlmResponse:
         run_id = kwargs["run_id"]
         if run_id in children:
-            return LlmResponse("end_turn", text="child answer", usage=UsageStats(10, 5))
+            return submit_response(
+                LlmResponse("end_turn", text="child answer", usage=UsageStats(10, 5)),
+                kwargs["tool_schemas"], run_id, kwargs["step"],
+            )
         roots[run_id] = roots.get(run_id, 0) + 1
         if roots[run_id] == 1:
             first = len(roots) == 1
@@ -308,7 +313,10 @@ async def test_background_task_survives_new_runner(
                 {"description": "child", "prompt": "child", "run_in_background": True}
                 if first else {"run_id": children[0]},
             )], usage=UsageStats(10, 5))
-        return LlmResponse("end_turn", text="parent done", usage=UsageStats(10, 5))
+        return submit_response(
+            LlmResponse("end_turn", text="parent done", usage=UsageStats(10, 5)),
+            kwargs["tool_schemas"], run_id, kwargs["step"],
+        )
 
     provider = AsyncMock()
     provider.chat.side_effect = chat
@@ -466,7 +474,7 @@ async def test_child_summary_is_managed_and_charged(tmp_path: Path) -> None:
     ])
     outcome = await background_result(spawn_tool(tmp_path, model, compaction=CompactionConfig(
         context_window_tokens=12_000, output_reserve_tokens=512, summary_max_tokens=128,
-        keep_recent_groups=1, auto_threshold=0.5,
+        keep_recent_turns=1, recent_token_budget=2_000, auto_threshold=0.5,
     )))
     summaries = [call for call in model.calls if call["run_id"] == "compact"]
     assert outcome.status == "success" and summaries
@@ -509,7 +517,7 @@ async def test_profile_model_is_applied(tmp_path: Path) -> None:
     result = await tool.invoke({"description": "test", "prompt": "g", "subagent_type": "custom"})
     assert not result.is_error and requested == ["role-model"]
     assert not original.calls and len(selected.calls) == 1
-    assert selected.calls[0]["tool_schemas"] == []
+    assert [s["name"] for s in selected.calls[0]["tool_schemas"]] == ["finish"]
     registry = tool._build_child_registry(EventBus(), "child", None,
                                           provider=selected, model="role-model")
     nested = registry.get("spawn_agent")

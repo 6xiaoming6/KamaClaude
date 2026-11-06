@@ -1,0 +1,22 @@
+{
+  "tools": [
+    {"name": "get_issue", "description": "Get a GitHub repository issue, bug report and its comments", "inputSchema": {"type": "object", "properties": {"owner": {"type": "string"}, "repo": {"type": "string"}, "issue_number": {"type": "integer"}}}},
+    {"name": "list_pull_requests", "description": "List proposed code changes awaiting review in a repository", "inputSchema": {"type": "object", "properties": {"repo": {"type": "string"}, "state": {"type": "string"}}}},
+    {"name": "get_file", "description": "Read the contents of a source code file from a repository", "inputSchema": {"type": "object", "properties": {"repo": {"type": "string"}, "path": {"type": "string"}}}},
+    {"name": "query_database", "description": "Execute a read-only SQL query and retrieve database rows", "inputSchema": {"type": "object", "properties": {"sql": {"type": "string"}, "database": {"type": "string"}}}},
+    {"name": "describe_table", "description": "Inspect database table columns, data types, primary keys and indexes", "inputSchema": {"type": "object", "properties": {"table_name": {"type": "string"}}}},
+    {"name": "web_search", "description": "Search public web pages for current information", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}}},
+    {"name": "read_document", "description": "Read a cloud document by its identifier", "inputSchema": {"type": "object", "properties": {"document_id": {"type": "string"}}}},
+    {"name": "send_mail", "description": "Send an email message to a recipient", "inputSchema": {"type": "object", "properties": {"recipient": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"}}}}
+  ],
+  "queries": [
+    {"background": "修复用户反馈的问题", "description": "get_issue issue_number comments", "expected": ["eval__get_issue"]},
+    {"background": "检查待审核的修改", "description": "list_pull_requests state repo", "expected": ["eval__list_pull_requests"]},
+    {"background": "检查订单数据", "description": "query_database sql", "expected": ["eval__query_database"]},
+    {"background": "查看项目实现", "description": "get_file path source code", "expected": ["eval__get_file"]},
+    {"background": "先了解问题的具体情况", "description": "获取缺陷报告的详细内容和讨论记录", "expected": ["eval__get_issue"]},
+    {"background": "排查字段不匹配", "description": "查看数据表有哪些字段、主键和索引", "expected": ["eval__describe_table"]},
+    {"background": "通知同事处理结果", "description": "向指定收件人发送电子邮件", "expected": ["eval__send_mail"]},
+    {"background": "查询最新资料", "description": "从互联网搜索相关网页", "expected": ["eval__web_search"]}
+  ]
+}

@@ -14,6 +14,7 @@ from kama_claude.core.runner import AgentRunner
 from kama_claude.core.session.manager import SessionManager
 from kama_claude.core.session.store import SessionStore
 from kama_claude.core.tools.base import BaseTool, ToolResult
+from kama_claude.core.tools.builtin.finish import FinishTool
 from kama_claude.core.tools.registry import ToolRegistry
 from kama_claude.core.transport.ipc_broadcaster import IpcEventBroadcaster
 from kama_claude.core.transport.socket_server import SocketServer
@@ -43,6 +44,8 @@ class FileProbe(BaseTool):
             (self.root / "b-started").touch()
             while not (self.root / "release-b").exists():
                 await asyncio.sleep(0.02)
+        if name == "a" and (self.root / "long-output").exists():
+            return ToolResult(content="HEAD" + "x" * 10_000 + "TAIL")
         return ToolResult(content=name + " complete")
 
 
@@ -64,6 +67,10 @@ class Provider:
         messages = kwargs["messages"]
         last = messages[-1]["content"]
         if isinstance(last, list) and any(b.get("type") == "tool_result" for b in last):
+            if any(schema["name"] == "finish" for schema in kwargs["tool_schemas"]):
+                return LlmResponse("tool_use", tool_calls=[ToolCallBlock(
+                    "finish-test", "finish", {"result": "done"},
+                )])
             return LlmResponse("end_turn", text="done")
         return LlmResponse(
             "tool_use",
@@ -77,6 +84,17 @@ class Provider:
 # 运行真实 Core handler、检查点与 TCP，只替换模型和有副作用工具
 async def main(root: Path, port: int) -> None:
     root.mkdir(parents=True, exist_ok=True)
+    if (root / "long-output").exists():
+        from kama_claude.core.compact import budget
+
+        original_archive = budget._archive_output
+
+        def controlled_archive(path: Path, text: str) -> None:
+            if (root / "archive-fail").exists():
+                raise OSError("controlled archive failure")
+            original_archive(path, text)
+
+        budget._archive_output = controlled_archive
     app = CoreApp()
     app._broadcaster = IpcEventBroadcaster()
     app._bus.subscribe(app._broadcaster.handle)
@@ -86,14 +104,18 @@ async def main(root: Path, port: int) -> None:
         def _build_registry(self, task_manager: Any, **kwargs: Any) -> ToolRegistry:
             registry = ToolRegistry()
             registry.register(FileProbe(root))
+            run = kwargs.get("run")
+            if run is not None and run.completion_mode == "explicit":
+                registry.register(FinishTool())
             return registry
 
     config = KamaConfig()
     if (root / "s9-mode").exists():
         config.compaction.auto_threshold = 0.05
-        config.compaction.prune_target_ratio = 0.02
     if (root / "s9-program-mode").exists():
-        config.compaction.context_window_tokens = 8_192
+        config.compaction.context_window_tokens = 65_536
+        config.compaction.auto_threshold = 0.05
+        config.compaction.recent_token_budget = 2_000
         config.compaction.output_reserve_tokens = 512
         config.compaction.summary_max_tokens = 256
     app._sessions = SessionManager(

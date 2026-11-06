@@ -22,6 +22,7 @@ from kama_claude.core.subagent.result import PENDING_RESULT, SubagentResult
 from kama_claude.core.subagent.tool import AgentResultParams, AgentResultTool, SpawnAgentTool
 from kama_claude.core.task.manager import TaskManager
 from kama_claude.core.tools.base import ToolResult
+from tests.unit.completion_support import submit_response
 
 
 class Model:
@@ -39,7 +40,10 @@ class Model:
         self.calls.append(kwargs)
         self.started.set()
         await self.release.wait()
-        return LlmResponse("end_turn", text=self.text, usage=UsageStats(10, 5))
+        return submit_response(
+            LlmResponse("end_turn", text=self.text, usage=UsageStats(10, 5)),
+            kwargs["tool_schemas"], kwargs["run_id"], kwargs["step"],
+        )
 
 
 # 构造共享注册表的工具，允许分别改变根 Run 与会话身份。
@@ -191,7 +195,10 @@ async def test_real_nested_execution_counts_descendants(tmp_path: Path) -> None:
                 "description": "grandchild", "prompt": "grandchild goal",
             })], usage=UsageStats(10, 5))
         seen.add(run_id)
-        return LlmResponse("end_turn", text="done", usage=UsageStats(10, 5))
+        return submit_response(
+            LlmResponse("end_turn", text="done", usage=UsageStats(10, 5)),
+            kwargs["tool_schemas"], run_id, kwargs["step"],
+        )
 
     model.chat = chat  # type: ignore[method-assign]
     tool = make_tool(tmp_path, model, registry, limits=SubagentConfig(max_total=2))

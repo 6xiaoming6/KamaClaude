@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kama_claude.core.events.bus import EventBus
-from kama_claude.core.llm.types import LlmResponse, UsageStats
+from kama_claude.core.llm.types import LlmResponse, ToolCallBlock, UsageStats
 from kama_claude.core.subagent.registry import ActiveSubagent, BackgroundTaskRegistry
 from kama_claude.core.subagent.result import PENDING_RESULT
 from kama_claude.core.subagent.tool import AgentResultTool, SpawnAgentTool
@@ -18,9 +18,8 @@ def _make_provider(result_text: str = "child done") -> Any:
     provider = AsyncMock()
     provider.chat = AsyncMock(
         return_value=LlmResponse(
-            stop_reason="end_turn",
-            tool_calls=[],
-            text=result_text,
+            stop_reason="tool_use",
+            tool_calls=[ToolCallBlock("finish-child", "finish", {"result": result_text})],
             usage=UsageStats(
                 input_tokens=10,
                 output_tokens=5,
@@ -93,9 +92,8 @@ async def test_agent_result_pending(tmp_path: Path) -> None:
     async def slow_chat(*args: Any, **kwargs: Any) -> LlmResponse:
         await event.wait()
         return LlmResponse(
-            stop_reason="end_turn",
-            tool_calls=[],
-            text="done",
+            stop_reason="tool_use",
+            tool_calls=[ToolCallBlock("finish-child", "finish", {"result": "done"})],
             usage=UsageStats(0, 0, 0, 0, 0.0),
         )
 
