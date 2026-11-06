@@ -100,6 +100,7 @@ class AgentLoop:
         context = self._context
         run = context.run
         await self._bus.publish_safe(StepStartedEvent(run_id=run.run_id, step=run.step, ts=_now()))
+        self._tools.deliver_subagent_notifications()
         system = run.system_prompt or context.system_prompt(
             "You are a helpful AI assistant. "
             "Use the available tools to complete the user's goal. " + (

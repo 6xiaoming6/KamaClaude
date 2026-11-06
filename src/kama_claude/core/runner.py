@@ -18,7 +18,7 @@ from kama_claude.core.bus.events import (
 )
 from kama_claude.core.checkpoint.checkpoint import Checkpoint, CheckpointError, RunCheckpoint
 from kama_claude.core.checkpoint.persistence import RunPersistence
-from kama_claude.core.config import KamaConfig
+from kama_claude.core.config import KamaConfig, SubagentConfig
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.discovery.exposure import load_tools
 from kama_claude.core.discovery.model import digest
@@ -35,6 +35,7 @@ from kama_claude.core.memory.context import DEFAULT_SYSTEM, initialize_prompt
 from kama_claude.core.memory.paths import project_root
 from kama_claude.core.memory.store import MemoryStore
 from kama_claude.core.permissions.manager import PermissionManager
+from kama_claude.core.run_budget import RunBudget
 from kama_claude.core.runs import RUNS_DIR, new_run_id
 from kama_claude.core.session.model import Session
 from kama_claude.core.session.store import SessionStore
@@ -42,8 +43,9 @@ from kama_claude.core.skills.context import retain_skill
 from kama_claude.core.skills.loader import SkillLoader
 from kama_claude.core.skills.model import SkillSnapshot
 from kama_claude.core.skills.tool import LoadSkillTool
+from kama_claude.core.subagent.query import AgentCancelTool, AgentResultTool
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
-from kama_claude.core.subagent.tool import AgentResultTool, SpawnAgentTool
+from kama_claude.core.subagent.tool import SpawnAgentTool
 from kama_claude.core.subagent.tracking import SubagentTracker
 from kama_claude.core.task.manager import TaskManager
 from kama_claude.core.tools.builtin import (
@@ -115,6 +117,7 @@ class AgentRunner:
         tool_whitelist: list[str] | None = None,
         workspace: Path | None = None,
         run: RunCheckpoint | None = None,
+        budget: RunBudget | None = None,
     ) -> ToolRegistry:
         allowed: set[str] | None = set(tool_whitelist) if tool_whitelist is not None else None
 
@@ -146,15 +149,23 @@ class AgentRunner:
         # 创建子agent的工具是否注册
         if provider is not None and bus is not None and run_id is not None:
             runs_dir = child_runs_dir or self._runs_dir
+            subagent_limits = SubagentConfig(
+                max_active=(run.subagent_max_active if run else None)
+                or self._config.subagent.max_active,
+                max_total=(run.subagent_max_total if run else None)
+                or self._config.subagent.max_total,
+            )
             self._task_registry.bind_root(
-                run_id, session_id, self._config.subagent,
+                run_id, session_id, subagent_limits,
                 known_ids=run.subagents if run is not None else (),
+                runs_dir=runs_dir,
             )
             # 恢复后派生的子任务也沿用父 Run 冻结的限制，而非重启时的新配置
             limits = replace(
                 self._config.agent, max_steps=run.max_steps,
                 max_run_seconds=run.max_run_seconds, max_total_tokens=run.max_total_tokens,
                 repeat_failure_limit=run.repeat_failure_limit,
+                no_progress_limit=run.no_progress_limit,
             ) if run is not None else self._config.agent
             provider_name, model = (run.provider, run.model) if run else self._providers.identity()
             child_tools = (
@@ -180,11 +191,14 @@ class AgentRunner:
                         memory_project_root=memory.project_root,
                         provider_name=provider_name, model=model,
                         provider_factory=self._providers.for_model, tool_whitelist=child_tools,
-                        root_run_id=run_id, subagent_config=self._config.subagent,
+                        root_run_id=run_id, subagent_config=subagent_limits,
+                        parent_budget=budget,
                     )
                 )
             if _ok("agent_result"):
                 registry.register(AgentResultTool(self._task_registry, session_id))
+            if _ok("agent_cancel"):
+                registry.register(AgentCancelTool(self._task_registry, session_id, run_id))
         # mcp内提供的工具是否注册
         if self._mcp_manager is not None:
             records = []
@@ -291,6 +305,9 @@ class AgentRunner:
                     await loop.run()
                 except CheckpointError:
                     # 保存失败立即传播，不再进入正常收尾或发布成功
+                    await self._task_registry.cancel_children(
+                        context.run.run_id, session.id if session else "",
+                    )
                     await bus.publish_safe(
                         RunInterruptedEvent(
                             run_id=context.run.run_id,
@@ -319,6 +336,11 @@ class AgentRunner:
                         context.mark_interrupted(reason)
                     else:
                         context.mark_failed(reason)
+                finally:
+                    # 子任务只服务本轮，父任务退出后不能遗留无人接收的后台执行。
+                    await self._task_registry.cancel_children(
+                        context.run.run_id, session.id if session else "",
+                    )
                 # 没有异常的话就是正常执行完一次agent loop，调用该方法收尾
                 return await self._finish_run(context, bus, persistence, cancelled=cancelled)
 
@@ -383,7 +405,10 @@ class AgentRunner:
             max_steps=self._config.agent.max_steps,
             max_run_seconds=self._config.agent.max_run_seconds,
             max_total_tokens=self._config.agent.max_total_tokens,
+            subagent_max_active=self._config.subagent.max_active,
+            subagent_max_total=self._config.subagent.max_total,
             repeat_failure_limit=self._config.agent.repeat_failure_limit,
+            no_progress_limit=self._config.agent.no_progress_limit,
             tool_whitelist=tool_whitelist,
             user_input=goal,
             tool_loading_mode=(
@@ -430,6 +455,7 @@ class AgentRunner:
         provider = self._providers.create(context.run, resuming=resuming)
         session = persistence.session if persistence else None
         store = persistence.store if persistence else None
+        budget = RunBudget(context.run, persistence=persistence)
         registry = self._build_registry(
             task_manager,
             session=session,
@@ -442,6 +468,7 @@ class AgentRunner:
             tool_whitelist=context.run.tool_whitelist,
             workspace=Path(context.run.workspace),
             run=context.run,
+            budget=budget,
         )
         if resuming and context.run.schemas_frozen:
             # 恢复只暴露原清单，新工具不能悄悄改变旧 Run 的工具范围
@@ -462,6 +489,7 @@ class AgentRunner:
             permission_manager=self._permission_manager, persistence=persistence,
             session_id=session.id if session else "", run_path=run_path, subagents=subagents,
             memory_config=self._config.memory,
+            budget=budget,
         )
 
 

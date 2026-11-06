@@ -25,6 +25,8 @@ class ToolResult:
     tool_references: list[str] = field(default_factory=list)
     ends_run: bool = False  # 结束控制信号，只有后端工具能产生，不来自模型输入。
     preserve_in_context: bool = False  # 有独立预算的流程说明，不能再裁成头尾预览。
+    # 子任务交接的内部凭据，不从模型参数或展示文案推断，不传入 Provider 消息。
+    collected_subagents: list[str] = field(default_factory=list)
 
     def message_content(self) -> str | list[dict[str, object]]:
         if not self.tool_references or self.is_error:

@@ -15,4 +15,6 @@ FINISH_INSTRUCTIONS = (
     "Do not declare completion only in ordinary text, and do not combine finish with other "
     "tool calls. Observe business tool results and report unfinished background work honestly. "
     "Do not duplicate the final answer outside finish."
+    " Collect every background subagent result with agent_result before finish. "
+    "Cancel unneeded child work with agent_cancel and collect its terminal result."
 )

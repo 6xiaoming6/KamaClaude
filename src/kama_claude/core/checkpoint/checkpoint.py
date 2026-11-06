@@ -10,6 +10,7 @@ from typing import Any, Literal, Self
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from kama_claude.core.memory.model import MemorySnapshot
+from kama_claude.core.progress import ProgressState, validate_progress_limit
 from kama_claude.core.skills.model import SkillEntry, SkillSnapshot
 
 
@@ -36,6 +37,12 @@ class ToolCheckpoint(BaseModel):
     attempts: int = 0
     output_prepared: bool = True  # 旧快照已在历史中；新调用显式设为 False。
     exposed: bool = True  # 回复产生时是否展示过此工具，防止同批先搜索再越过加载步骤。
+
+# 完成提醒的投递记录，不代替子任务终态或结果收集状态。
+class SubagentNotification(BaseModel):
+    status: str
+    delivered: bool = False
+
 
 # 一次 Run 的检查点：目标、当前步骤和状态
 # 保存恢复阶段，以及当前工具批次应该从哪里继续
@@ -72,9 +79,16 @@ class RunCheckpoint(BaseModel):
     elapsed_seconds: float = Field(default=0.0, ge=0, allow_inf_nan=False)
     actual_tokens: int = Field(default=0, ge=0)
     estimated_tokens: int = Field(default=0, ge=0)
+    # actual/estimated 是本 Run 与全部后代的总量；以下仅用于区分自身和后代。
+    child_actual_tokens: int = Field(default=0, ge=0)
+    child_estimated_tokens: int = Field(default=0, ge=0)
+    subagent_max_active: int | None = Field(default=None, gt=0)
+    subagent_max_total: int | None = Field(default=None, gt=0)
     usage_complete: bool = True
     failure_fingerprint: str = ""
     repeated_failures: int = Field(default=0, ge=0)
+    no_progress_limit: int = 0  # 旧 Run 缺省关闭，新 Run 按本轮配置冻结。
+    progress: ProgressState = Field(default_factory=ProgressState)
     step: int = 0
     status: Literal["running", "interrupted", "success", "failed"] = "running"
     phase: Literal["ready", "llm", "tools", "finished"] = "ready"
@@ -84,11 +98,18 @@ class RunCheckpoint(BaseModel):
     result: str = ""
     context_pct: float = 0.0
     subagents: dict[str, str] = Field(default_factory=dict)
+    subagent_notifications: dict[str, SubagentNotification] = Field(default_factory=dict)
     decisions: list[dict[str, Any]] = Field(default_factory=list)
 
     @model_validator(mode="after")
     # 恢复时拒绝损坏的可见列表，不能静默删掉或加载冻结目录外工具。
     def validate_loaded_tools(self) -> Self:
+        validate_progress_limit(self.no_progress_limit)
+        if (
+            self.child_actual_tokens > self.actual_tokens
+            or self.child_estimated_tokens > self.estimated_tokens
+        ):
+            raise ValueError("descendant token usage exceeds inclusive Run usage")
         if self.schemas_frozen and self.tool_loading_mode in ("on_demand", "deferred"):
             names = {str(schema["name"]) for schema in self.tool_schemas}
             if len(set(self.loaded_tool_names)) != len(self.loaded_tool_names):

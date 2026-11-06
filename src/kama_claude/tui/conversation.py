@@ -232,7 +232,8 @@ class ConversationView(VerticalScroll):
                 self.break_stream()
                 self.append(Static("上段模型输出未完成，正在重新请求。", markup=False))
             budget_text = (
-                f"预算：{method}输入估算 {estimate}"
+                ("任务树用量更新" if event.get("method") == "subagent_activity"
+                 else f"预算：{method}输入估算 {estimate}")
                 + (
                     f" / 压缩阈值 {event.get('trigger_tokens')}"
                     if event.get("trigger_tokens")
@@ -240,6 +241,12 @@ class ConversationView(VerticalScroll):
                 )
                 + f"；累计已知 {actual}"
                 f" + 估算占用 {uncertain} tokens；执行 {budget_elapsed:.1f}s"
+                + (
+                    f"；其中后代 {event.get('child_actual_tokens', 0)}"
+                    f" + 估算 {event.get('child_estimated_tokens', 0)}（已包含）"
+                    if event.get("child_actual_tokens") or event.get("child_estimated_tokens")
+                    else ""
+                )
                 + (f"；提示：{reason}" if reason else "")
             )
             budget_id = "budget-" + str(event.get("run_id", ""))

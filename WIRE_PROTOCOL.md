@@ -1592,6 +1592,8 @@ Events sent over the IPC socket (daemon → client).
 | `reason` | `string | null` | no |
 | `actual_tokens` | `integer` | no |
 | `estimated_tokens` | `integer` | no |
+| `child_actual_tokens` | `integer` | no |
+| `child_estimated_tokens` | `integer` | no |
 | `elapsed_seconds` | `number` | no |
 | `usage_complete` | `boolean` | no |
 | `ts` | `string` | yes |
@@ -1637,6 +1639,16 @@ Events sent over the IPC socket (daemon → client).
     "estimated_tokens": {
       "default": 0,
       "title": "Estimated Tokens",
+      "type": "integer"
+    },
+    "child_actual_tokens": {
+      "default": 0,
+      "title": "Child Actual Tokens",
+      "type": "integer"
+    },
+    "child_estimated_tokens": {
+      "default": 0,
+      "title": "Child Estimated Tokens",
       "type": "integer"
     },
     "elapsed_seconds": {

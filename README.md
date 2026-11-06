@@ -2,7 +2,7 @@
 
 一个基于 Python 的本地 Coding Agent。用户通过 TUI 或 CLI 输入目标，独立 Core 调用模型、执行工具并保存运行状态，前端实时显示回复、工具进度和审批。
 
-`dev` 已整合 S0–S11，重点是**可恢复执行、上下文组织、工具权限与 MCP 按需发现**。当前面向单用户、单 Core 使用；项目验证了运行机制，真实复杂任务的成功率与成本收益仍需要独立评估。
+`dev` 已整合 S0–S12，重点是**可恢复执行、上下文组织、工具权限、MCP 按需发现与子 Agent 协作**。当前面向单用户、单 Core 使用；项目验证了运行机制，真实复杂任务的成功率与成本收益仍需要独立评估。
 
 ## 先理解几个核心问题
 
@@ -54,6 +54,7 @@ flowchart TD
 | 工具批次、恢复游标、逐工具保存 | [tools/batch.py](./src/kama_claude/core/tools/batch.py)、[tools/invocation.py](./src/kama_claude/core/tools/invocation.py) |
 | 原子快照、完整历史、恢复决定 | [checkpoint/](./src/kama_claude/core/checkpoint/)、[session/store.py](./src/kama_claude/core/session/store.py) |
 | 统一 Provider、受管重试和累计预算 | [llm/](./src/kama_claude/core/llm/)、[run_budget.py](./src/kama_claude/core/run_budget.py) |
+| 重复读取与短循环保护 | [progress.py](./src/kama_claude/core/progress.py)、[工具批次入口](./src/kama_claude/core/tools/batch.py) |
 | 估算、近期保留、摘要候选与提交 | [compact/](./src/kama_claude/core/compact/) |
 | 规则、自动记忆、全局 Skill 加载 | [memory/](./src/kama_claude/core/memory/)、[skills/](./src/kama_claude/core/skills/) |
 | MCP 连接、目录哈希、混合检索 | [mcp/](./src/kama_claude/core/mcp/)、[discovery/](./src/kama_claude/core/discovery/) |
@@ -114,8 +115,9 @@ uv run kama chat
 [agent]
 max_steps = 20
 max_run_seconds = 0       # 0 关闭累计时间限制
-max_total_tokens = 0      # 0 关闭累计 Token 限制
+max_total_tokens = 0      # 整棵任务树累计 Token 上限，0 关闭
 repeat_failure_limit = 5
+no_progress_limit = 5     # 只读调用模式重复上限；0 关闭，启用范围 4～20
 
 [compaction]
 auto_threshold = 0.8      # 0 关闭自动摘要，硬预算检查仍生效
@@ -134,7 +136,11 @@ global_auto_tokens = 512
 project_index_tokens = 1024
 ```
 
-Run 的累计执行时间包含模型、工具和审批等待；恢复不重置原 Run 的预算。普通模型调用与自动摘要纳入主 Run 预算，子 Agent 暂不汇总到主 Run，手动压缩单独记用量。
+Run 的累计执行时间包含模型、工具和审批等待；恢复不重置原 Run 的预算。普通模型调用、自动摘要与子 Agent 的模型请求纳入整棵树的共享预算，手动压缩单独记用量。
+
+重复失败保护处理连续相同错误；无进展保护补充检测 `read_file`、`list_dir`、`find_files`、`search_text` 中连续重复且结果不变的调用，支持长度 1～3 的短循环。重复 3 轮时提醒模型改变方法，默认 5 轮时以 `no_progress` 停止本轮；至少等模型看到提醒后的下一 Step 仍重复才停止。同一查询结果变化、写入或其他工具调用会清空观察窗口，子 Agent 等待不纳入此检测。该机制不判断任务语义，其他形式的循环仍依靠 Step、时间及 Token 上限。
+
+`no_progress_limit` 可通过 `KAMA_AGENT_NO_PROGRESS_LIMIT` 覆盖。限制与指纹随 Run 检查点保存，恢复不重置；新 Run 重新计数，旧 Run 缺少该字段时保持关闭。工具结果未知时不自动重试，仍需用户核实。
 
 MCP 支持标准 stdio 和 Streamable HTTP。HTTP 配置示例需要替换为真实端点：
 
@@ -161,13 +167,40 @@ max_loaded_schema_tokens = 8192
 
 这些是应用层检查。获批 Shell 和远程 MCP 的实际能力不受文件工具路径校验限制；命令执行和子 Agent 没有系统沙箱。
 
+## 子 Agent 协作
+
+采用“多个只读助手＋前台修改任务”的轻量分工。默认 `explorer` 定位代码；`planner`、`reviewer` 提供只读分析；`executor` 实施修改并验证，只能前台执行。自定义角色也按与父白名单交集后的工具范围检查，包含 Shell、写记忆、写文件、派生能力或未知工具的角色不能后台运行。权限审批继续生效；这是协作约束，不是系统沙箱。
+
+模型通过以下工具协作（以下为工具参数示意）：
+
+```text
+spawn_agent(description="检查连接处理", prompt="目标、范围、约束、证据和完成条件",
+            subagent_type="explorer", run_in_background=true)
+agent_result(run_ids=["child-one", "child-two"], wait_s=10)
+agent_cancel(run_ids=["unneeded-child"])
+```
+
+以上 ID 需替换为 spawn_agent 返回的真实 Run ID。`agent_result` 一次查询 1～8 个 ID；已有结果立即返回，否则最多等到任意任务完成或超时。取消查询不取消子任务。取消子任务后仍需查询终态；父任务未收集完后台结果时不能 `finish`。父任务退出时清理自己的后代，单轮取消等待最多 2 秒，不承诺强制终止忽略取消的协程。
+
+角色从项目 `.kama/agents/`、用户 `~/.kama/agents/`、内建配置依次选择。精简目录进入 `spawn_agent` 描述，实例保存配置快照；恢复时角色定义指纹变化会被冻结 Schema 校验拒绝。未选择角色默认使用只读 explorer。
+
+后台子任务结束后，完成事件进入直接父任务的轻量通知队列。在父任务下一次模型请求的准备边界，将未投递提醒合并追加到工作上下文：`子任务 <run_id> 已结束，状态为 success，请调用 agent_result 获取结果`。提醒不包含完整报告、不算真实用户输入、不写入完整对话；重复事件去重，已收集的结果不再提醒。队列及投递记录随检查点保存，不主动打断正在进行的模型请求，也不额外创建模型请求。
+
+**预算按树共享**：每个 Run 的 `actual_tokens`、`estimated_tokens` 已包含所有后代；`child_actual_tokens`、`child_estimated_tokens` 表示其中的后代部分。自身用量为总量减后代部分。祖先只接收每笔请求的增量，不再次累加子任务报告。普通请求、自动摘要和每次重试都先检查各级余额、预留“输入估计＋输出上限”，提交根检查点后才调用模型；有效 Usage 替换预留，缺失、失败和取消保留估算占用。并发兄弟不能各自领取一份完整根预算。实际 Usage 可能超过估算，运行器会据此停止后续操作，不承诺账单绝不超过配置值。
+
+任务数量默认同根同时 3 个、累计派生 8 个，包含前台、后台与嵌套任务；数量限制随新 Run 冻结。`max_steps` 仍为每个 Agent 的循环保护；执行时间按祖先墙钟剩余量约束，不叠加并行子任务耗时。`max_total_tokens=0` 仍表示关闭 Token 上限。
+
+子 Run 在 `report.md` 外保存 `result.json`，包含真实终态、有限摘要、用量、来源和报告路径。缓存淘汰或 Core 重启后可从当前会话的运行目录重新查询，绝不自动重派。损坏记录明确报错。已完成且结果明确的子任务不会阻碍父任务续跑收集成果；没有完成记录的子任务树、结果未知的子任务及结果未知的 `spawn_agent` 仍拒绝自动恢复。
+
+升级提示：`agent_result` 参数统一为 `run_ids` 列表，旧 `run_id` 参数不再接受；新增 `agent_cancel`，角色目录进入 Schema。先完成或终止旧中断 Run，不能绕过冻结工具校验。沙箱、worktree 和子 Agent 追问本轮未实现。
+
 ## 数据保存
 
 | 默认路径 | 内容 |
 | --- | --- |
 | `~/.kama/sessions/<sid>/checkpoint.json` | 权威工作历史、Run 状态、工具游标、提示与预算快照 |
 | 同目录 `thread.jsonl`、`meta.json` | 只追加的完整对话、导出的会话元数据 |
-| 同目录 `runs/<run_id>/` | `events.jsonl`、`.tasks/`、长输出 `outputs/`、摘要副本；子 Agent 有 `report.md` |
+| 同目录 `runs/<run_id>/` | `events.jsonl`、`.tasks/`、长输出 `outputs/`、摘要副本；子 Agent 有 `report.md`、`result.json` |
 | `~/.kama/AGENTS.md`、项目 `AGENTS.md` | 用户维护的全局/项目规则 |
 | `~/.kama/AGENTS.auto.md` | Agent 维护的精简全局信息 |
 | `~/.kama/projects/<project-id>/memory/` | `MEMORY.md` 索引与主题 Markdown；项目 ID 根据规范化项目路径生成 |
@@ -201,6 +234,6 @@ uv run python scripts/gen_protocol_doc.py --check
 
 这里的 `integration` 标记专指付费模型测试；非付费命令仍覆盖真实 TCP、Core 进程重启、MCP JSON/SSE 与 TUI。Embedding 真实离线验证需配置 `KAMA_TEST_E5_MODEL_PATH`。测试数量和实测结果以运行输出为准；机制测试不代表真实代码修复成功率或 Prompt Cache 收益。
 
-当前边界：主 Agent 支持检查点恢复，未知副作用仍需用户核实；不恢复外部进程或未完成子任务树。子 Agent 在同一 Core 中运行，独立上下文、共享工作区，受根 Run 数量限制，通过 `agent_result(run_id, wait_s)` 有界等待并交回报告。`finish` 不进行业务自动验收。长会话存储成本和真实任务评估仍是后续改进点。
+当前边界：主 Agent 支持检查点恢复，未知副作用仍需用户核实；不恢复外部进程或未完成子任务树。子 Agent 在同一 Core 中运行，独立上下文、共享工作区，受根 Run 数量限制，通过 `agent_result(run_ids, wait_s)` 批量有界等待并交回报告，共享整棵任务树的 Token 上限。`finish` 不进行业务自动验收。长会话存储成本和真实任务评估仍是后续改进点。
 
 协议以 [WIRE_PROTOCOL.md](./WIRE_PROTOCOL.md) 为准。历史学习资料见 [项目面试题](./docs/interview/01-项目面试题与参考答案.md)、[模拟面试](./docs/interview/02-模拟面试与复习清单.md)、[相关八股](./docs/interview/03-相关八股与连续追问.md)；阅读时对照当前源码。dev 独立维护总览和面试资料，阶段学习文档保留在对应分支。

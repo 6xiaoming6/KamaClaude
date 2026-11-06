@@ -28,3 +28,9 @@ async def test_budget_status_updates_one_widget(monkeypatch):
         app._view.subagent_runs["child"] = "run-test"
         app._handle_event_inner({**event, "run_id": "child"})
         assert not list(app.query("#budget-child"))
+        app._handle_event_inner({
+            **event, "method": "subagent_activity", "actual_tokens": 307,
+            "estimated_tokens": 0, "child_actual_tokens": 200,
+        })
+        text = str(app.query_one("#budget-run-test", Static).render())
+        assert "任务树用量更新" in text and "累计已知 307" in text and "后代 200" in text

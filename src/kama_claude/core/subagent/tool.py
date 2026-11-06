@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
-from kama_claude.core.agents.loader import AgentProfile, AgentProfileError, AgentProfileLoader
+from kama_claude.core.agents.loader import AgentProfile, AgentProfileError
 from kama_claude.core.assembly import create_agent_loop
 from kama_claude.core.bus.events import SubagentStartedEvent
 from kama_claude.core.checkpoint.checkpoint import RunCheckpoint
@@ -26,16 +26,15 @@ from kama_claude.core.events.bus import EventBus
 from kama_claude.core.events.writer import EventWriter
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.memory.store import MemoryStore
+from kama_claude.core.run_budget import BudgetExceeded, RunBudget
 from kama_claude.core.runs import new_run_id
 from kama_claude.core.skills.loader import SkillLoader
 from kama_claude.core.skills.tool import LoadSkillTool
-from kama_claude.core.subagent.registry import (
-    ActiveSubagent,
-    BackgroundTaskRegistry,
-    SubagentLimitError,
-)
+from kama_claude.core.subagent.query import AgentCancelTool, AgentResultTool
+from kama_claude.core.subagent.registry import BackgroundTaskRegistry, SubagentLimitError
 from kama_claude.core.subagent.report import HANDOFF_INSTRUCTIONS
-from kama_claude.core.subagent.result import PENDING_RESULT
+from kama_claude.core.subagent.roles import BACKGROUND_TOOLS, RoleCatalog, effective_tools
+from kama_claude.core.subagent.tracking import SubagentTracker
 from kama_claude.core.tools.base import BaseTool, ToolParams, ToolResult
 from kama_claude.core.tools.builtin.finish import FinishTool
 from kama_claude.core.tools.builtin.memory import MemoryReadTool, MemoryWriteTool
@@ -58,11 +57,15 @@ class SpawnAgentParams(ToolParams):
     description: str = Field(min_length=1, max_length=200, description="Short task title for TUI.")
     prompt: str = Field(
         min_length=1, max_length=262_144,
-        description="Complete task and necessary context; parent conversation is not inherited.",
+        description=(
+            "Self-contained task: objective, relevant paths, constraints, required output and "
+            "completion criteria. Parent conversation is not inherited."
+        ),
     )
     run_in_background: bool = Field(default=False, description="Return a Run ID for agent_result.")
     subagent_type: str = Field(
-        default="", description="planner/executor/reviewer or a custom role; empty uses defaults.",
+        default="explorer",
+        description="Role from the frozen catalog; default explorer is read-only.",
     )
 
 
@@ -74,6 +77,9 @@ class SpawnAgentTool(BaseTool):
         "The sub-agent starts with a clean context containing only the provided prompt — "
         "it does not inherit the current conversation history. "
         "Use run_in_background=true to run in parallel; retrieve result later with agent_result."
+        " Parallel work must be read-only. Executor and any write-capable role run in foreground. "
+        "Delegate independent tasks with clear scope and evidence requirements. "
+        "Collect all background results before finish."
     )
     input_schema = SpawnAgentParams.model_json_schema()
     params_model = SpawnAgentParams
@@ -102,8 +108,10 @@ class SpawnAgentTool(BaseTool):
         subagent_config: SubagentConfig | None = None,
         memory_config: MemoryConfig | None = None,
         memory_project_root: Path | None = None,
+        parent_budget: RunBudget | None = None,
     ) -> None:
         self._provider = provider
+        self._parent_budget = parent_budget
         self._parent_bus = parent_bus
         self._parent_run_id = parent_run_id
         self._permission_manager = permission_manager
@@ -119,14 +127,19 @@ class SpawnAgentTool(BaseTool):
         self._depth = depth
         self._workspace = (workspace if workspace is not None else Path.cwd()).resolve()
         self._execution = execution or ExecutionConfig()
-        self._profiles = AgentProfileLoader(self._workspace)
+        self._profiles = RoleCatalog(self._workspace)
+        self.description = (
+            type(self).description + "\nAvailable roles:\n" + self._profiles.description
+        )
         self._memory_config = memory_config or MemoryConfig()
         self._memory_project_root = MemoryStore(
             self._workspace, self._memory_config, project=memory_project_root,
         ).project_root
         self._root_run_id = root_run_id or parent_run_id
-        self._subagent_config = subagent_config or SubagentConfig()
-        self._task_registry.bind_root(self._root_run_id, session_id, self._subagent_config)
+        self._subagent_config = replace(subagent_config or SubagentConfig())
+        self._task_registry.bind_root(
+            self._root_run_id, session_id, self._subagent_config, runs_dir=self._runs_dir,
+        )
 
     # 派生子 agent，前台时阻塞直到完成并返回结果，后台时立即返回 run_id
     async def invoke(self, params: dict[str, object]) -> ToolResult:
@@ -140,8 +153,17 @@ class SpawnAgentTool(BaseTool):
             )
 
         try:
-            profile = self._profiles.load(p.subagent_type) if p.subagent_type else None
-            model = profile.model if profile and profile.model else self._model
+            profile = self._profiles.get(p.subagent_type)
+            allowed = effective_tools(profile, self._tool_whitelist)
+            if p.run_in_background and (
+                profile.name == "executor" or allowed is None or not allowed <= BACKGROUND_TOOLS
+            ):
+                return ToolResult(
+                    "Background subagents must have only read-only tools. "
+                    "Use explorer/reviewer, or run this role in foreground.",
+                    is_error=True, error_type="invalid_operation",
+                )
+            model = profile.model or self._model
             provider = self._provider
             if model != self._model:
                 if self._provider_factory is None:
@@ -151,6 +173,11 @@ class SpawnAgentTool(BaseTool):
             return ToolResult(content=str(exc), is_error=True, error_type="configuration_error")
 
         child_run_id = new_run_id()
+        if self._parent_budget is not None:
+            try:
+                self._parent_budget.check()
+            except BudgetExceeded as exc:
+                return ToolResult(str(exc), is_error=True, error_type="budget")
         try:
             self._task_registry.reserve(child_run_id, self._root_run_id, self._session_id)
         except SubagentLimitError as exc:
@@ -165,11 +192,14 @@ class SpawnAgentTool(BaseTool):
                     completion_mode="explicit",
                     max_run_seconds=self._agent_config.max_run_seconds,
                     max_total_tokens=self._agent_config.max_total_tokens,
+                    subagent_max_active=self._subagent_config.max_active,
+                    subagent_max_total=self._subagent_config.max_total,
                     repeat_failure_limit=self._agent_config.repeat_failure_limit,
+                    no_progress_limit=self._agent_config.no_progress_limit,
                     memory_project_root=str(self._memory_project_root),
                 ),
                 system_prompt_override=(
-                    profile.system_prompt if profile else
+                    profile.system_prompt or
                     "You are a helpful AI assistant. Use tools to complete the assigned sub-task."
                 ) + HANDOFF_INSTRUCTIONS,
             )
@@ -181,9 +211,13 @@ class SpawnAgentTool(BaseTool):
                 await self._parent_bus.publish_safe(event)
 
             child_bus.subscribe(_bridge)
+            tracker = SubagentTracker(child_context.run)
+            child_bus.subscribe(tracker.handle_event)
+            budget = RunBudget(child_context.run, parent=self._parent_budget)
             child_registry = self._build_child_registry(
                 child_bus, child_run_id, profile, provider=provider, model=model,
                 run=child_context.run,
+                budget=budget,
             )
             child_run_path = self._runs_dir / child_run_id
             child_run_path.mkdir(parents=True, exist_ok=True)
@@ -191,7 +225,7 @@ class SpawnAgentTool(BaseTool):
                 provider, child_registry, child_bus, context=child_context,
                 compaction=self._compaction, permission_manager=self._permission_manager,
                 session_id=self._session_id, run_path=child_run_path,
-                memory_config=self._memory_config,
+                memory_config=self._memory_config, subagents=tracker, budget=budget,
             )
             # 先登记再发布开始事件；门闩保证父任务先记录派生关系，子任务才执行。
             start = asyncio.Event()
@@ -219,7 +253,7 @@ class SpawnAgentTool(BaseTool):
         if p.run_in_background:
             return ToolResult(content=(
                 f"Subagent started in background. run_id={child_run_id}. "
-                f"Use agent_result(run_id='{child_run_id}') to retrieve result."
+                f"Use agent_result(run_ids=['{child_run_id}']) to retrieve result."
             ))
 
         # 前台取消继续传递给子任务；结果与后台查询使用同一份已保存的交接。
@@ -244,7 +278,7 @@ class SpawnAgentTool(BaseTool):
         except asyncio.CancelledError:
             if any(tool.status in ("executing", "unknown") for tool in context.run.tools):
                 context.mark_interrupted("cancelled")
-            else:
+            elif not context.is_done():
                 context.mark_failed("cancelled")
             raise
         except Exception as exc:
@@ -255,6 +289,7 @@ class SpawnAgentTool(BaseTool):
             else:
                 context.mark_failed("subagent_error")
         finally:
+            await self._task_registry.cancel_children(context.run.run_id, self._session_id)
             # 报告落盘后才发布完成通知；失败由注册表转成明确的失败结果。
             await self._task_registry.notify_finished(context.run.run_id)
 
@@ -266,13 +301,14 @@ class SpawnAgentTool(BaseTool):
         profile: AgentProfile | None,
         *, provider: LLMProvider | None = None, model: str | None = None,
         run: RunCheckpoint | None = None,
+        budget: RunBudget | None = None,
     ) -> ToolRegistry:
         from kama_claude.core.task.manager import TaskManager
 
-        allowed = self._tool_whitelist
-        if profile is not None and profile.allowed_tools is not None:
-            requested = set(profile.allowed_tools)
-            allowed = requested if allowed is None else allowed & requested
+        allowed = (
+            self._tool_whitelist if profile is None
+            else effective_tools(profile, self._tool_whitelist)
+        )
 
         # 角色只能进一步缩小父任务明确授权的工具范围
         def _allowed(name: str) -> bool:
@@ -292,7 +328,7 @@ class SpawnAgentTool(BaseTool):
             if _allowed(tool.name):
                 registry.register(tool)
 
-        if self._depth < 1:
+        if self._depth < 1 and _allowed("spawn_agent"):
             nested = SpawnAgentTool(
                 provider=provider if provider is not None else self._provider,
                 parent_bus=child_bus,
@@ -313,11 +349,15 @@ class SpawnAgentTool(BaseTool):
                 model=model if model is not None else self._model,
                 provider_factory=self._provider_factory,
                 tool_whitelist=sorted(allowed) if allowed is not None else None,
+                parent_budget=budget,
             )
-            if _allowed("spawn_agent"):
-                registry.register(nested)
-            if _allowed("agent_result"):
-                registry.register(AgentResultTool(self._task_registry, self._session_id))
+            registry.register(nested)
+        if _allowed("agent_result"):
+            registry.register(AgentResultTool(self._task_registry, self._session_id))
+        if _allowed("agent_cancel"):
+            registry.register(AgentCancelTool(
+                self._task_registry, self._session_id, child_run_id,
+            ))
 
         if run is not None:
             if run.completion_mode == "explicit":
@@ -328,42 +368,3 @@ class SpawnAgentTool(BaseTool):
                 registry.register(LoadSkillTool(run))
 
         return registry
-
-
-class AgentResultParams(ToolParams):
-    run_id: str = Field(min_length=1, description="Child Run ID from this session's spawn_agent.")
-    wait_s: float = Field(
-        default=10, ge=0, le=30, allow_inf_nan=False,
-        description="Wait at most this many seconds; 0 queries now. Retry if still running.",
-    )
-
-
-# 查询后台 subagent 的执行状态和最终结果
-class AgentResultTool(BaseTool):
-    name = "agent_result"
-    description = (
-        "Retrieve the result of a background sub-agent previously started with spawn_agent. "
-        "Wait up to wait_s (default 10, maximum 30) seconds; 0 queries immediately. "
-        "If still running, call again later. Waiting never cancels the background task."
-    )
-    input_schema = AgentResultParams.model_json_schema()
-    params_model = AgentResultParams
-
-    # 初始化，持有共享的后台任务注册表
-    def __init__(self, task_registry: BackgroundTaskRegistry, session_id: str) -> None:
-        self._task_registry = task_registry
-        self._session_id = session_id
-
-    # 查询指定 run_id 的后台任务状态，返回结果或错误
-    async def invoke(self, params: dict[str, object]) -> ToolResult:
-        p = AgentResultParams.model_validate(params)
-        entry = await self._task_registry.wait_result(p.run_id, self._session_id, p.wait_s)
-        if entry is None:
-            return ToolResult(
-                content=f"Unknown run_id for this session: {p.run_id} (missing or expired).",
-                is_error=True,
-                error_type="runtime_error",
-            )
-        if isinstance(entry, ActiveSubagent):
-            return ToolResult(content=PENDING_RESULT)
-        return entry.as_tool_result()

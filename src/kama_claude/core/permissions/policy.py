@@ -40,6 +40,8 @@ DEFAULT_POLICIES: dict[str, ToolPolicy] = {
     "search_tool": ToolPolicy(default=PermissionDecision.ALLOW),
     "load_skill": ToolPolicy(default=PermissionDecision.ALLOW),
     "finish": ToolPolicy(default=PermissionDecision.ALLOW),
+    "agent_result": ToolPolicy(default=PermissionDecision.ALLOW),
+    "agent_cancel": ToolPolicy(default=PermissionDecision.ALLOW),
 }
 
 # 未在 DEFAULT_POLICIES 中登记的工具的兜底策略，总是询问用户是否执行

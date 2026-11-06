@@ -12,6 +12,7 @@ from kama_claude.core.context import ExecutionContext
 from kama_claude.core.discovery.exposure import callable_names, request_schemas
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import ToolCallBlock
+from kama_claude.core.progress import ProgressGuard
 from kama_claude.core.run_budget import BudgetExceeded, RunBudget
 from kama_claude.core.tools.base import ToolResult
 from kama_claude.core.tools.invocation import invoke_tool, publish_tool_result
@@ -46,12 +47,20 @@ class ToolBatchExecutor:
         self._session_id = session_id
         self._subagents = subagents
         self._outputs = output_preparer or ToolOutputPreparer(CompactionConfig(), None)
+        self._progress = ProgressGuard(context.run)
 
     # 预算检查、压缩与真实请求共用同一份可见定义。
     def model_schemas(self) -> list[dict[str, object]]:
         if self._context.run.schemas_frozen:
             return request_schemas(self._context.run)
         return self.registry.tool_schemas()
+
+    # 完成通知与工作历史一同提交，再交给请求预算和压缩处理。
+    def deliver_subagent_notifications(self) -> None:
+        if self._subagents is not None and self._subagents.deliver_notifications(
+            self._context.messages,
+        ):
+            self._save_checkpoint()
 
     # 从游标继续执行，结果、历史和游标都在这里按顺序处理
     async def run_pending(self) -> bool:
@@ -85,6 +94,7 @@ class ToolBatchExecutor:
             started_at = time.monotonic()
             attempts_before = tool.attempts
             visible = callable_names(run, context.messages)
+            registered = self.registry.get(tool.name)
             if mixed_finish:
                 result = ToolResult(
                     "No tool in this batch was executed: finish must be the only tool call. "
@@ -98,6 +108,11 @@ class ToolBatchExecutor:
                     "Tool was not exposed on this model turn. Search and use it on the next turn.",
                     is_error=True, error_type="schema_error",
                 )
+            elif (
+                self._subagents is not None and registered is not None and registered.ends_run
+                and (blocked := self._subagents.finish_error()) is not None
+            ):
+                result = blocked
             else:
                 result = await invoke_tool(
                     self.registry,
@@ -112,7 +127,10 @@ class ToolBatchExecutor:
                     notify_result=False,
                 )
 
+            warning, stalled = self._progress.observe(registered, tool.input, result)
             repeated = self._budget.record_tool_result(tool.name, tool.input, result)
+            if warning:
+                result.content += "\n" + warning
             tool.result = asdict(result)
             tool.output_prepared = False  # 本次新结果必须整理，不能继承旧快照的默认标记。
             if result.outcome_unknown:
@@ -135,7 +153,7 @@ class ToolBatchExecutor:
 
             # 先一起保存结果、消息和游标，再通知前端；保存失败就停在这里
             if self._subagents is not None:
-                self._subagents.record_result(tool, result)
+                self._subagents.record_result(result)
             self._save_checkpoint()
             if tool.status == "completed" and not self._prepare_output(tool):
                 return False
@@ -149,6 +167,8 @@ class ToolBatchExecutor:
             )
             if repeated:
                 raise BudgetExceeded("repeated_tool_failure")
+            if stalled:
+                raise BudgetExceeded("no_progress")
             if context.is_done():
                 return run.status == "success"
         self._finish_tool_batch()

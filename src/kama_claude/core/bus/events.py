@@ -271,9 +271,11 @@ class SubagentFinishedEvent(BaseModel):
     parent_run_id: str
     status: str          # "success" | "failed" | "interrupted"
     reason: str | None = None
-    # 子任务独立统计，已知用量与未知请求的估算占用分开显示
+    # 含全部后代的总量，不能再与后代事件相加。
     actual_tokens: int = 0
     estimated_tokens: int = 0
+    child_actual_tokens: int = 0
+    child_estimated_tokens: int = 0
     elapsed_seconds: float = 0.0
     usage_complete: bool = True
     ts: str
@@ -297,6 +299,8 @@ class RunBudgetEvent(BaseModel):
     trigger_tokens: int = 0  # 固定配置比例对应的压缩阈值；0 表示关闭自动压缩
     actual_tokens: int = 0
     estimated_tokens: int = 0
+    child_actual_tokens: int = 0
+    child_estimated_tokens: int = 0
     elapsed_seconds: float = 0.0
     max_total_tokens: int = 0
     max_run_seconds: int = 0

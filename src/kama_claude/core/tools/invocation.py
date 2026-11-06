@@ -17,8 +17,10 @@ from kama_claude.core.bus.events import (
     ToolCallFinishedEvent,
     ToolCallStartedEvent,
 )
+from kama_claude.core.checkpoint.checkpoint import CheckpointError
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import ToolCallBlock
+from kama_claude.core.run_budget import BudgetExceeded
 from kama_claude.core.tools.base import BaseTool, FileTool, ToolResult
 from kama_claude.core.tools.builtin.bash import BashTool
 from kama_claude.core.tools.errors import RateLimitedError, ToolError
@@ -236,6 +238,8 @@ async def _execute_attempt(
             operation,
             timeout=timeout,
         )
+    except (BudgetExceeded, CheckpointError):
+        raise
     except WorkspacePathError as exc:
         result = ToolResult(content=str(exc), is_error=True, error_type="permission_denied")
     except ToolError as exc:
@@ -296,6 +300,7 @@ async def _execute_with_retry(
 
         retry = (
             result.is_error
+            and not result.outcome_unknown
             and tool.retry_safe
             and result.error_type in _RETRYABLE
             and attempt <= _MAX_RETRIES
