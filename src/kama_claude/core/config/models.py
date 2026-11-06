@@ -26,6 +26,12 @@ class AgentConfig:
     max_run_seconds: int = 0
     max_total_tokens: int = 0
     repeat_failure_limit: int = 5
+    no_progress_limit: int = 5
+
+    def __post_init__(self) -> None:
+        from kama_claude.core.progress import validate_progress_limit
+
+        validate_progress_limit(self.no_progress_limit)
 
 
 @dataclass

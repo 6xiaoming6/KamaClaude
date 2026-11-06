@@ -49,7 +49,14 @@ class ManagedProvider:
         if self._budget is not None:
             self._budget.tick()
         if self._persistence is not None:
-            self._persistence.save()
+            try:
+                self._persistence.save()
+            except Exception as exc:
+                if self._budget is not None:
+                    self._budget.block(exc)
+                raise
+        if self._budget is not None:
+            self._budget.save_ancestors()
 
     # 发布主任务预算，摘要也归属原 Run，避免污染其他会话
     async def notify(
@@ -61,6 +68,10 @@ class ManagedProvider:
                 self._bus, self._budget, method, estimated_input, reason,
                 trigger_tokens=trigger_tokens,
             )
+            ancestor = self._budget.parent
+            while ancestor is not None:
+                await publish_budget(self._bus, ancestor, method="subagent_activity")
+                ancestor = ancestor.parent
 
     # 每次实际重试分别预留并记账，完整响应和当前请求估算严格配对
     async def chat(

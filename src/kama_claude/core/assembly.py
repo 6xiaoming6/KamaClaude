@@ -33,6 +33,7 @@ def create_agent_loop(
     persistence: RunPersistence | None = None, session_id: str = "",
     run_path: Path | None = None, subagents: SubagentTracker | None = None,
     memory_config: MemoryConfig | None = None,
+    budget: RunBudget | None = None,
 ) -> AgentLoop:
     memory = MemoryStore(
         Path(context.run.workspace), memory_config,
@@ -44,7 +45,7 @@ def create_agent_loop(
         context.run.provider, context.run.model,
         persistence.checkpoint.token_estimation if persistence else None,
     )
-    budget = RunBudget(context.run)
+    budget = budget or RunBudget(context.run, persistence=persistence)
     managed = ManagedProvider(
         provider, estimator, compaction, budget=budget, persistence=persistence, event_bus=bus,
     )

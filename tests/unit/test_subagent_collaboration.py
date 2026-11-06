@@ -16,10 +16,11 @@ from kama_claude.core.config.toml import apply_toml
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock, UsageStats
 from kama_claude.core.runner import AgentRunner
+from kama_claude.core.subagent.query import AgentResultParams, AgentResultTool
 from kama_claude.core.subagent.registry import ActiveSubagent, BackgroundTaskRegistry
 from kama_claude.core.subagent.report import write_report
 from kama_claude.core.subagent.result import PENDING_RESULT, SubagentResult
-from kama_claude.core.subagent.tool import AgentResultParams, AgentResultTool, SpawnAgentTool
+from kama_claude.core.subagent.tool import SpawnAgentTool
 from kama_claude.core.task.manager import TaskManager
 from kama_claude.core.tools.base import ToolResult
 from tests.unit.completion_support import submit_response
@@ -83,13 +84,13 @@ async def test_bounded_wait_preserves_child(tmp_path: Path) -> None:
     query = AgentResultTool(registry, "session")
     await model.started.wait()
     for duration in (0, 0.01):
-        result = await query.invoke({"run_id": run_id, "wait_s": duration})
-        assert result.content == PENDING_RESULT
+        result = await query.invoke({"run_ids": [run_id], "wait_s": duration})
+        assert PENDING_RESULT in result.content
         entry = registry.get(run_id, "session")
         assert isinstance(entry, ActiveSubagent) and not entry.task.cancelled()
     model.release.set()
-    result = await query.invoke({"run_id": run_id})
-    cached = await query.invoke({"run_id": run_id, "wait_s": 30})
+    result = await query.invoke({"run_ids": [run_id]})
+    cached = await query.invoke({"run_ids": [run_id], "wait_s": 30})
     assert result == cached and "answer" in result.content and not result.is_error
     assert len(model.calls) == 1
 
@@ -100,7 +101,7 @@ async def test_waiter_cancellation_is_isolated(tmp_path: Path) -> None:
     registry, model = BackgroundTaskRegistry(), Model(blocked=True)
     run_id, _ = await start(make_tool(tmp_path, model, registry))
     await model.started.wait()
-    waiter = asyncio.create_task(AgentResultTool(registry, "session").invoke({"run_id": run_id}))
+    waiter = asyncio.create_task(AgentResultTool(registry, "session").invoke({"run_ids": [run_id]}))
     await asyncio.sleep(0)
     waiter.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -117,7 +118,7 @@ async def test_child_cancellation_returns_result(tmp_path: Path) -> None:
     registry, model = BackgroundTaskRegistry(), Model(blocked=True)
     run_id, _ = await start(make_tool(tmp_path, model, registry))
     await model.started.wait()
-    waiter = asyncio.create_task(AgentResultTool(registry, "session").invoke({"run_id": run_id}))
+    waiter = asyncio.create_task(AgentResultTool(registry, "session").invoke({"run_ids": [run_id]}))
     await asyncio.sleep(0)
     entry = registry.get(run_id, "session")
     assert isinstance(entry, ActiveSubagent)
@@ -135,8 +136,8 @@ async def test_child_cancellation_returns_result(tmp_path: Path) -> None:
 @pytest.mark.parametrize("value", [-1, 31, float("nan"), float("inf"), "bad"])
 def test_invalid_wait(value: Any) -> None:
     with pytest.raises(ValidationError):
-        AgentResultParams.model_validate({"run_id": "child", "wait_s": value})
-    assert AgentResultParams(run_id="child").wait_s == 10
+        AgentResultParams.model_validate({"run_ids": ["child"], "wait_s": value})
+    assert AgentResultParams(run_ids=["child"]).wait_s == 10
 
 
 # 功能：并发派生不会超过活跃上限，拒绝的请求不产生开始事件或 Task。
@@ -184,6 +185,13 @@ async def test_foreground_and_nested_share_root(tmp_path: Path) -> None:
 # 设计：假模型通过真实 Loop 派生孙任务，避免只验证构造参数而遗漏调用链。
 async def test_real_nested_execution_counts_descendants(tmp_path: Path) -> None:
     registry, model = BackgroundTaskRegistry(), Model()
+    roles = tmp_path / ".kama" / "agents"
+    roles.mkdir(parents=True)
+    (roles / "coordinator.toml").write_text(
+        '[agent]\ndescription="Delegate a bounded task"\n'
+        'allowed_tools=["spawn_agent", "agent_result", "agent_cancel", "read_file"]\n',
+        encoding="utf-8",
+    )
     seen: set[str] = set()
 
     # 父任务首次回复请求一个孙任务，其余调用立即结束。
@@ -202,7 +210,9 @@ async def test_real_nested_execution_counts_descendants(tmp_path: Path) -> None:
 
     model.chat = chat  # type: ignore[method-assign]
     tool = make_tool(tmp_path, model, registry, limits=SubagentConfig(max_total=2))
-    result = await tool.invoke({"description": "child", "prompt": "goal"})
+    result = await tool.invoke({
+        "description": "child", "prompt": "goal", "subagent_type": "coordinator",
+    })
     assert not result.is_error and len(seen) == 2
     assert registry._roots[("session", "root")].spawned == seen
     assert len(list((tmp_path / "runs").glob("*/report.md"))) == 2
@@ -229,21 +239,21 @@ async def test_report_precedes_notification(tmp_path: Path) -> None:
     assert len(reports) == 1 and "answer" in reports[0]
 
 
-# 功能：查询不能观察其他会话活跃任务，也不能从缓存过期结果重新派生。
+# 功能：查询隔离会话，缓存淘汰后从磁盘取回原结果，不重新派生。
 # 设计：分别在活跃与淘汰后查询，核对调用次数和原任务状态。
 async def test_live_session_isolation_and_expired_result(tmp_path: Path) -> None:
     registry, model = BackgroundTaskRegistry(max_results=1), Model(blocked=True)
     tool = make_tool(tmp_path, model, registry)
     first, _ = await start(tool)
-    denied = await AgentResultTool(registry, "other").invoke({"run_id": first})
+    denied = await AgentResultTool(registry, "other").invoke({"run_ids": [first]})
     assert denied.is_error
     assert isinstance(registry.get(first, "session"), ActiveSubagent)
     model.release.set()
     await finish(registry, first)
     second, _ = await start(tool)
     await finish(registry, second)
-    expired = await AgentResultTool(registry, "session").invoke({"run_id": first})
-    assert expired.is_error and "expired" in expired.content
+    expired = await AgentResultTool(registry, "session").invoke({"run_ids": [first]})
+    assert not expired.is_error and first in expired.collected_subagents
     assert len(model.calls) == 2
 
 
@@ -282,7 +292,8 @@ async def test_total_survives_cache_and_runner_change(tmp_path: Path) -> None:
         run_id, _ = await start(tool)
         ids.append(run_id)
         await finish(registry, run_id)
-    assert registry.get(ids[0], "session") is None
+    assert ids[0] not in registry._results
+    assert isinstance(registry.get(ids[0], "session"), SubagentResult)
     config = KamaConfig(subagent=limits)
     runner = AgentRunner(config, provider=model, task_registry=registry)
     tools = runner._build_registry(
@@ -334,7 +345,7 @@ async def test_report_and_handoff(tmp_path: Path, background: bool) -> None:
     if background:
         run_id, _ = await start(tool)
         stored = await finish(registry, run_id)
-        result = await AgentResultTool(registry, "session").invoke({"run_id": run_id})
+        result = await AgentResultTool(registry, "session").invoke({"run_ids": [run_id]})
     else:
         result = await tool.invoke({"description": "fg", "prompt": "goal"})
         stored = next(iter(registry._results.values()))

@@ -4,7 +4,7 @@ import asyncio
 import logging
 from collections import OrderedDict
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -14,6 +14,8 @@ from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.subagent.report import write_report
 from kama_claude.core.subagent.result import SubagentResult
+from kama_claude.core.subagent.store import SubagentResultStore, SubagentStoreError
+from kama_claude.core.tools.errors import ToolError
 
 log = logging.getLogger(__name__)
 
@@ -52,14 +54,18 @@ class BackgroundTaskRegistry:
         self._roots: dict[tuple[str, str], RootQuota] = {}
         self._max_results = max_results
         self._notifications: set[asyncio.Task[None]] = set()
+        self._stores: dict[str, dict[Path, SubagentResultStore]] = {}
 
     # Runner 重建只补充已提交的派生记录，不重置已有计数。
     def bind_root(
         self, root_run_id: str, session_id: str, limits: SubagentConfig,
         known_ids: Iterable[str] = (),
+        *, runs_dir: Path,
     ) -> None:
-        quota = self._roots.setdefault((session_id, root_run_id), RootQuota(limits))
+        quota = self._roots.setdefault((session_id, root_run_id), RootQuota(replace(limits)))
         quota.spawned.update(known_ids)
+        root = runs_dir.resolve()
+        self._stores.setdefault(session_id, {}).setdefault(root, SubagentResultStore(root))
 
     # 单事件循环内同步检查并预留，不在检查与占位之间让出执行权。
     def reserve(self, run_id: str, root_run_id: str, session_id: str) -> None:
@@ -107,6 +113,8 @@ class BackgroundTaskRegistry:
         if entry.result is not None:
             return entry.result
         run = entry.context.run
+        if run.status == "running":
+            entry.context.mark_failed("subagent_incomplete")
         report_path = ""
         try:
             report_path = str(write_report(run, entry.run_path))
@@ -117,13 +125,29 @@ class BackgroundTaskRegistry:
             else:
                 entry.context.mark_failed("report_save_failed")
             run.result += f"\nReport could not be saved: {exc}"
-        entry.result = SubagentResult.from_run(
+        result = SubagentResult.from_run(
             run, entry.session_id, entry.parent_run_id, report_path,
         )
-        self._results[run_id] = entry.result
+        try:
+            SubagentResultStore(entry.run_path.parent).save(result)
+        except SubagentStoreError:
+            log.exception("subagent result metadata failed run_id=%s", run_id)
+            if result.outcome_unknown:
+                entry.context.mark_interrupted("result_save_failed")
+            else:
+                entry.context.mark_failed("result_save_failed")
+            result = SubagentResult.from_run(
+                run, entry.session_id, entry.parent_run_id, report_path,
+            )
+        entry.result = result
+        self._cache_result(result)
+        return result
+
+    def _cache_result(self, result: SubagentResult) -> None:
+        self._results[result.run_id] = result
+        self._results.move_to_end(result.run_id)
         while len(self._results) > self._max_results:
             self._results.popitem(last=False)
-        return entry.result
 
     # 查询先检查会话归属，已完成 Task 主动回收，缺失结果不重新派生。
     def get(self, run_id: str, session_id: str) -> ActiveSubagent | SubagentResult | None:
@@ -134,27 +158,29 @@ class BackgroundTaskRegistry:
             self._collect(run_id)
             entry = None
         result = (entry.result or entry) if entry is not None else self._results.get(run_id)
-        return result if result is not None and result.session_id == session_id else None
+        if result is not None:
+            return result if result.session_id == session_id else None
+        # 缓存淘汰和 Core 重启只影响内存，不使已提交的成果消失。
+        for store in self._stores.get(session_id, {}).values():
+            saved = store.load(run_id, session_id)
+            if saved is not None:
+                self._cache_result(saved)
+                return saved
+        return None
 
     # shield 隔离查询超时和查询者取消；子任务自身取消仍返回它的已收尾结果。
-    async def wait_result(
-        self, run_id: str, session_id: str, wait_s: float,
-    ) -> ActiveSubagent | SubagentResult | None:
-        entry = self.get(run_id, session_id)
-        if not isinstance(entry, ActiveSubagent) or wait_s == 0:
-            return entry
-        try:
-            await asyncio.wait_for(asyncio.shield(entry.task), timeout=wait_s)
-        except TimeoutError:
-            pass
-        except asyncio.CancelledError:
-            current = asyncio.current_task()
-            if current is not None and current.cancelling():
-                raise
-        except Exception:
-            # 任务异常由回收入口读取并转换为子任务结果。
-            pass
-        return self.get(run_id, session_id)
+    async def wait_results(
+        self, run_ids: list[str], session_id: str, wait_s: float,
+    ) -> dict[str, ActiveSubagent | SubagentResult | None]:
+        entries = {run_id: self.get(run_id, session_id) for run_id in run_ids}
+        tasks = {entry.task for entry in entries.values() if isinstance(entry, ActiveSubagent)}
+        # 有结果或错误立即返回；其余场景最多等到任意任务完成，不逐个累加超时。
+        if tasks and wait_s and all(
+            isinstance(entry, ActiveSubagent) for entry in entries.values()
+        ):
+            await asyncio.wait(tasks, timeout=wait_s, return_when=asyncio.FIRST_COMPLETED)
+        # asyncio.wait 的超时和查询者取消都不会取消传入的业务 Task。
+        return {run_id: self.get(run_id, session_id) for run_id in run_ids}
 
     # 统一通知终态；报告已经写入，通知失败不会触发任务重跑。
     async def notify_finished(self, run_id: str) -> None:
@@ -171,6 +197,8 @@ class BackgroundTaskRegistry:
             reason=result.reason, actual_tokens=result.actual_tokens,
             estimated_tokens=result.estimated_tokens, elapsed_seconds=result.elapsed_seconds,
             usage_complete=result.usage_complete, ts=datetime.now(UTC).isoformat(),
+            child_actual_tokens=result.child_actual_tokens,
+            child_estimated_tokens=result.child_estimated_tokens,
         )
 
     # 回收异常与活跃名额；协程尚未开始便取消时，也保存报告并补发一次通知。
@@ -182,7 +210,10 @@ class BackgroundTaskRegistry:
         if missing_finalization:
             run = entry.context.run
             if entry.task.cancelled():
-                entry.context.mark_failed("cancelled")
+                if any(tool.status in {"executing", "unknown"} for tool in run.tools):
+                    entry.context.mark_interrupted("cancelled")
+                elif run.status == "running":
+                    entry.context.mark_failed("cancelled")
             else:
                 error = entry.task.exception()
                 if error is not None:
@@ -193,23 +224,74 @@ class BackgroundTaskRegistry:
             self.finalize(run_id)
             notice = asyncio.create_task(entry.bus.publish_safe(self._finished_event(entry)))
             self._notifications.add(notice)
-            notice.add_done_callback(self._notifications.discard)
+            notice.add_done_callback(self._notice_done)
         elif not entry.task.cancelled():
             entry.task.exception()
         self._tasks.pop(run_id)
 
+    def _notice_done(self, task: asyncio.Task[None]) -> None:
+        self._notifications.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            log.error("subagent completion notification failed: %s", task.exception())
+
+    # 停止本轮派生的后代；不会取消同会话中其他根 Run 的任务。
+    async def cancel_children(self, parent_run_id: str, session_id: str) -> None:
+        owners = {parent_run_id}
+        while True:
+            children = {
+                run_id for run_id, entry in self._tasks.items()
+                if entry.session_id == session_id and (
+                    entry.parent_run_id in owners or entry.root_run_id == parent_run_id
+                )
+            }
+            if children <= owners:
+                break
+            owners.update(children)
+        await self._cancel_tasks({
+            entry.task for run_id, entry in self._tasks.items()
+            if run_id != parent_run_id and run_id in owners
+        })
+
+    async def cancel_child(self, run_id: str, parent_run_id: str, session_id: str) -> str:
+        entry = self.get(run_id, session_id)
+        if entry is None:
+            raise ToolError("unknown child Run ID", "not_found")
+        if entry.parent_run_id != parent_run_id and (
+            not isinstance(entry, ActiveSubagent) or entry.root_run_id != parent_run_id
+        ):
+            raise ToolError("cannot cancel another parent Run's task", "permission_denied")
+        if not isinstance(entry, ActiveSubagent):
+            return "already finished"
+        await self._cancel_tasks({entry.task})
+        await self.cancel_children(run_id, session_id)
+        return "cancelled" if entry.task.done() else "cancellation requested; still running"
+
+    async def _cancel_tasks(self, tasks: set[asyncio.Task[None]]) -> None:
+        if not tasks:
+            return
+        for task in tasks:
+            if not task.cancelling():
+                task.cancel()
+        _, pending = await asyncio.wait(tasks, timeout=2.0)
+        if pending:
+            log.warning("subagent cancellation timed out; remaining=%d", len(pending))
+            for task in pending:
+                task.cancel()
+
     # 会话关闭清除对应根配额；Core 退出取消全部，等待工具完成有界清理。
     async def cancel(self, *, session_id: str | None = None) -> None:
-        tasks = [
+        tasks = {
             entry.task for entry in list(self._tasks.values())
             if session_id is None or entry.session_id == session_id
-        ]
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        }
+        await self._cancel_tasks(tasks)
         if self._notifications:
-            await asyncio.gather(*list(self._notifications), return_exceptions=True)
+            _, pending = await asyncio.wait(set(self._notifications), timeout=2.0)
+            for task in pending:
+                task.cancel()
         for key in list(self._roots):
             if session_id is None or key[0] == session_id:
-                del self._roots[key]
+                # 不配合取消的任务继续占据额度，不能假装已释放。
+                if not any((entry.session_id, entry.root_run_id) == key
+                           for entry in self._tasks.values()):
+                    del self._roots[key]

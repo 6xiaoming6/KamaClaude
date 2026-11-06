@@ -107,6 +107,7 @@ def _apply_agent(config: KamaConfig, value: Any) -> None:
         raise SystemExit("Config error: [agent] must be a table")
     unknown_agent: set[str] = set(agent.keys()) - {
         "max_steps", "max_run_seconds", "max_total_tokens", "repeat_failure_limit",
+        "no_progress_limit",
     }
     if unknown_agent:
         raise SystemExit(f"Unknown [agent] keys: {', '.join(sorted(unknown_agent))}")
@@ -116,11 +117,13 @@ def _apply_agent(config: KamaConfig, value: Any) -> None:
             raise SystemExit("Config error: agent.max_steps must be a positive integer")
         config.agent.max_steps = val
 
-    for key in ("max_run_seconds", "max_total_tokens", "repeat_failure_limit"):
+    for key in ("max_run_seconds", "max_total_tokens", "repeat_failure_limit", "no_progress_limit"):
         if key in agent:
             value = agent[key]
             if type(value) is not int or value < 0:
                 raise SystemExit(f"Config error: agent.{key} must be a nonnegative integer")
+            if key == "no_progress_limit" and value != 0 and not 4 <= value <= 20:
+                raise SystemExit("Config error: no_progress_limit must be 0 or from 4 to 20")
             setattr(config.agent, key, value)
 
 

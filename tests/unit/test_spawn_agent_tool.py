@@ -9,9 +9,10 @@ import pytest
 
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock, UsageStats
+from kama_claude.core.subagent.query import AgentResultTool
 from kama_claude.core.subagent.registry import ActiveSubagent, BackgroundTaskRegistry
 from kama_claude.core.subagent.result import PENDING_RESULT
-from kama_claude.core.subagent.tool import AgentResultTool, SpawnAgentTool
+from kama_claude.core.subagent.tool import SpawnAgentTool
 
 
 def _make_provider(result_text: str = "child done") -> Any:
@@ -109,8 +110,8 @@ async def test_agent_result_pending(tmp_path: Path) -> None:
     run_id = spawn_result.content.split("run_id=")[1].split(".")[0]
 
     result_tool = AgentResultTool(registry, "sess-test")
-    result = await result_tool.invoke({"run_id": run_id, "wait_s": 0})
-    assert result.content == PENDING_RESULT
+    result = await result_tool.invoke({"run_ids": [run_id], "wait_s": 0})
+    assert PENDING_RESULT in result.content
     assert not result.is_error
 
     event.set()
@@ -135,7 +136,7 @@ async def test_agent_result_done(tmp_path: Path) -> None:
     await asyncio.wait_for(task, timeout=5.0)
 
     result_tool = AgentResultTool(registry, "sess-test")
-    result = await result_tool.invoke({"run_id": run_id})
+    result = await result_tool.invoke({"run_ids": [run_id]})
     assert not result.is_error
     assert "final answer" in result.content
 
@@ -161,7 +162,7 @@ async def test_nesting_limit(tmp_path: Path) -> None:
 async def test_agent_result_unknown_run_id(tmp_path: Path) -> None:
     registry = BackgroundTaskRegistry()
     tool = AgentResultTool(registry, "sess-test")
-    result = await tool.invoke({"run_id": "nonexistent-id"})
+    result = await tool.invoke({"run_ids": ["nonexistent-id"]})
     assert result.is_error
     assert "Unknown" in result.content
 

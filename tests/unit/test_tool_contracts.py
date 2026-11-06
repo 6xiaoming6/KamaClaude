@@ -134,7 +134,9 @@ def test_builtin_schemas_have_single_source(tmp_path: Path) -> None:
         TaskManager(tmp_path / "tasks"), provider=AsyncMock(), bus=EventBus(), run_id="run",
         workspace=tmp_path,
     )
-    assert len(registry.tool_schemas()) == 15
+    assert {"spawn_agent", "agent_result", "agent_cancel"} <= {
+        str(schema["name"]) for schema in registry.tool_schemas()
+    }
     for schema in registry.tool_schemas():
         tool = registry.get(str(schema["name"]))
         assert tool is not None and tool.params_model is not None

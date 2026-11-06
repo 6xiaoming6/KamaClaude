@@ -102,7 +102,7 @@ def _apply_agent(config: KamaConfig) -> None:
             raise SystemExit(
                 f"Config error: KAMA_MAX_STEPS must be an integer, got: {max_steps_str!r}"
             )
-    for key in ("max_run_seconds", "max_total_tokens", "repeat_failure_limit"):
+    for key in ("max_run_seconds", "max_total_tokens", "repeat_failure_limit", "no_progress_limit"):
         name = "KAMA_AGENT_" + key.upper()
         raw = os.environ.get(name)
         if raw is not None:
@@ -112,6 +112,8 @@ def _apply_agent(config: KamaConfig) -> None:
                 raise SystemExit(f"Config error: {name} must be a nonnegative integer") from exc
             if amount < 0:
                 raise SystemExit(f"Config error: {name} must be a nonnegative integer")
+            if key == "no_progress_limit" and amount != 0 and not 4 <= amount <= 20:
+                raise SystemExit(f"Config error: {name} must be 0 or from 4 to 20")
             setattr(config.agent, key, amount)
 
 

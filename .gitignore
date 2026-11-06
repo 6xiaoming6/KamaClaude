@@ -19,7 +19,6 @@ uv.lock
 # Local practice files
 /workspace/
 
-# dev keeps its overview, interviews and improvement outline
+# S12 only adds its own learning document; existing tracked documents remain untouched.
 /docs/*
-!/docs/interview/
-!/docs/S8-二次开发改进大纲.md
+!/docs/S12-子Agent协作与共享预算.md

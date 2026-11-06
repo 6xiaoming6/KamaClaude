@@ -180,3 +180,24 @@ async def test_failed_event_has_valid_error_class(monkeypatch: pytest.MonkeyPatc
     for e in events:
         if e.type == "tool.call_failed":  # type: ignore[attr-defined]
             assert e.error_class in valid_classes  # type: ignore[attr-defined]
+
+
+async def test_unknown_result_never_retries_even_if_tool_declares_retry_safe(monkeypatch):
+    class UnknownTool(BaseTool):
+        name = "unknown-result"
+        description = "controlled uncertain outcome"
+        input_schema = {"type": "object", "properties": {}}
+        retry_safe = True
+
+        def __init__(self):
+            self.calls = 0
+
+        async def invoke(self, params):
+            self.calls += 1
+            return ToolResult("uncertain", is_error=True, error_type="runtime_error",
+                              outcome_unknown=True)
+
+    tool = UnknownTool()
+    result, events = await _run(tool, monkeypatch=monkeypatch)
+    assert result.outcome_unknown and result.is_error and tool.calls == 1
+    assert len([event for event in events if event.type == "tool.call_failed"]) == 1

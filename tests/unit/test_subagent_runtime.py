@@ -21,9 +21,10 @@ from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.runner import AgentRunner
 from kama_claude.core.session.manager import SessionManager
 from kama_claude.core.session.store import SessionStore
+from kama_claude.core.subagent.query import AgentResultTool
 from kama_claude.core.subagent.registry import ActiveSubagent, BackgroundTaskRegistry
 from kama_claude.core.subagent.result import SubagentResult
-from kama_claude.core.subagent.tool import AgentResultTool, SpawnAgentTool
+from kama_claude.core.subagent.tool import SpawnAgentTool
 from kama_claude.core.tools.builtin.read_file import ReadFileTool
 from tests.unit.completion_support import submit_response
 
@@ -83,7 +84,7 @@ async def test_failure_status_is_not_success(tmp_path: Path, background: bool) -
     if background:
         outcome = await background_result(tool)
         result = await AgentResultTool(tool._task_registry, "session").invoke({
-            "run_id": outcome.run_id,
+            "run_ids": [outcome.run_id],
         })
     else:
         result = await tool.invoke({"description": "test", "prompt": "goal"})
@@ -100,11 +101,12 @@ async def test_completed_cache_is_bounded_and_scoped(tmp_path: Path) -> None:
     first = await background_result(tool)
     second = await background_result(tool)
     assert not registry._tasks
-    assert registry.get(first.run_id, "session") is None
+    assert first.run_id not in registry._results
+    assert registry.get(first.run_id, "session") == first
     assert registry.get(second.run_id, "other") is None
-    assert registry.get(second.run_id, "session") is second
+    assert registry.get(second.run_id, "session") == second
     assert not hasattr(second, "messages") and not hasattr(second, "context")
-    denied = await AgentResultTool(registry, "other").invoke({"run_id": second.run_id})
+    denied = await AgentResultTool(registry, "other").invoke({"run_ids": [second.run_id]})
     assert denied.is_error
 
 
@@ -282,7 +284,7 @@ def test_role_model_uses_same_backend(provider_type: Any) -> None:
 
 # 功能：验证新建 Runner 后仍可收集上一轮后台任务
 # 设计：通过真实 SessionManager 连续发送两轮消息，仅替换模型，不绕过 Runner 组装
-async def test_background_task_survives_new_runner(
+async def test_completed_background_result_survives_new_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -306,12 +308,13 @@ async def test_background_task_survives_new_runner(
                 kwargs["tool_schemas"], run_id, kwargs["step"],
             )
         roots[run_id] = roots.get(run_id, 0) + 1
-        if roots[run_id] == 1:
-            first = len(roots) == 1
+        first = len(roots) == 1
+        if (first and roots[run_id] <= 2) or (not first and roots[run_id] == 1):
+            delegate = first and roots[run_id] == 1
             return LlmResponse("tool_use", tool_calls=[ToolCallBlock(
-                "delegate" if first else "collect", "spawn_agent" if first else "agent_result",
+                "delegate" if delegate else "collect", "spawn_agent" if delegate else "agent_result",
                 {"description": "child", "prompt": "child", "run_in_background": True}
-                if first else {"run_id": children[0]},
+                if delegate else {"run_ids": [children[0]]},
             )], usage=UsageStats(10, 5))
         return submit_response(
             LlmResponse("end_turn", text="parent done", usage=UsageStats(10, 5)),
@@ -405,6 +408,7 @@ def test_restored_parent_passes_frozen_limits(tmp_path: Path) -> None:
     assert isinstance(spawn, SpawnAgentTool)
     assert spawn._agent_config == AgentConfig(
         max_steps=3, max_total_tokens=20_000, max_run_seconds=60, repeat_failure_limit=2,
+        no_progress_limit=0,
     )
 
 
@@ -448,7 +452,9 @@ async def test_child_hard_context_limit_and_unknown_result(
     model = Provider(LlmResponse("tool_use", tool_calls=[ToolCallBlock(
         "write", "write_file", {"path": "a.txt", "content": "x"},
     )]))
-    result = await spawn_tool(tmp_path, model).invoke({"description": "write", "prompt": "g"})
+    result = await spawn_tool(tmp_path, model).invoke({
+        "description": "write", "prompt": "g", "subagent_type": "executor",
+    })
     assert result.is_error and result.outcome_unknown
     assert "unknown_tool_result" in result.content and len(model.calls) == 1
 

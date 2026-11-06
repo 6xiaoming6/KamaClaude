@@ -29,7 +29,7 @@ class _ProfileConfig(BaseModel):
     model: str = ""
 
 
-# 按两级优先级（项目本地 > 用户全局 > 内建）查找并解析角色配置
+# 项目本地 > 用户全局 > 内建；目录和实际派生使用同一份配置。
 class AgentProfileLoader:
     _BUILTIN_DIR = Path(__file__).parent / "builtin"
 
@@ -48,6 +48,22 @@ class AgentProfileLoader:
                 except (OSError, ValueError, KeyError, TypeError, ValidationError) as exc:
                     raise AgentProfileError(f"invalid agent profile {name}: {path}: {exc}") from exc
         raise AgentProfileError(f"unknown subagent type: {name}")
+
+    # 仅扫描角色元信息；损坏角色仍列入目录，并在选择时明确拒绝。
+    def catalog(self) -> tuple[dict[str, AgentProfile], dict[str, str]]:
+        directories = [
+            self._BUILTIN_DIR, Path("~/.kama/agents").expanduser(),
+            self._workspace / ".kama" / "agents",
+        ]
+        names = {path.stem for directory in directories for path in directory.glob("*.toml")}
+        profiles: dict[str, AgentProfile] = {}
+        errors: dict[str, str] = {}
+        for name in sorted(names):
+            try:
+                profiles[name] = self.load(name)
+            except AgentProfileError as exc:
+                errors[name] = str(exc)
+        return profiles, errors
 
     # 返回 [项目本地, 用户全局, 内建] 路径；load() 返回第一个存在的，项目本地优先级最高
     def _search_paths(self, name: str) -> list[Path]:

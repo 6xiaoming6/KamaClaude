@@ -76,9 +76,22 @@ class SessionRecovery:
             unknown = [t for t in run.tools if t.status in ("executing", "unknown")]
 
             # 一些必要性前置检查
-            if any(
-                state in ("running", "unknown", "background") for state in run.subagents.values()
-            ) or any(tool.name == "spawn_agent" for tool in unknown):
+            from kama_claude.core.subagent.store import SubagentResultStore, SubagentStoreError
+
+            # 仅复用已落盘且结果明确的成果；没有完成记录的子任务树仍禁止恢复。
+            results = SubagentResultStore(self._store.runs_dir(str(cp.session["id"])))
+            unfinished = False
+            for child_id, state in run.subagents.items():
+                if state not in {"running", "unknown", "background"}:
+                    continue
+                try:
+                    saved = results.load(child_id, str(cp.session["id"]))
+                except SubagentStoreError as exc:
+                    raise HandlerError(RECOVERY_REQUIRED, str(exc)) from exc
+                if saved is None or saved.outcome_unknown:
+                    unfinished = True
+                    break
+            if unfinished or any(tool.name == "spawn_agent" for tool in unknown):
                 raise HandlerError(
                     RECOVERY_REQUIRED, "unfinished subagent recovery is not supported"
                 )
