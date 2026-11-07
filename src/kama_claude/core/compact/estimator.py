@@ -6,15 +6,17 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from kama_claude.core.checkpoint.checkpoint import UsageAnchor
+from kama_claude.core.llm.images import image_estimate_projection
 from kama_claude.core.llm.tool_loading import expand_references
 
 
 # 文本按 UTF-8 字节数除以四向上取整；消息先规范序列化，计入结构字段
 def estimate_bytes(value: Any) -> int:
+    value, image_tokens = image_estimate_projection(value)
     text = value if isinstance(value, str) else json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     )
-    return (len(text.encode("utf-8")) + 3) // 4
+    return (len(text.encode("utf-8")) + 3) // 4 + image_tokens
 
 
 # 指纹同时覆盖系统提示、工具定义和已统计的消息前缀，检测历史原地修改
@@ -82,7 +84,7 @@ class TokenEstimator:
 
     # 普通请求与摘要隔离，切换模型或估算版本不会混用旧 Usage
     def _key(self, kind: str) -> str:
-        return json.dumps(["bytes-v3", self.provider, self.model, kind], separators=(",", ":"))
+        return json.dumps(["bytes-v4", self.provider, self.model, kind], separators=(",", ":"))
 
     # 只检查锚点覆盖的前缀；历史或提示变化时直接回退全文估算。
     def select(

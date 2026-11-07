@@ -21,7 +21,11 @@ from kama_claude.core.bus.events import (
     SkillInvokedEvent,
 )
 from kama_claude.core.checkpoint.checkpoint import Checkpoint, CheckpointError
-from kama_claude.core.checkpoint.recovery import RECOVERY_REQUIRED, SessionRecovery
+from kama_claude.core.checkpoint.recovery import (
+    RECOVERY_CONFLICT,
+    RECOVERY_REQUIRED,
+    SessionRecovery,
+)
 from kama_claude.core.compact.manager import compact_session
 from kama_claude.core.config import CompactionConfig, MemoryConfig
 from kama_claude.core.events.bus import EventBus
@@ -77,6 +81,7 @@ class SessionManager:
         self._sessions: dict[str, Session] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._tasks: dict[str, asyncio.Task[str]] = {}
+        self._stop_requests: dict[str, asyncio.Event] = {}
         self._stopping = False
         self._load_errors: dict[str, str] = {}
         self._skill_loader = SkillLoader()
@@ -212,6 +217,7 @@ class SessionManager:
                 session=session,
                 store=self._store,
                 checkpoint=checkpoint,
+                stop_event=self._stop_requests.get(sid),
             )
             # Runner 已提交 Run 和会话终态
             cp = self._store.checkpoints.load(sid)
@@ -241,6 +247,7 @@ class SessionManager:
     def _start(
         self, sid: str, run_id: str, execution: Coroutine[Any, Any, str],
     ) -> asyncio.Task[str]:
+        self._stop_requests[sid] = asyncio.Event()
         task = asyncio.create_task(execution)
         # Core 持有业务 Task，客户端连接只负责等待或观察
         self._tasks[sid] = task
@@ -249,6 +256,7 @@ class SessionManager:
         def done(completed: asyncio.Task[str]) -> None:
             if self._tasks.get(sid) is completed:
                 self._tasks.pop(sid, None)
+                self._stop_requests.pop(sid, None)
             if not completed.cancelled() and completed.exception() is not None:
                 error = completed.exception()
                 log.error("session run failed sid=%s error=%s", sid, error)
@@ -356,7 +364,38 @@ class SessionManager:
                 )
             return {"run_id": run.run_id, "status": run.status, "revision": cp.revision}
 
-    # 显式关闭会话，进行中的运行必须先结束
+    # 请求安全停止：当前工具自然完成，之后保存中断位置；不关闭会话。
+    async def interrupt(
+        self, sid: str, run_id: str | None = None, *, wait: bool = False,
+    ) -> dict[str, Any]:
+        self._get_session(sid)
+        cp = self._store.ensure_checkpoint(sid)
+        if run_id is not None and (cp.run is None or cp.run.run_id != run_id):
+            raise HandlerError(RECOVERY_CONFLICT, "run changed; reopen session before interrupting")
+        task = self._tasks.get(sid)
+        requested = task is not None and not task.done()
+        if requested and task is not None:
+            self._stop_requests[sid].set()
+            if self._permissions is not None and cp.run is not None:
+                self._permissions.interrupt_waiting(sid)
+            if not wait:
+                return {"run_id": cp.run.run_id if cp.run else None,
+                        "status": "stopping", "revision": cp.revision}
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                caller = asyncio.current_task()
+                if caller is not None and caller.cancelling():
+                    raise
+        cp = self._recovery.recover_orphaned_run(sid, running=self.is_running(sid))
+        self._sessions[sid] = Session.from_dict(cp.session)
+        return {
+            "run_id": cp.run.run_id if cp.run else None,
+            "status": cp.run.status if cp.run else cp.session["status"],
+            "revision": cp.revision,
+        }
+
+    # 显式关闭会话，进行中的运行必须先通过 interrupt 完成收尾。
     async def close(self, sid: str) -> None:
         session = self._get_session(sid)
         if self.is_running(sid) or self._locks[sid].locked():
@@ -364,15 +403,16 @@ class SessionManager:
         async with self._locks[sid]:
             cp = self._store.ensure_checkpoint(sid)
             if cp.run and cp.run.status == "interrupted":
-                cp.run.status = "failed"
-                cp.run.phase = "finished"
+                # 复用终止逻辑补齐未完成工具的配对结果，不丢失未知副作用说明。
+                self._recovery.prepare_resume(cp, cp.revision, "abort")
                 cp.run.reason = "session_closed"
             if self._task_registry is not None:
                 await self._task_registry.cancel(session_id=sid)
             session.status = "closed"
             session.updated_at = _now()
             cp.session = session.to_dict()
-            self._store.checkpoints.save(cp)
+            self._store.save_checkpoint(cp)
+            self._store.export_meta(session)
             if self._permissions is not None:
                 self._permissions.cancel_session(sid, reason="session_closed")
             await self._bus.publish_safe(SessionClosedEvent(session_id=sid, ts=_now()))

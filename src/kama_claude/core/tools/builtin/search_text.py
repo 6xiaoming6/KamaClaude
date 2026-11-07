@@ -1,30 +1,36 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from collections import deque
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 import regex
 from pydantic import Field, model_validator
 
 from kama_claude.core.tools.base import FileTool, ToolParams, ToolResult
 from kama_claude.core.tools.errors import ToolError
-from kama_claude.core.tools.files import MAX_OUTPUT_BYTES, ReadBudget, text_lines
+from kama_claude.core.tools.files import ReadBudget, text_lines
+from kama_claude.core.tools.output import json_result
 from kama_claude.core.tools.traversal import DirectoryScanner, matches_glob
 from kama_claude.core.workspace import WorkspacePathError
 
 
 class SearchTextParams(ToolParams):
-    pattern: str = Field(min_length=1, max_length=512)
-    path: str = "."
-    include: str = Field(default="**/*", min_length=1, max_length=512)
-    literal: bool = True
-    case_sensitive: bool = True
-    context_lines: int = Field(default=1, ge=0, le=3)
-    limit: int = Field(default=100, ge=1, le=200)
-    include_ignored: bool = False
+    pattern: str = Field(min_length=1, max_length=512, description="Single-line text or regex.")
+    path: str = Field(default=".", min_length=1, description="Directory or concrete text file.")
+    include: str = Field(default="**/*", min_length=1, max_length=512,
+                         description="Relative file glob within path, e.g. **/*.py.")
+    output_mode: Literal["matches", "files"] = Field(
+        default="matches", description="Return matching lines/context, or matching files/counts.",
+    )
+    literal: bool = Field(default=True, description="False enables bounded single-line regex.")
+    case_sensitive: bool = Field(default=True, description="Use case-sensitive matching.")
+    context_lines: int = Field(default=1, ge=0, le=3,
+                               description="Before/after lines per match; ignored in files mode.")
+    limit: int = Field(default=100, ge=1, le=200,
+                       description="Maximum matching lines (matches) or files (files).")
+    include_ignored: bool = Field(default=False, description="Include ignored/generated entries.")
 
     @model_validator(mode="after")
     # 非法正则在审批和执行前报参数错误，逐行搜索不接收多行模式
@@ -43,11 +49,14 @@ class SearchTextTool(FileTool):
     name = "search_text"
     retry_safe = True
     description = (
-        "Search UTF-8 file contents and return JSON paths, line numbers and short context. "
+        "Search UTF-8 contents. Use output_mode=files to locate files and count matching lines; "
+        "then matches mode to get line numbers and short context, and read_file to inspect code. "
+        "Counts are per line, not per occurrence; count_complete=false means only a lower bound. "
         "Literal matching is default; literal=false enables a regex with a per-match timeout. "
         "path may be a directory or a single file. Relative paths use the workspace and external "
         "paths require approval. Skips binary/invalid text, links and ignored entries; reports "
-        "partial scans. Regexes do not span lines. Output is limited to 50 KiB."
+        "partial scans. Regexes do not span lines. JSON is limited to 8000 characters/50 KiB; "
+        "narrow path/include/pattern when truncated. No matches in a partial scan prove nothing."
     )
     params_model = SearchTextParams
     input_schema = SearchTextParams.model_json_schema()
@@ -69,6 +78,7 @@ class SearchTextTool(FileTool):
             0 if params.case_sensitive else regex.IGNORECASE,
         )
         matches: list[dict[str, Any]] = []
+        found_files: list[dict[str, Any]] = []
         skipped_files = 0
         unread_files = 0
         skipped_lines = 0
@@ -78,6 +88,8 @@ class SearchTextTool(FileTool):
                 continue
             before: deque[dict[str, object]] = deque(maxlen=params.context_lines)
             pending: list[dict[str, Any]] = []
+            matching_lines = 0
+            file_complete = True
             try:
                 for line in text_lines(path, budget):
                     context = {"line": line.number, "text": line.text[:400]}
@@ -88,10 +100,17 @@ class SearchTextTool(FileTool):
                     ]
                     if line.shortened:
                         skipped_lines += 1
+                        file_complete = False
                         before.append(context)
                         continue
                     found = expression.search(line.text, timeout=0.05)
                     if found is not None:
+                        if params.output_mode == "files":
+                            if matching_lines == 0 and len(found_files) >= params.limit:
+                                reason = "result_limit"
+                                break
+                            matching_lines += 1
+                            continue
                         if len(matches) >= params.limit:
                             reason = "result_limit"
                             break
@@ -107,13 +126,23 @@ class SearchTextTool(FileTool):
                     before.append(context)
             except TimeoutError:
                 reason = "regex_timeout"
+                file_complete = False
             except WorkspacePathError:
                 raise
             except (UnicodeError, ToolError):
                 skipped_files += 1
+                file_complete = False
+                if matching_lines:
+                    unread_files += 1  # 已经返回的计数是下界，整体也必须标记不完整。
             except (PermissionError, FileNotFoundError):
                 skipped_files += 1
                 unread_files += 1
+                file_complete = False
+            if matching_lines:
+                found_files.append({
+                    "path": path.relative_to(base).as_posix(), "matching_lines": matching_lines,
+                    "count_complete": file_complete and not budget.reason and not reason,
+                })
             if reason or not budget.check():
                 break
         reason = (
@@ -121,16 +150,13 @@ class SearchTextTool(FileTool):
             or ("unreadable_entries" if unread_files or scanner.skipped else "")
         )
         result = {
-            "root": str(root), "matches": matches,
+            "root": str(base), "output_mode": params.output_mode,
             "truncated": bool(reason or scanner.skipped), "reason": reason,
             "skipped_files": skipped_files, "skipped_lines": skipped_lines,
             "unreadable_files": unread_files,
             "skipped_directories": scanner.skipped,
         }
-        # 后续上下文也计入输出上限，不能因命中很多行而撑爆模型输入
-        while matches and len(json.dumps(result, ensure_ascii=False).encode()) > MAX_OUTPUT_BYTES:
-            matches.pop()
-            result["truncated"], result["reason"] = True, "output_limit"
-        if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) > MAX_OUTPUT_BYTES:
-            raise ToolError("result metadata exceeds output limit", "resource_limit")
-        return ToolResult(content=json.dumps(result, ensure_ascii=False))
+        key = "files" if params.output_mode == "files" else "matches"
+        result[key] = found_files if key == "files" else matches
+        result["hint"] = "Narrow path/include/pattern if partial; read_file at a matched line."
+        return json_result(result, key)

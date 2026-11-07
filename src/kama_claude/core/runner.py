@@ -27,6 +27,7 @@ from kama_claude.core.events.bus import EventBus, EventHandler
 from kama_claude.core.events.writer import EventWriter
 from kama_claude.core.llm.base import LLMProvider
 from kama_claude.core.llm.factory import ProviderFactory
+from kama_claude.core.llm.images import supports_images
 from kama_claude.core.llm.tool_loading import referenced_tools
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.mcp.server import McpServerManager
@@ -118,6 +119,7 @@ class AgentRunner:
         workspace: Path | None = None,
         run: RunCheckpoint | None = None,
         budget: RunBudget | None = None,
+        stop_event: asyncio.Event | None = None,
     ) -> ToolRegistry:
         allowed: set[str] | None = set(tool_whitelist) if tool_whitelist is not None else None
 
@@ -127,7 +129,9 @@ class AgentRunner:
 
         registry = ToolRegistry()
         workspace = workspace if workspace is not None else Path.cwd()
-        for tool in builtin_tools(workspace, self._config.execution, task_manager):
+        provider_name, model = (run.provider, run.model) if run else self._providers.identity()
+        for tool in builtin_tools(workspace, self._config.execution, task_manager,
+                                  image_support=supports_images(provider_name, model)):
             if _ok(tool.name):
                 registry.register(tool)
         memory = MemoryStore(
@@ -194,6 +198,7 @@ class AgentRunner:
                         provider_factory=self._providers.for_model, tool_whitelist=child_tools,
                         root_run_id=run_id, subagent_config=subagent_limits,
                         parent_budget=budget,
+                        stop_event=stop_event,
                     )
                 )
             if _ok("agent_result"):
@@ -257,6 +262,7 @@ class AgentRunner:
         system_prompt_override: str | None = None,
         tool_whitelist: list[str] | None = None,
         checkpoint: Checkpoint | None = None,
+        stop_event: asyncio.Event | None = None,
     ) -> RunOutcome:
         # 显式传入待恢复检查点才是续跑，普通新消息仍开始新的 Run
         resuming = checkpoint is not None
@@ -265,6 +271,7 @@ class AgentRunner:
             system_prompt_override=system_prompt_override,
             tool_whitelist=tool_whitelist, checkpoint=checkpoint,
         )
+        context.stop_event = stop_event
         run_path = (
             store.runs_dir(session.id) / context.run.run_id
             if session is not None and store is not None
@@ -320,7 +327,7 @@ class AgentRunner:
                         )
                     )
                     raise
-                # 正常取消，比如ctrl + c取消后，会出现这个异常
+                # Core 退出等任务取消走此处；TUI Ctrl+C 由 Loop 在安全边界停止。
                 except asyncio.CancelledError:
                     cancelled = True
                     # finish 已提交终态后取消通知，不能把磁盘上的成功降级为中断。
@@ -340,9 +347,14 @@ class AgentRunner:
                         context.mark_failed(reason)
                 finally:
                     # 子任务只服务本轮，父任务退出后不能遗留无人接收的后台执行。
-                    await self._task_registry.cancel_children(
-                        context.run.run_id, session.id if session else "",
-                    )
+                    if context.run.reason == "user_stopped":
+                        await self._task_registry.wait_children(
+                            context.run.run_id, session.id if session else "",
+                        )
+                    else:
+                        await self._task_registry.cancel_children(
+                            context.run.run_id, session.id if session else "",
+                        )
                 # 没有异常的话就是正常执行完一次agent loop，调用该方法收尾
                 return await self._finish_run(context, bus, persistence, cancelled=cancelled)
 
@@ -471,6 +483,7 @@ class AgentRunner:
             child_runs_dir=store.runs_dir(session.id) if session and store else self._runs_dir,
             session_id=session.id if session else "",
             tool_whitelist=context.run.tool_whitelist,
+            stop_event=context.stop_event,
             workspace=Path(context.run.workspace),
             run=context.run,
             budget=budget,

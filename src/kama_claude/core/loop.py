@@ -13,7 +13,7 @@ from kama_claude.core.checkpoint.checkpoint import CheckpointError, ToolCheckpoi
 from kama_claude.core.compact.manager import ContextManager
 from kama_claude.core.compact.request import assemble_messages
 from kama_claude.core.completion import FINISH_INSTRUCTIONS, FINISH_REMINDER
-from kama_claude.core.context import ExecutionContext
+from kama_claude.core.context import ExecutionContext, RunStopRequested
 from kama_claude.core.discovery.exposure import callable_names
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.base import LLMProvider
@@ -61,17 +61,22 @@ class AgentLoop:
         try:
             async with asyncio.timeout(self._budget.remaining_seconds()):
                 while not context.is_done():
+                    context.check_stop()
                     # 使用独立 if，让同一步依次进入模型和工具阶段
                     if run.phase == "ready" and not self._start_step():
                         return
                     if run.phase == "llm" and not await self._call_model():
                         return
+                    context.check_stop()
                     if run.phase == "tools" and not context.is_done():
                         if not await self._tools.run_pending():
                             return
                     await self._bus.publish_safe(
                         StepFinishedEvent(run_id=run.run_id, step=run.step, ts=_now())
                     )
+        except RunStopRequested:
+            context.mark_interrupted("user_stopped")
+            self._save_checkpoint()
         except (BudgetExceeded, TimeoutError) as exc:
             reason = str(exc) if isinstance(exc, BudgetExceeded) else "run_time_budget_exceeded"
             self._tools.stop_for_budget(reason)
@@ -113,6 +118,7 @@ class AgentLoop:
         # 请求前准备
         if not await self._context_manager.prepare(system, schemas):
             return False
+        context.check_stop()  # 摘要请求完成后也先停下，不能再发普通模型请求。
         # 规则 system 冻结；自动记忆由统一请求投影注入。
         system = run.system_prompt or system
         exposed = callable_names(run, context.messages) if run.schemas_frozen else {

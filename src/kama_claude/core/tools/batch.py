@@ -16,6 +16,7 @@ from kama_claude.core.progress import ProgressGuard
 from kama_claude.core.run_budget import BudgetExceeded, RunBudget
 from kama_claude.core.tools.base import ToolResult
 from kama_claude.core.tools.invocation import invoke_tool, publish_tool_result
+from kama_claude.core.tools.output import append_tool_warning
 from kama_claude.core.tools.registry import ToolRegistry
 
 if TYPE_CHECKING:
@@ -79,6 +80,7 @@ class ToolBatchExecutor:
         )
         # 开始按上次记录的顺序执行工具
         while run.tool_index < len(run.tools):
+            context.check_stop()
             self._budget.check()
             tool = run.tools[run.tool_index]
             if tool.status == "completed":
@@ -130,7 +132,7 @@ class ToolBatchExecutor:
             warning, stalled = self._progress.observe(registered, tool.input, result)
             repeated = self._budget.record_tool_result(tool.name, tool.input, result)
             if warning:
-                result.content += "\n" + warning
+                append_tool_warning(result, warning)
             tool.result = asdict(result)
             tool.output_prepared = False  # 本次新结果必须整理，不能继承旧快照的默认标记。
             if result.outcome_unknown:
@@ -202,6 +204,9 @@ class ToolBatchExecutor:
     def _save_tool_phase(self, phase: Literal["awaiting_approval", "executing"]) -> None:
         run = self._context.run
         tool = run.tools[run.tool_index]
+        # 运行中的调用（含受控重试）自然完成；尚未执行的调用不再启动。
+        if tool.status != "executing":
+            self._context.check_stop()
         if phase == "executing":
             self._budget.check()
         tool.status = phase

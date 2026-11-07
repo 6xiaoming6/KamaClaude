@@ -19,6 +19,6 @@ uv.lock
 # Local practice files
 /workspace/
 
-# S12 only adds its own learning document; existing tracked documents remain untouched.
+# S13 only adds its own learning document; existing tracked documents remain untouched.
 /docs/*
-!/docs/S12-子Agent协作与共享预算.md
+!/docs/S13-代码仓库探索工具.md

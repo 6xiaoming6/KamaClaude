@@ -236,6 +236,13 @@ class BackgroundTaskRegistry:
 
     # 停止本轮派生的后代；不会取消同会话中其他根 Run 的任务。
     async def cancel_children(self, parent_run_id: str, session_id: str) -> None:
+        await self._cancel_tasks(self._child_tasks(parent_run_id, session_id))
+
+    # 用户有序停止时，后代共用停止信号；等待它们保存当前工具结果，不强制取消。
+    async def wait_children(self, parent_run_id: str, session_id: str) -> None:
+        await asyncio.gather(*self._child_tasks(parent_run_id, session_id), return_exceptions=True)
+
+    def _child_tasks(self, parent_run_id: str, session_id: str) -> set[asyncio.Task[None]]:
         owners = {parent_run_id}
         while True:
             children = {
@@ -247,10 +254,10 @@ class BackgroundTaskRegistry:
             if children <= owners:
                 break
             owners.update(children)
-        await self._cancel_tasks({
+        return {
             entry.task for run_id, entry in self._tasks.items()
             if run_id != parent_run_id and run_id in owners
-        })
+        }
 
     async def cancel_child(self, run_id: str, parent_run_id: str, session_id: str) -> str:
         entry = self.get(run_id, session_id)

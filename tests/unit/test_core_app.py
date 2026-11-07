@@ -102,7 +102,8 @@ async def test_shutdown_gates_requests_first_and_keeps_cleanup_on_failure(monkey
         await task
     assert order == ["gate", "sessions", "mcp", "server", "trace"]
     controls = {call.args[0] for call in server.register.call_args_list if call.kwargs.get("control")}
-    assert controls == {"core.ping", "permission.respond", "session.set_permission_mode"}
+    assert controls == {"core.ping", "core.shutdown", "permission.respond",
+                        "session.set_permission_mode", "session.interrupt"}
 
 
 async def test_startup_log_excludes_configured_credentials(monkeypatch, caplog):

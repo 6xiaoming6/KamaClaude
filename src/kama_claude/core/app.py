@@ -13,12 +13,15 @@ from datetime import UTC
 from pathlib import Path
 from typing import Any
 
+import psutil
 from pydantic import BaseModel, ValidationError
 
 import kama_claude
 from kama_claude.core.bus.commands import (
     AgentRunCommand,
     AgentRunResult,
+    CoreShutdownCommand,
+    CoreShutdownResult,
     EventSubscribeCommand,
     EventSubscribeResult,
     PermissionRespondCommand,
@@ -32,6 +35,8 @@ from kama_claude.core.bus.commands import (
     SessionCreateResult,
     SessionGetHistoryCommand,
     SessionGetHistoryResult,
+    SessionInterruptCommand,
+    SessionInterruptResult,
     SessionListCommand,
     SessionListResult,
     SessionOpenCommand,
@@ -85,6 +90,7 @@ class CoreApp:
         self._permission_manager: PermissionManager | None = None
         self._mcp_manager: McpServerManager | None = None
         self._task_registry = BackgroundTaskRegistry()
+        self._shutdown = asyncio.Event()
 
     # 处理 core.ping 请求，返回服务版本、运行时长和接收时间
     async def _ping_handler(self, params: dict[str, Any]) -> PongResult:
@@ -94,7 +100,17 @@ class CoreApp:
             server_version=kama_claude.__version__,
             uptime_ms=int((time.monotonic() - self._start_time) * 1000),
             received_at=datetime.datetime.now(datetime.UTC).isoformat(),
+            pid=os.getpid(),
         )
+
+    # 只有记录中的同一个进程才能被停止，避免端口或 PID 复用误停其他 Core。
+    async def _shutdown_handler(self, params: dict[str, Any]) -> CoreShutdownResult:
+        cmd = CoreShutdownCommand.model_validate(params)
+        if (cmd.expected_pid != os.getpid()
+                or abs(cmd.expected_created_at - psutil.Process().create_time()) > 0.001):
+            raise HandlerError(-32602, "Core process identity changed; refusing shutdown")
+        asyncio.get_running_loop().call_soon(self._shutdown.set)
+        return CoreShutdownResult()
 
     # 将 EventBus 事件写入 trace（作为 EventBus 订阅者）
     # 这里用trace记录core内部的事件传递
@@ -205,6 +221,13 @@ class CoreApp:
         cmd = SessionCompactCommand.model_validate(params)
         result = await self._sessions.compact(cmd.session_id, cmd.focus)
         return result
+
+    # 控制请求独立于普通请求额度，审批或长 RPC 占满时仍能取消业务 Run。
+    async def _session_interrupt_handler(self, params: dict[str, Any]) -> SessionInterruptResult:
+        assert self._sessions is not None
+        cmd = SessionInterruptCommand.model_validate(params)
+        result = await self._sessions.interrupt(cmd.session_id, cmd.run_id, wait=cmd.wait)
+        return SessionInterruptResult(**result)
 
     # 关闭 session 并返回 closed 状态
     async def _session_close_handler(self, params: dict[str, Any]) -> SessionCloseResult:
@@ -336,6 +359,7 @@ class CoreApp:
             trace=self._trace,
         )
         server.register("core.ping", self._ping_handler, control=True)
+        server.register("core.shutdown", self._shutdown_handler, control=True)
         server.register("agent.run", self._agent_run_handler)
         server.register("event.subscribe", self._subscribe_handler)
         server.register("session.create", self._session_create_handler)
@@ -345,6 +369,7 @@ class CoreApp:
         server.register("session.send_message", self._session_send_handler)
         server.register("session.get_history", self._session_history_handler)
         server.register("session.close", self._session_close_handler)
+        server.register("session.interrupt", self._session_interrupt_handler, control=True)
         server.register("permission.respond", self._permission_respond_handler, control=True)
         server.register("session.compact", self._session_compact_handler)
         server.register(
@@ -356,7 +381,7 @@ class CoreApp:
         logger.info("config summary: %s", config_summary(self._config))
 
         loop = asyncio.get_running_loop()
-        shutdown = asyncio.Event()
+        shutdown = self._shutdown
         try:
             if sys.platform != "win32":
                 # 用户按 Ctrl+C，或进程收到终止信号，就调用shutdown.set()，通知主协程停止等待

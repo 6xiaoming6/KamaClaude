@@ -55,11 +55,13 @@ async def test_output_is_bounded_and_exit_code_preserved(tmp_path):
 # 设计：先创建文件再长时间等待，用文件证明副作用确实发生
 async def test_timeout_keeps_unknown_side_effect(tmp_path):
     result = await CommandExecutor(tmp_path).execute(
-        python_command("from pathlib import Path; import time; Path('effect').touch(); time.sleep(30)"),
+        python_command("from pathlib import Path; import time; Path('effect').touch(); "
+                       "print('started', flush=True); time.sleep(30)"),
         0.5,
     )
     assert (tmp_path / "effect").exists()
     assert result.outcome_unknown and result.error.startswith("timeout")
+    assert "started" in result.output
 
 
 # 功能：验证取消会清理实际命令进程并继续传播 CancelledError

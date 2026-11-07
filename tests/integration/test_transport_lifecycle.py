@@ -24,6 +24,53 @@ from tests.unit.test_checkpoint_recovery import Provider
 from tests.unit.test_connection_sender import Writer
 
 
+# 普通 RPC 等待 Run 占满额度时，停止控制仍可用；工具完成后两个 RPC 都正常返回。
+async def test_graceful_interrupt_works_while_send_request_occupies_slot(tmp_path):
+    from tests.unit.test_checkpoint_recovery import manager, tool_response
+    from tests.unit.test_session_interrupt import BlockingTool
+
+    store = SessionStore(tmp_path)
+    probe = BlockingTool()
+    bus = EventBus()
+    sessions = manager(store, Provider([tool_response("a")]), [probe], bus)
+    session = await sessions.create("chat")
+    broadcaster = IpcEventBroadcaster()
+    bus.subscribe(broadcaster.handle)
+    app = CoreApp()
+    app._sessions, app._broadcaster = sessions, broadcaster
+    server = SocketServer("127.0.0.1", 0, broadcaster, max_requests=1)
+    server.register("session.send_message", app._session_send_handler)
+    server.register("session.interrupt", app._session_interrupt_handler, control=True)
+    await server.start()
+    port = server._server.sockets[0].getsockname()[1]
+    client = SocketClient("127.0.0.1", port)
+    await client.connect()
+    receiver = asyncio.create_task(client.run_event_loop())
+    sent = asyncio.create_task(client.send_command("session.send_message", {
+        "session_id": session.id, "content": "goal",
+    }))
+    try:
+        await asyncio.wait_for(probe.started.wait(), 2)
+        cp = store.checkpoints.load(session.id)
+        result = await asyncio.wait_for(client.send_command("session.interrupt", {
+            "session_id": session.id, "run_id": cp.run.run_id,
+        }), 2)
+        assert result["status"] == "stopping" and not sent.done()
+        assert not probe.cancelled
+        probe.release.set()
+        accepted = await asyncio.wait_for(sent, 2)
+        assert accepted["run_id"] == cp.run.run_id
+        stopped = store.checkpoints.load(session.id)
+        assert stopped.run.reason == "user_stopped"
+        assert stopped.run.tools[0].status == "completed"
+    finally:
+        probe.release.set()
+        await sessions.shutdown()
+        await client.close()
+        await asyncio.gather(receiver, sent, return_exceptions=True)
+        await server.stop()
+
+
 # 真实 Core 协调层、TCP、检查点和 Loop；只有模型回复由事件控制。
 async def test_rpc_disconnect_reclaims_request_but_core_run_continues(tmp_path: Path):
     started, release = asyncio.Event(), asyncio.Event()

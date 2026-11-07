@@ -29,9 +29,10 @@ class KamaTuiApp(App[None]):
 
     TITLE = "KamaClaude"
     BINDINGS = [
-        Binding("ctrl+q", "quit", "退出", priority=True),
+        Binding("ctrl+c", "interrupt_run", "停止当前任务", priority=True),
+        Binding("ctrl+q", "quit", "关闭会话并退出", priority=True),
         Binding("ctrl+o", "open_sessions", "历史会话", priority=True),
-        Binding("ctrl+w", "close_session", "关闭会话", priority=True),
+        Binding("ctrl+w", "leave_session", "返回会话列表", priority=True),
         Binding("ctrl+p", "permission_mode", "审批模式", priority=True),
     ]
     CSS = """
@@ -71,7 +72,7 @@ class KamaTuiApp(App[None]):
         "[bold cyan]╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝ ╚═════╝"
         "╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝[/bold cyan]\n"
         "[dim]  输入消息开始对话  ·  键入 / 触发 skill  ·  "
-        "Ctrl+Q 退出 · Ctrl+O 会话 · Ctrl+W 关闭会话[/dim]"
+        "Ctrl+C 停止任务 · Ctrl+W 后台离开 · Ctrl+Q 关闭会话并退出[/dim]"
     )
 
     # 初始化连接参数和 TUI 内部状态
@@ -84,6 +85,10 @@ class KamaTuiApp(App[None]):
         self._client: SocketClient | None = None
         self._pending_permission_blocks: dict[str, PermissionBlock] = {}
         self._session_id: str | None = None
+        self._run_id: str | None = None
+        self._session_action: str | None = None
+        self._picking_session = False
+        self._detached = False
         self._permission_mode = PermissionMode.ASK
         self._permission_mode_updates = 0
         self._header_state = "connecting"
@@ -185,9 +190,51 @@ class KamaTuiApp(App[None]):
         except Exception:
             pass
 
-    # 退出仅断开界面，保留可重新打开的会话
+    # 不直接退出：先让正在执行的工具自然完成，再关闭会话。
     async def action_quit(self) -> None:
-        self.exit()
+        if self._session_action is None and not self._opening:
+            self._session_action = "close"
+            self.run_worker(self._close_session(), name="close_session", exclusive=False)
+
+    def action_interrupt_run(self) -> None:
+        if (self._client is not None and self._session_id is not None
+                and self._session_action is None and not self._opening
+                and len(self.screen_stack) == 1):
+            self._session_action = "interrupt"
+            self.run_worker(self._interrupt_run(), name="interrupt_run", exclusive=False)
+
+    # 只登记停止请求；正在运行的工具不会因前端按键被取消。
+    async def _interrupt_run(self) -> None:
+        client, sid = self._client, self._session_id
+        try:
+            if client is None or sid is None:
+                return
+            result = await client.send_command("session.interrupt", {
+                "session_id": sid, "run_id": self._run_id,
+            })
+            if self._client is not client or self._session_id != sid:
+                return
+            if result["status"] == "stopping":
+                # 完成通知可能先于 RPC 响应到达，不能把已中断界面改回 stopping。
+                if self._header_state not in {"interrupted", "ready", "closed"}:
+                    self._show_stopping()
+                else:
+                    await self._open_session(sid)
+            else:
+                await self._open_session(sid)
+        except (IpcError, RuntimeError, OSError) as exc:
+            if self._session_id == sid:
+                self._view.append(Static(f"停止失败：{exc}", markup=False))
+        finally:
+            self._session_action = None
+
+    def _show_stopping(self) -> None:
+        self._busy = True
+        self._update_header("stopping")
+        prompt = self._prompt()
+        if prompt is not None:
+            prompt.disabled = True
+            prompt.border_title = "正在停止：等待当前调用完成并保存检查点…"
 
     # 模式弹窗使用独立 Worker 组，不能取消连接和正在等待的 RPC。
     def action_permission_mode(self) -> None:
@@ -229,21 +276,58 @@ class KamaTuiApp(App[None]):
 
     # 打开历史选择器，不取消当前 Core 中的运行
     def action_open_sessions(self) -> None:
-        if self._client is not None and not self._opening:
+        if (self._client is not None and not self._opening and not self._picking_session
+                and self._session_action is None and len(self.screen_stack) == 1):
             self.run_worker(self._pick_session(), name="session_picker", exclusive=False)
 
-    # 主动关闭会话与退出界面是两个不同动作
-    def action_close_session(self) -> None:
-        self.run_worker(self._close_session(), name="close_session", exclusive=False)
+    # 离开只清理前端身份与展示，Core 继续持有原来的业务 Run。
+    def action_leave_session(self) -> None:
+        if (not self._opening and not self._picking_session
+                and self._session_action is None and len(self.screen_stack) == 1):
+            self.run_worker(self._leave_session(), name="leave_session", exclusive=False)
 
-    # 向 Core 发送显式关闭请求
+    async def _leave_session(self) -> None:
+        async with self._open_lock:
+            self._session_id = None
+            self._detached = True
+            self._run_id = None
+            self._busy = False
+            self._event_buffer.clear()
+            self._last_event_seq = 0
+            self._pending_permission_blocks.clear()
+            await self._view.remove_children()
+            self._view.reset()
+            for popup in list(self.screen_stack[0].query(SlashCompleteWidget)):
+                await popup.remove()
+            prompt = self._prompt()
+            if prompt is not None:
+                prompt.text = ""
+                prompt.disabled = True
+                prompt.border_title = "请选择历史会话或新建会话"
+            self._update_header("selecting")
+        await self._pick_session()
+
+    # 等待有序停止与关闭都成功后才退出；断线或保存失败不能伪装成已关闭。
     async def _close_session(self) -> None:
-        if self._client is None or self._session_id is None:
-            return
+        client, sid = self._client, self._session_id
         try:
-            await self._client.send_command("session.close", {"session_id": self._session_id})
+            if sid is None:
+                self.exit()
+                return
+            if client is None:
+                raise ConnectionError("未连接 Core，无法确认会话已关闭；重连后重试")
+            self._show_stopping()
+            await client.send_command("session.interrupt", {
+                "session_id": sid, "run_id": self._run_id, "wait": True,
+            })
+            await client.send_command("session.close", {"session_id": sid})
+            self.exit()
         except (IpcError, RuntimeError, OSError) as exc:
-            self._view.append(Static(f"[red]close error: {exc}[/red]"))
+            self._view.append(Static(f"关闭失败：{exc}", markup=False))
+            if self._client is client and self._session_id == sid:
+                await self._refresh_session()
+        finally:
+            self._session_action = None
 
     # 将输入框提交内容发送给当前 chat session；用 worker 发送，避免 await 阻塞 App 消息泵
     async def on_chat_text_area_submitted(self, event: ChatTextArea.Submitted) -> None:
@@ -375,6 +459,7 @@ class KamaTuiApp(App[None]):
             "disconnected": "red",
             "connecting": "dim",
             "interrupted": "yellow",
+            "stopping": "yellow",
             "closed": "dim",
         }.get(state, "dim")
         header.update(
@@ -385,8 +470,9 @@ class KamaTuiApp(App[None]):
 
     # 选择历史或新建会话，仅用户明确操作才恢复中断任务，选择后并打开会话
     async def _pick_session(self) -> None:
-        if self._client is None:
+        if self._client is None or self._picking_session:
             return
+        self._picking_session = True
         try:
             # 向 Core 发送请求获取会话列表
             result = await self._client.send_command("session.list", {})
@@ -408,6 +494,8 @@ class KamaTuiApp(App[None]):
                 await self._open_session(selected)
         except (IpcError, RuntimeError, OSError) as exc:
             self._view.append(Static(f"[red]open error: {exc}[/red]"))
+        finally:
+            self._picking_session = False
 
     # 先缓冲推送，再用权威快照重建显示，最后应用水位之后的事件
     async def _open_session(self, sid: str) -> None:
@@ -420,12 +508,15 @@ class KamaTuiApp(App[None]):
             return
         previous = self._session_id
         previous_mode = self._permission_mode
+        previous_detached = self._detached
+        previous_run_id = self._run_id
         # 加载期间先缓冲事件，避免历史快照与实时更新交叉覆盖
         self._opening = True
         self._event_buffer = []
         self._session_id = sid
         try:
             data = await self._client.send_command("session.open", {"session_id": sid})
+            self._detached = False
             self._permission_mode = PermissionMode(data.get("permission_mode", "ask"))
             cursor = data.get("next_cursor")
             while cursor is not None:
@@ -455,6 +546,7 @@ class KamaTuiApp(App[None]):
             self._view.render_history(data["messages"])
             # 拿到该会话检查点的运行状态
             run = data.get("run")
+            self._run_id = str(run["run_id"]) if run else None
             if run:
                 self._view.completed_tools.update(
                     {
@@ -464,7 +556,7 @@ class KamaTuiApp(App[None]):
                     }
                 )
                 # 状态为interrupted就需要用户决定是否从中断恢复运行
-                if run["status"] == "interrupted":
+                if run["status"] == "interrupted" and not data["running"]:
                     self._view.append(RecoveryActions(self._snapshot_revision, run))
                 # 状态为成功或者失败都说明上次的运行是完整的
                 elif run["status"] in ("success", "failed"):
@@ -507,6 +599,8 @@ class KamaTuiApp(App[None]):
         except BaseException:
             self._session_id = previous
             self._permission_mode = previous_mode
+            self._detached = previous_detached
+            self._run_id = previous_run_id
             raise
         finally:
             self._opening = False
@@ -552,9 +646,12 @@ class KamaTuiApp(App[None]):
 
     # 中断通知后刷新快照，按钮与未知工具信息来自持久化状态
     async def _refresh_session(self) -> None:
-        if self._session_id is not None:
+        sid = self._session_id
+        if sid is not None:
             try:
-                await self._open_session(self._session_id)
+                async with self._open_lock:
+                    if self._session_id == sid:
+                        await self._load_session(sid)
             except (IpcError, RuntimeError, OSError):
                 log.exception("session refresh failed")
 
@@ -628,8 +725,10 @@ class KamaTuiApp(App[None]):
 
     # 根据事件 type 路由到对应渲染逻辑；捕获异常防止 socket loop 因单个事件崩溃
     def _handle_event(self, event: dict[str, Any]) -> None:
-        if self._replay_run_id is None and self._session_id is not None:
-            if event.get("session_id") != self._session_id:
+        if self._replay_run_id is None:
+            if self._session_id is None and self._detached:
+                return
+            if self._session_id is not None and event.get("session_id") != self._session_id:
                 return
         seq = event.get("event_seq")
         if isinstance(seq, int):
@@ -645,6 +744,9 @@ class KamaTuiApp(App[None]):
     # App 处理会话和审批操作；普通展示事件交给对话视图。
     def _handle_event_inner(self, event: dict[str, Any]) -> None:
         kind = str(event.get("type", ""))
+        if kind in {"run.started", "run.resumed"} and not event.get("parent_run_id"):
+            if event.get("run_id") not in self._view.subagent_runs:
+                self._run_id = str(event.get("run_id", "")) or self._run_id
         if kind not in {"llm.token", "session.permission_mode_changed"}:
             self._view.break_stream()
         if kind in {
@@ -685,7 +787,8 @@ class KamaTuiApp(App[None]):
             )
             self._busy = True
             self._update_header("interrupted")
-            self.run_worker(self._refresh_session(), name="refresh", exclusive=False)
+            if self._session_action != "close":
+                self.run_worker(self._refresh_session(), name="refresh", exclusive=False)
         elif t == "run.resumed":
             self._busy = True
             self._update_header("running")

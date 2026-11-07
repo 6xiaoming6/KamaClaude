@@ -8,5 +8,5 @@ system_prompt = """
 返回可核实的结论、文件路径和必要行号，指出尚未确认的事项。
 不要把建议描述成已经完成的修改或验证。
 """
-allowed_tools = ["read_file", "list_dir", "find_files", "search_text", "memory_read", "task_get", "task_list", "load_skill"]
+allowed_tools = ["read_file", "list_dir", "find_files", "search_text", "get_file_outline", "search_symbol", "read_symbol", "memory_read", "task_get", "task_list", "load_skill"]
 model = ""

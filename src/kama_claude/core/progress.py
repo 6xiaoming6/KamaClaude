@@ -13,7 +13,10 @@ from kama_claude.core.workspace import WorkspacePathError
 if TYPE_CHECKING:
     from kama_claude.core.checkpoint.checkpoint import RunCheckpoint
 
-_READ_TOOLS = frozenset({"read_file", "list_dir", "find_files", "search_text"})
+_READ_TOOLS = frozenset({
+    "read_file", "list_dir", "find_files", "search_text",
+    "get_file_outline", "search_symbol", "read_symbol",
+})
 _MAX_PERIOD = 3
 _WARN_REPEATS = 3
 

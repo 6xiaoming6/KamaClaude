@@ -1,22 +1,21 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from pathlib import Path
 
 from pydantic import Field, field_validator
 
 from kama_claude.core.tools.base import FileTool, ToolParams, ToolResult
-from kama_claude.core.tools.errors import ToolError
-from kama_claude.core.tools.files import MAX_OUTPUT_BYTES, ReadBudget
+from kama_claude.core.tools.files import ReadBudget
+from kama_claude.core.tools.output import json_result
 from kama_claude.core.tools.traversal import DirectoryScanner, matches_glob
 
 
 class FindFilesParams(ToolParams):
     pattern: str = Field(min_length=1, max_length=512, description="File glob, e.g. **/*.py.")
-    path: str = "."
-    limit: int = Field(default=100, ge=1, le=200)
-    include_ignored: bool = False
+    path: str = Field(default=".", min_length=1, description="Directory to search within.")
+    limit: int = Field(default=100, ge=1, le=200, description="Maximum matching file paths.")
+    include_ignored: bool = Field(default=False, description="Include ignored/generated entries.")
 
     @field_validator("pattern")
     # 模式只选择目录内文件，不承担路径解析或目录跳转
@@ -34,7 +33,9 @@ class FindFilesTool(FileTool):
         "Find file paths by case-sensitive glob, e.g. **/*test*.py. A filename pattern searches "
         "all levels. Relative path uses the workspace; external paths require approval. "
         "Skips ignored/generated entries and links by default. Returns JSON paths, truncation "
-        "and scan information. Use include_ignored=true to inspect ignored files."
+        "and scan information. Use include_ignored=true to inspect ignored files. "
+        "Then use search_text for contents or get_file_outline for definitions. "
+        "Narrow path/pattern when truncated; partial results cannot prove absence."
     )
     params_model = FindFilesParams
     input_schema = FindFilesParams.model_json_schema()
@@ -67,9 +68,4 @@ class FindFilesTool(FileTool):
             "root": str(root), "files": found, "truncated": bool(reason or scanner.skipped),
             "reason": reason, "skipped_directories": scanner.skipped,
         }
-        while found and len(json.dumps(result, ensure_ascii=False).encode()) > MAX_OUTPUT_BYTES:
-            found.pop()
-            result["truncated"], result["reason"] = True, "output_limit"
-        if len(json.dumps(result, ensure_ascii=False).encode()) > MAX_OUTPUT_BYTES:
-            raise ToolError("result metadata exceeds output limit", "resource_limit")
-        return ToolResult(content=json.dumps(result, ensure_ascii=False))
+        return json_result(result, "files")

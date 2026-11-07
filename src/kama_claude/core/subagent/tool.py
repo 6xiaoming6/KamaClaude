@@ -24,6 +24,7 @@ from kama_claude.core.config import (
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.events.writer import EventWriter
+from kama_claude.core.llm.images import supports_images
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.memory.store import MemoryStore
 from kama_claude.core.run_budget import BudgetExceeded, RunBudget
@@ -111,9 +112,11 @@ class SpawnAgentTool(BaseTool):
         memory_config: MemoryConfig | None = None,
         memory_project_root: Path | None = None,
         parent_budget: RunBudget | None = None,
+        stop_event: asyncio.Event | None = None,
     ) -> None:
         self._provider = provider
         self._parent_budget = parent_budget
+        self._stop_event = stop_event
         self._parent_bus = parent_bus
         self._parent_run_id = parent_run_id
         self._permission_manager = permission_manager
@@ -205,6 +208,7 @@ class SpawnAgentTool(BaseTool):
                     profile.system_prompt or
                     "You are a helpful AI assistant. Use tools to complete the assigned sub-task."
                 ) + HANDOFF_INSTRUCTIONS,
+                stop_event=self._stop_event,
             )
 
             child_bus = EventBus()
@@ -292,7 +296,10 @@ class SpawnAgentTool(BaseTool):
             else:
                 context.mark_failed("subagent_error")
         finally:
-            await self._task_registry.cancel_children(context.run.run_id, self._session_id)
+            if context.run.reason == "user_stopped":
+                await self._task_registry.wait_children(context.run.run_id, self._session_id)
+            else:
+                await self._task_registry.cancel_children(context.run.run_id, self._session_id)
             # 报告落盘后才发布完成通知；失败由注册表转成明确的失败结果。
             await self._task_registry.notify_finished(context.run.run_id)
 
@@ -319,7 +326,10 @@ class SpawnAgentTool(BaseTool):
 
         registry = ToolRegistry()
         child_task_manager = TaskManager(self._runs_dir / child_run_id / ".tasks")
-        for tool in builtin_tools(self._workspace, self._execution, child_task_manager):
+        for tool in builtin_tools(
+            self._workspace, self._execution, child_task_manager,
+            image_support=supports_images(self._provider_name, model or self._model),
+        ):
             if _allowed(tool.name):
                 registry.register(tool)
         memory = MemoryStore(
@@ -354,6 +364,7 @@ class SpawnAgentTool(BaseTool):
                 provider_factory=self._provider_factory,
                 tool_whitelist=sorted(allowed) if allowed is not None else None,
                 parent_budget=budget,
+                stop_event=self._stop_event,
             )
             registry.register(nested)
         if _allowed("agent_result"):

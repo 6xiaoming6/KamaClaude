@@ -34,19 +34,26 @@ class CommandExecutor:
         self._execution = execution or ExecutionConfig()
 
     # 逐块排空管道，只保留固定大小的字节缓冲，避免大输出耗尽内存
-    async def _read_output(self, stream: asyncio.StreamReader) -> str:
-        kept = bytearray()
-        truncated = False
+    async def _read_output(
+        self, stream: asyncio.StreamReader, kept: bytearray | None = None,
+    ) -> str:
+        kept = kept if kept is not None else bytearray()
         while chunk := await stream.read(16 * 1024):
-            room = _OUTPUT_LIMIT - len(kept)
+            # 多保留一个字节作为截断标志；异常时调用方也能取得已经读到的输出。
+            room = _OUTPUT_LIMIT + 1 - len(kept)
             kept.extend(chunk[:room])
-            truncated = truncated or len(chunk) > room
+        return self._decode_output(kept)
+
+    @staticmethod
+    def _decode_output(kept: bytearray) -> str:
+        truncated = len(kept) > _OUTPUT_LIMIT
+        raw = kept[:_OUTPUT_LIMIT]
         try:
-            output = kept.decode("utf-8")
+            output = raw.decode("utf-8")
         except UnicodeDecodeError as exc:
             partial_utf8 = truncated and exc.reason == "unexpected end of data"
             encoding = locale.getencoding() if os.name == "nt" and not partial_utf8 else "utf-8"
-            output = kept.decode(encoding, errors="replace")
+            output = raw.decode(encoding, errors="replace")
         return output + ("\n[truncated]" if truncated else "")
 
     # 运行中采集子进程身份，根 shell 先退出时仍能清理已经发现的后代
@@ -110,6 +117,7 @@ class CommandExecutor:
         watcher: asyncio.Task[None] | None = None
         reader: asyncio.Task[str] | None = None
         launch: asyncio.Task[asyncio.subprocess.Process] | None = None
+        captured = bytearray()
         try:
             # 启动也受保护，取消发生在创建窗口时仍能取回句柄并清理
             launch = asyncio.create_task(asyncio.create_subprocess_shell(
@@ -127,7 +135,7 @@ class CommandExecutor:
             if root is not None:
                 watcher = asyncio.create_task(self._watch_children(root, children))
             assert proc.stdout is not None
-            reader = asyncio.create_task(self._read_output(proc.stdout))
+            reader = asyncio.create_task(self._read_output(proc.stdout, captured))
             async with asyncio.timeout(timeout):
                 output = await asyncio.shield(reader)
                 returncode = await proc.wait()
@@ -152,7 +160,9 @@ class CommandExecutor:
             reason = f"timeout after {timeout:g}s" if isinstance(exc, TimeoutError) else str(exc)
             if not cleaned:
                 reason += "; process cleanup incomplete"
-            return CommandResult("", None, reason, outcome_unknown=proc is not None)
+            return CommandResult(
+                self._decode_output(captured), None, reason, outcome_unknown=proc is not None,
+            )
         finally:
             for task in (watcher, reader):
                 if task is not None and not task.done():

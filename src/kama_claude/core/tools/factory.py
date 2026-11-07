@@ -9,8 +9,11 @@ from kama_claude.core.tools.builtin import (
     BashTool,
     EditFileTool,
     FindFilesTool,
+    GetFileOutlineTool,
     ListDirTool,
     ReadFileTool,
+    ReadSymbolTool,
+    SearchSymbolTool,
     SearchTextTool,
     TaskCreateTool,
     TaskGetTool,
@@ -22,11 +25,12 @@ from kama_claude.core.tools.builtin import (
 
 # 这里只列出共同工具；记忆、MCP、子任务及白名单仍由各自装配处明确处理。
 def builtin_tools(
-    workspace: Path, execution: ExecutionConfig, tasks: TaskManager,
+    workspace: Path, execution: ExecutionConfig, tasks: TaskManager, *, image_support: bool = True,
 ) -> list[BaseTool]:
     return [
-        ReadFileTool(workspace), BashTool(workspace, execution),
+        ReadFileTool(workspace, image_support=image_support), BashTool(workspace, execution),
         WriteFileTool(workspace), ListDirTool(workspace),
         FindFilesTool(workspace), SearchTextTool(workspace), EditFileTool(workspace),
+        GetFileOutlineTool(workspace), SearchSymbolTool(workspace), ReadSymbolTool(workspace),
         TaskCreateTool(tasks), TaskUpdateTool(tasks), TaskListTool(tasks), TaskGetTool(tasks),
     ]

@@ -13,8 +13,9 @@ _MAX_ENTRIES = 200
 
 
 class ListDirParams(ToolParams):
-    path: str = "."
-    max_depth: int = Field(default=2, ge=1, le=_MAX_DEPTH)
+    path: str = Field(default=".", min_length=1, description="Directory to list.")
+    max_depth: int = Field(default=2, ge=1, le=_MAX_DEPTH,
+                           description="Displayed levels below path; not a full recursive scan.")
     include_ignored: bool = Field(default=False, description="Include ignored/generated entries.")
 
 
@@ -27,7 +28,9 @@ class ListDirTool(FileTool):
         "Relative paths use the fixed workspace; external absolute paths require approval. "
         "Skips common generated directories and .gitignore matches unless include_ignored=true. "
         "Other hidden entries are shown. Links are displayed but never recursively followed. "
-        f"Maximum depth is {_MAX_DEPTH}, maximum total entries is {_MAX_ENTRIES}."
+        f"Maximum depth is {_MAX_DEPTH}, maximum total entries is {_MAX_ENTRIES}. "
+        "Directories at the depth boundary are marked as not expanded. "
+        "Use find_files/search_text to locate files without expanding a large tree."
     )
     input_schema = ListDirParams.model_json_schema()
 
@@ -61,6 +64,8 @@ class ListDirTool(FileTool):
                 linked = is_link(entry)
                 is_dir = not linked and entry.is_dir()
                 suffix = " [link]" if linked else "/" if is_dir else ""
+                if is_dir and depth == max_depth:
+                    suffix += " [not expanded: max_depth]"
                 lines.append(f"{prefix}{connector}{entry.name}{suffix}")
                 count += 1
                 if is_dir and depth < max_depth:
