@@ -34,8 +34,8 @@ async def test_manual_compaction_creates_provider_on_demand(tmp_path: Path) -> N
     manager = SessionManager(
         store, Mock(), EventBus(), provider_factory=factory,
         compaction=CompactionConfig(
-            context_window_tokens=8_192, output_reserve_tokens=512,
-            auto_threshold=0.1, summary_max_tokens=256,
+            context_window_tokens=8_192, output_reserve_ratio=(512) / (8_192),
+            auto_threshold=0.1, summary_max_ratio=(256) / (8_192), summary_target_ratio=(256) / (2 * (8_192)),
         ),
     )
     session = await manager.create("chat")

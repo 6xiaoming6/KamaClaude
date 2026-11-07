@@ -10,13 +10,13 @@
     {"name": "send_mail", "description": "Send an email message to a recipient", "inputSchema": {"type": "object", "properties": {"recipient": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"}}}}
   ],
   "queries": [
-    {"background": "修复用户反馈的问题", "description": "get_issue issue_number comments", "expected": ["eval__get_issue"]},
-    {"background": "检查待审核的修改", "description": "list_pull_requests state repo", "expected": ["eval__list_pull_requests"]},
-    {"background": "检查订单数据", "description": "query_database sql", "expected": ["eval__query_database"]},
-    {"background": "查看项目实现", "description": "get_file path source code", "expected": ["eval__get_file"]},
-    {"background": "先了解问题的具体情况", "description": "获取缺陷报告的详细内容和讨论记录", "expected": ["eval__get_issue"]},
-    {"background": "排查字段不匹配", "description": "查看数据表有哪些字段、主键和索引", "expected": ["eval__describe_table"]},
-    {"background": "通知同事处理结果", "description": "向指定收件人发送电子邮件", "expected": ["eval__send_mail"]},
-    {"background": "查询最新资料", "description": "从互联网搜索相关网页", "expected": ["eval__web_search"]}
+    {"background": "修复用户反馈的问题", "description": "Read a reported problem and its discussion", "keywords": ["get_issue", "issue_number", "comments"], "expected": ["eval__get_issue"]},
+    {"background": "检查待审核的修改", "description": "Find proposed changes that need code review", "keywords": ["list_pull_requests", "state", "repo"], "expected": ["eval__list_pull_requests"]},
+    {"background": "检查订单数据", "description": "Retrieve rows from a relational database", "keywords": ["query_database", "sql"], "expected": ["eval__query_database"]},
+    {"background": "查看项目实现", "description": "Read a source file from a repository", "keywords": ["get_file", "path"], "expected": ["eval__get_file"]},
+    {"background": "先了解问题的具体情况", "description": "获取缺陷报告的详细内容和讨论记录", "keywords": ["issue", "comments"], "expected": ["eval__get_issue"]},
+    {"background": "排查字段不匹配", "description": "查看数据表有哪些字段、主键和索引", "keywords": ["table", "columns", "indexes"], "expected": ["eval__describe_table"]},
+    {"background": "通知同事处理结果", "description": "向指定收件人发送电子邮件", "keywords": ["email", "recipient"], "expected": ["eval__send_mail"]},
+    {"background": "查询最新资料", "description": "从互联网搜索相关网页", "keywords": ["web", "search"], "expected": ["eval__web_search"]}
   ]
 }

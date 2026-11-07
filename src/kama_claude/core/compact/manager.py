@@ -166,7 +166,7 @@ class ContextManager:
         counter = self._estimator.select(system, request, schemas)
         pressure = config.auto_threshold > 0 and counter.request(
             system, request, schemas,
-        ) >= int(config.input_limit * config.auto_threshold)
+        ) >= config.trigger_tokens
         result: CompactionResult | None = None
         if pressure and self._compactor is not None:
             await self._bus.publish_safe(ContextCompactionStartedEvent(
@@ -288,6 +288,7 @@ async def compact_session(
             memory = MemoryStore(
                 Path(cp.run.workspace), memory_config,
                 project=Path(cp.run.memory_project_root) if cp.run.memory_project_root else None,
+                context_budget=config,
             )
             try:
                 snapshot, loaded = validate_candidate(cp.run, result, memory, config, estimator)

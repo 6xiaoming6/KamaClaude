@@ -151,7 +151,7 @@ async def test_concurrent_reservation_is_bounded(tmp_path: Path) -> None:
         events.append(event)
 
     bus.subscribe(collect)
-    tool = make_tool(tmp_path, model, registry, bus=bus)
+    tool = make_tool(tmp_path, model, registry, bus=bus, limits=SubagentConfig(max_active=3))
     results = await asyncio.gather(*(start(tool) for _ in range(6)))
     accepted = [run_id for run_id, result in results if not result.is_error]
     assert len(accepted) == len(registry._tasks) == 3
@@ -435,7 +435,7 @@ def test_report_evidence_and_atomic_failure(tmp_path: Path, monkeypatch: pytest.
 # 设计：仅调用现有小节解析函数，排除机器全局配置和 dotenv 的干扰。
 def test_subagent_config(monkeypatch: pytest.MonkeyPatch) -> None:
     config = KamaConfig()
-    assert (config.subagent.max_active, config.subagent.max_total) == (3, 8)
+    assert (config.subagent.max_active, config.subagent.max_total) == (2, 6)
     apply_toml(config, {"subagent": {"max_active": 2, "max_total": 5}})
     monkeypatch.setenv("KAMA_SUBAGENT_MAX_ACTIVE", "4")
     monkeypatch.setenv("KAMA_SUBAGENT_MAX_TOTAL", "7")

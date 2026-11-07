@@ -37,6 +37,10 @@ Use these six Markdown sections:
 ## 5. Unfinished work and uncertain outcomes
 ## 6. Key paths and continuation entry points
 Do not include credentials or raw chain of thought.
+Use concise bullets and keep only facts needed to continue the task. Refer to file
+paths and relevant locations instead of copying source files, logs or long command output.
+Merge repeated facts; retain concrete constraints, evidence, blockers and next actions.
+Complete all six sections and stop naturally; do not fill the available output budget.
 """
 
 
@@ -89,7 +93,8 @@ class Compactor:
         if not threshold:
             result.reason = "auto_disabled"
             return result
-        if counter.request(system, request, schemas) < int(self._config.input_limit * threshold):
+        trigger = int(self._config.context_window_tokens * threshold)
+        if counter.request(system, request, schemas) < trigger:
             result.reason = "below_threshold"
             return result
         # 延迟创建 SDK，未达阈值时 /compact 无需凭证或模型请求。
@@ -127,9 +132,18 @@ class Compactor:
             unchanged.reason = "incomplete_tool_batch"
             return unchanged
         native_names = {str(s["name"]) for s in schemas if s.get("defer_loading")}
+        # 固定前缀按真实估算占用扣除，近期额度不能挤掉摘要和下一次输出空间。
+        fixed_tokens = counter.raw_request(system, prefix, schemas)
+        recent_budget = min(
+            self._config.recent_token_budget,
+            self._config.input_limit - fixed_tokens - self._config.summary_max_tokens,
+        )
+        if recent_budget <= 0:
+            unchanged.reason = "required_context_too_large"
+            return unchanged
         try:
             old, recent = split_history(
-                messages, self._config.keep_recent_turns, self._config.recent_token_budget,
+                messages, self._config.keep_recent_turns, recent_budget,
                 counter, mcp_names=native_names,
             )
         except ValueError as exc:
@@ -144,16 +158,17 @@ class Compactor:
         # old 可能排除了保留的当前请求：用原始消息序号准确指明范围。
         old_ids = {id(message) for message in old}
         ranges = [str(i + 1) for i, message in enumerate(messages) if id(message) in old_ids]
+        # 目标长度是软约束，与 API 强制截断线分开；小额度配置也保留收尾余量。
+        target_tokens = self._config.summary_target_for(counter.count(old))
         instruction = (
-            _COMPACT_PROMPT + f"\nKeep under {self._config.summary_max_tokens} tokens."
+            _COMPACT_PROMPT + f"\nAim for about {target_tokens} tokens or fewer; "
+            "this is a soft target. Use more only to preserve essential continuation facts."
             + "\nOLD record numbers (1-based, excluding automatic context): " + ", ".join(ranges)
         )
         if focus.strip():
             instruction += "\nUser focus: " + focus.strip()
         summary_request = [*request, {"role": "user", "content": instruction}]
-        summary_limit = (
-            self._config.context_window_tokens - self._config.summary_max_tokens - 1_024
-        )
+        summary_limit = self._config.summary_input_limit
         summary_counter = self._estimator.select(system, summary_request, schemas, kind="summary")
         if summary_counter.request(system, summary_request, schemas) > summary_limit:
             unchanged.reason = "summary_input_too_large"

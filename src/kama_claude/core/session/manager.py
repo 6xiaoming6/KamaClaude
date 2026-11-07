@@ -15,6 +15,7 @@ from kama_claude.core.bus.events import (
     SessionClosedEvent,
     SessionCreatedEvent,
     SessionMessageReceivedEvent,
+    SessionPermissionModeChangedEvent,
     SessionResumedEvent,
     SessionWaitingForInputEvent,
     SkillInvokedEvent,
@@ -25,6 +26,7 @@ from kama_claude.core.compact.manager import compact_session
 from kama_claude.core.config import CompactionConfig, MemoryConfig
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.memory.model import MemoryError
+from kama_claude.core.permissions.mode import PermissionMode
 from kama_claude.core.runs import new_run_id
 from kama_claude.core.session.model import Session, SessionMode
 from kama_claude.core.session.store import SessionStore
@@ -303,7 +305,24 @@ class SessionManager:
             "run": cp.run.model_dump(mode="json") if cp.run else None,
             "running": self.is_running(sid),
             "pending_permissions": pending,
+            "permission_mode": self._permissions.get_mode(sid)
+            if self._permissions else PermissionMode.ASK,
         }
+
+    # 不持有运行锁，运行或等待审批时也能调整后续调用的模式。
+    async def set_permission_mode(self, sid: str, mode: PermissionMode) -> PermissionMode:
+        if self._stopping:
+            raise HandlerError(SERVER_SHUTTING_DOWN, "Server shutting down")
+        session = self._get_session(sid)
+        if session.status == "closed":
+            raise HandlerError(SESSION_CLOSED, "session already closed")
+        if self._permissions is None:
+            raise HandlerError(-32603, "permission manager unavailable")
+        self._permissions.set_mode(sid, mode)
+        await self._bus.publish_safe(SessionPermissionModeChangedEvent(
+            session_id=sid, permission_mode=mode, ts=_now(),
+        ))
+        return mode
 
     # 在会话锁内应用恢复决定，保存成功后才启动原 Run
     async def resume(

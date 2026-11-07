@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from pydantic import BaseModel, Field
 
@@ -72,6 +72,8 @@ class SpawnAgentParams(ToolParams):
 # 在隔离的冷启动上下文中派生子 agent，支持前台阻塞和后台并行两种模式
 class SpawnAgentTool(BaseTool):
     name = "spawn_agent"
+    # 前台等待可能很长，父子 Loop 已统一检查剩余时间，不再套普通工具的 120 秒。
+    timeout_s: ClassVar[float | None] = None
     description = (
         "Spawn an isolated sub-agent to handle a self-contained sub-task. "
         "The sub-agent starts with a clean context containing only the provided prompt — "
@@ -134,6 +136,7 @@ class SpawnAgentTool(BaseTool):
         self._memory_config = memory_config or MemoryConfig()
         self._memory_project_root = MemoryStore(
             self._workspace, self._memory_config, project=memory_project_root,
+            context_budget=self._compaction,
         ).project_root
         self._root_run_id = root_run_id or parent_run_id
         self._subagent_config = replace(subagent_config or SubagentConfig())
@@ -321,6 +324,7 @@ class SpawnAgentTool(BaseTool):
                 registry.register(tool)
         memory = MemoryStore(
             self._workspace, self._memory_config, project=self._memory_project_root,
+            context_budget=self._compaction,
         )
         for tool in (
             MemoryReadTool(memory), MemoryWriteTool(memory, self._session_id, child_run_id),

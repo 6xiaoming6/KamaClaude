@@ -13,9 +13,8 @@ async def idle_socket(self: KamaTuiApp) -> None:
     await asyncio.Future()
 
 
-# 功能：验证 TUI 显示子任务已知用量、估算占用及失败原因
-# 设计：使用真实 Textual 组件渲染子任务终态，不让子任务预算覆盖主任务预算行
-async def test_subagent_usage_and_reason_are_visible(monkeypatch: pytest.MonkeyPatch) -> None:
+# 子任务保留终态与原因，不再混入主对话的累计用量显示。
+async def test_subagent_state_without_cumulative_usage(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(KamaTuiApp, "_socket_loop", idle_socket)
     app = KamaTuiApp("127.0.0.1", 1)
     async with app.run_test(size=(110, 35)) as pilot:
@@ -32,5 +31,5 @@ async def test_subagent_usage_and_reason_are_visible(monkeypatch: pytest.MonkeyP
         })
         await pilot.pause()
         content = "\n".join(str(widget.render()) for widget in app.query(Static))
-        assert "已知 115" in content and "估算 50" in content
+        assert "已知 115" not in content and "估算 50" not in content
         assert "run_token_budget_exceeded" in content

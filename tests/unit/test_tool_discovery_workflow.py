@@ -10,7 +10,8 @@ from kama_claude.core.checkpoint.checkpoint import CheckpointError, RunCheckpoin
 from kama_claude.core.compact.estimator import TokenEstimator
 from kama_claude.core.config import KamaConfig, McpServerConfig, ToolSearchConfig
 from kama_claude.core.discovery.exposure import load_tools, visible_schemas
-from kama_claude.core.discovery.tool import SearchTool
+from kama_claude.core.discovery.retrieval import ToolRetriever
+from kama_claude.core.discovery.tool import SearchTool, SearchToolParams
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock
 from kama_claude.core.mcp.server import McpServerManager
@@ -25,7 +26,9 @@ from tests.unit.discovery_support import ScriptedProvider, mcp_client
 # 构造模型的搜索请求，工具返回值仍走项目实际批次保存代码。
 def search_response():
     return LlmResponse("tool_use", tool_calls=[ToolCallBlock(
-        "search", "search_tool", {"description": "Get GitHub issue details"},
+        "search", "search_tool", {
+            "description": "Get GitHub issue details", "keywords": ["get_issue", "github"],
+        },
     )])
 
 
@@ -207,10 +210,40 @@ async def test_whitespace_search_is_known_error(tmp_path, monkeypatch):
     config, manager, _ = await setup_manager(tmp_path, monkeypatch)
     run = AgentRunner(config)._new_run_state("goal", "run-empty", None)
     tool = SearchTool(run, [], manager.retriever)
-    result = await tool.invoke({"description": "  "})
+    result = await tool.invoke({"description": "  ", "keywords": ["issue"]})
     assert result.is_error and result.error_type == "schema_error"
     assert run.loaded_tool_names == []
     await manager.stop_all()
+
+
+@pytest.mark.parametrize("params", [
+    {"description": "issue"},
+    {"keywords": ["get_issue"]},
+    {"description": "issue", "keywords": []},
+    {"description": "issue", "keywords": [" "]},
+    {"description": "issue", "keywords": "get_issue"},
+    {"description": "issue", "keywords": [123]},
+    {"description": "issue", "keywords": ["x" * 101]},
+    {"description": "issue", "keywords": ["github", "get_issue", "comments", "number"]},
+])
+async def test_invalid_search_parameters_do_not_load_tools(tmp_path, params):
+    from kama_claude.core.llm.types import ToolCallBlock
+    from kama_claude.core.tools.invocation import invoke_tool
+    from kama_claude.core.tools.registry import ToolRegistry
+
+    run = RunCheckpoint(run_id="r", goal="g", model="fake", workspace=str(tmp_path), max_steps=0)
+    retriever = AsyncMock(spec=ToolRetriever)
+    registry = ToolRegistry()
+    registry.register(SearchTool(run, [], retriever))
+    result = await invoke_tool(registry, ToolCallBlock("search", "search_tool", params), EventBus(), "r")
+    assert result.is_error and result.error_type == "schema_error"
+    assert run.loaded_tool_names == []
+    retriever.search.assert_not_awaited()
+
+
+def test_search_keywords_strip_surrounding_whitespace():
+    args = SearchToolParams(description="read issue", keywords=[" github ", "get_issue\n", "comments"])
+    assert args.keywords == ["github", "get_issue", "comments"]
 
 
 # 功能：恢复时即使模型 Schema 不变，完整 MCP 定义变化也必须明确拒绝。

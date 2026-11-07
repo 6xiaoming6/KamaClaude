@@ -4,6 +4,8 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Discriminator, Field
 
+from kama_claude.core.permissions.mode import PermissionMode
+
 
 # 描述 Core 启动后的监听地址和版本信息
 class CoreStartedEvent(BaseModel):
@@ -107,6 +109,8 @@ class LlmTokenEvent(BaseModel):
     type: Literal["llm.token"] = "llm.token"
     run_id: str
     token: str
+    input_tokens_estimate: int | None = None  # 请求输入估算，供流式阶段展示；不当作实际计费。
+    context_window_tokens: int | None = None  # Core 本次实际配置的窗口。
     ts: str
 
 
@@ -120,6 +124,7 @@ class LlmUsageEvent(BaseModel):
     cache_read_input_tokens: int
     cache_creation_input_tokens: int
     context_pct: float = 0.0
+    context_window_tokens: int | None = None
     ts: str
 
 
@@ -211,6 +216,14 @@ class ContextCompactedEvent(BaseModel):
     applied_stages: list[str] = Field(default_factory=list)
     llm_used: bool = False
     preserved_messages: int = 0  # 摘要外保留的近期消息及必要发现记录数。
+    ts: str
+
+
+# 会话模式改变，通知打开同一会话的前端；不改变已发出的审批请求。
+class SessionPermissionModeChangedEvent(BaseModel):
+    type: Literal["session.permission_mode_changed"] = "session.permission_mode_changed"
+    session_id: str
+    permission_mode: PermissionMode
     ts: str
 
 
@@ -334,6 +347,7 @@ Event = Annotated[
     | ContextCompactedEvent
     | ContextCompactionStartedEvent
     | ContextCompactionFailedEvent
+    | SessionPermissionModeChangedEvent
     | PermissionRequestedEvent
     | PermissionGrantedEvent
     | PermissionDeniedEvent

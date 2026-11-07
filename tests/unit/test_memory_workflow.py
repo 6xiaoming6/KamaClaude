@@ -240,7 +240,7 @@ async def test_refreshed_prompt_rechecks_budget_and_anchor(tmp_path: Path) -> No
     estimator.observe(context.run.system_prompt, context.messages, schemas, 1)
     assert estimator.select(context.run.system_prompt, context.messages, schemas).method == "usage_anchor"
     memory = loop._context_manager._memory
-    memory.config.global_auto_tokens = 100_000
+    memory.config.global_auto_ratio = 100_000 / 1_048_576
     memory.global_path().write_text("NEW_LARGE_AUTO " * 10_000, encoding="utf-8")
     await loop.run()
     assert context.run.reason == "context_budget_exceeded" and context.run.step == 3
@@ -286,8 +286,10 @@ async def test_manual_compaction_refresh_and_commit(
         auto.write_bytes(b"\xff")
     if mode == "hard_budget":
         manager._compaction = CompactionConfig(
-            context_window_tokens=2_048, output_reserve_tokens=512, summary_max_tokens=256,
+            context_window_tokens=2_048, output_reserve_ratio=(512) / (2_048), summary_max_ratio=(256) / (2_048), summary_target_ratio=(256) / (2 * (2_048)),
+            auto_threshold=0.5,
         )
+        manager._memory.global_auto_ratio = 0.01
         rule.write_text("NEW_RULE " * 1_000, encoding="utf-8")
     candidate = CompactionResult(
         [{"role": "user", "content": "short history"}], 10_000, 10,
@@ -323,14 +325,14 @@ async def test_manual_compaction_refresh_and_commit(
     assert store.read_history(session.id) == original_history and len(model.calls) == 1
 
 
-# 功能：新预算配置支持环境覆盖，拒绝旧字段和非正整数。
+# 功能：比例预算支持环境覆盖，拒绝旧字段和非法比例。
 # 设计：直接调用解析入口，避免外部配置文件影响边界验证。
 def test_memory_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
     config = KamaConfig()
-    apply_toml(config, {"memory": {"global_auto_tokens": 256, "project_index_tokens": 512}})
-    monkeypatch.setenv("KAMA_MEMORY_PROJECT_INDEX_TOKENS", "768")
+    apply_toml(config, {"memory": {"global_auto_ratio": 0.0005, "project_index_ratio": 0.001}})
+    monkeypatch.setenv("KAMA_MEMORY_PROJECT_INDEX_RATIO", "0.002")
     apply_env(config)
-    assert config.memory == MemoryConfig(global_auto_tokens=256, project_index_tokens=768)
-    for value in ({"global_tokens": 512}, {"project_index_tokens": 0}, {"global_auto_tokens": True}):
+    assert config.memory == MemoryConfig(global_auto_ratio=0.0005, project_index_ratio=0.002)
+    for value in ({"global_tokens": 512}, {"project_index_ratio": 0}, {"global_auto_ratio": True}):
         with pytest.raises(SystemExit):
             apply_toml(config, {"memory": value})

@@ -72,7 +72,7 @@ class RunCheckpoint(BaseModel):
     mcp_definition_hashes: dict[str, str] = Field(default_factory=dict)
     loaded_tool_names: list[str] = Field(default_factory=list)
     max_loaded_schema_tokens: int = Field(default=8_192, gt=0)
-    max_steps: int
+    max_steps: int = Field(ge=0)  # 0 不限步数；恢复保留原限制和已运行步数。
     max_run_seconds: int = Field(default=0, ge=0)
     max_total_tokens: int = Field(default=0, ge=0)
     repeat_failure_limit: int = Field(default=5, ge=0)

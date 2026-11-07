@@ -133,6 +133,7 @@ class AgentRunner:
         memory = MemoryStore(
             workspace, self._config.memory,
             project=Path(run.memory_project_root) if run and run.memory_project_root else None,
+            context_budget=self._config.compaction,
         )
         for memory_tool in (
             MemoryReadTool(memory), MemoryWriteTool(memory, session_id, run_id or ""),
@@ -228,7 +229,8 @@ class AgentRunner:
         context = self._create_context(
             self._new_run_state(goal, run_id, tools),
             cp.messages,
-            memory_store=MemoryStore(Path.cwd(), self._config.memory),
+            memory_store=MemoryStore(Path.cwd(), self._config.memory,
+                                     context_budget=self._config.compaction),
             system_prompt_override=system_prompt,
         )
         persistence = RunPersistence(context, cp, session, store)
@@ -377,6 +379,7 @@ class AgentRunner:
             memory_store=MemoryStore(
                 Path(run.workspace), self._config.memory,
                 project=Path(run.memory_project_root) if run.memory_project_root else None,
+                context_budget=self._config.compaction,
             ),
             system_prompt_override=system_prompt_override,
         )
@@ -415,7 +418,9 @@ class AgentRunner:
                 ("deferred" if provider in ("anthropic", "deepseek") else "on_demand")
                 if self._config.tool_search.enabled else "all"
             ),
-            max_loaded_schema_tokens=self._config.tool_search.max_loaded_schema_tokens,
+            max_loaded_schema_tokens=self._config.tool_search.schema_budget(
+                self._config.compaction.context_window_tokens,
+            ),
         )
 
     # 新任务与恢复共用 Context 构建，已有系统提示优先使用冻结值

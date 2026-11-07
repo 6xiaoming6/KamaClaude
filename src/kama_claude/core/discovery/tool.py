@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+from typing import Annotated
 
-from pydantic import Field
+from pydantic import Field, StringConstraints
 
 from kama_claude.core.checkpoint.checkpoint import RunCheckpoint
 from kama_claude.core.discovery.exposure import load_tools
@@ -13,15 +14,22 @@ from kama_claude.core.tools.base import BaseTool, ToolParams, ToolResult
 
 class SearchToolParams(ToolParams):
     description: str = Field(min_length=1, max_length=2000,
-                             description="Describe the capability needed for the current step.")
+                             description="Describe the required capability for semantic search.")
+    keywords: list[Annotated[str, StringConstraints(
+        strip_whitespace=True, min_length=1, max_length=100,
+    )]] = Field(
+        min_length=1, max_length=3,
+        description="1 to 3 precise terms, e.g. server/tool names or parameter names.",
+    )
 
 
 class SearchTool(BaseTool):
     name = "search_tool"
     description = (
-        "Find and load MCP tools needed for the current step. Describe the required capability; "
-        "the backend adds the user's task context. Loaded tools become callable on your NEXT "
-        "model turn. This only discovers tools; it does not execute them or grant permission."
+        "Find and load MCP tools needed for the current step. Provide a description for semantic "
+        "search and keywords for lexical search (e.g. ['github', 'get_issue']). The backend adds "
+        "the user's task context only to semantic search. Loaded tools become callable on your "
+        "NEXT model turn. This only discovers tools; it does not execute them or grant permission."
     )
     params_model = SearchToolParams
     input_schema = SearchToolParams.model_json_schema()
@@ -45,6 +53,7 @@ class SearchTool(BaseTool):
         result = await self._retriever.search(
             [record for record in self._records if record.public_name in self._run.mcp_tool_names],
             self._run.user_input or self._run.goal, args.description,
+            args.keywords,
         )
         candidates = result.ranking[:self._retriever.config.top_k]
         selected, rejected = load_tools(self._run, [name for name, _ in candidates])

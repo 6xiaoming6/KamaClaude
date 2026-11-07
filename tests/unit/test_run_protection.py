@@ -89,9 +89,10 @@ async def test_usage_save_failure_does_not_retry_completed_response():
 # 功能：验证请求失败的估算占用经过序列化恢复后仍参与上限检查
 # 设计：第一次请求占用几乎全部预算，恢复后第二次不能重新获得额度
 async def test_budget_reservation_survives_restart():
-    state = run_state(max_total_tokens=9000)
+    config = CompactionConfig()
+    state = run_state(max_total_tokens=config.output_reserve_tokens + 808)
     inner = provider(RuntimeError("connection ended"))
-    managed = ManagedProvider(inner, TokenEstimator(), CompactionConfig(), budget=RunBudget(state))
+    managed = ManagedProvider(inner, TokenEstimator(), config, budget=RunBudget(state))
     with pytest.raises(RuntimeError):
         await managed.chat([], [], EventBus(), state.run_id)
     restored = RunCheckpoint.model_validate_json(state.model_dump_json())
@@ -148,7 +149,7 @@ async def test_loop_stops_repeated_failures_and_pairs_remaining_tools():
 # 设计：构造必须摘要的历史，但主 Run 的额度不足以发起摘要请求
 async def test_summary_budget_error_propagates():
     from tests.unit.test_compactor import history
-    config = CompactionConfig(auto_threshold=0.01)
+    config = CompactionConfig(auto_threshold=0.01, context_window_tokens=65_536)
     inner = provider(LlmResponse("end_turn", text="unused"))
     estimator = TokenEstimator()
     managed = ManagedProvider(inner, estimator, config, budget=RunBudget(run_state(max_total_tokens=1)))
@@ -284,6 +285,40 @@ async def test_usage_event_uses_configured_window():
     await managed.chat([], [], bus, state.run_id, max_output_tokens=10)
     assert events[0].context_pct == 0.1
     assert state.actual_tokens == 110
+
+
+# 流式显示沿用 Usage 锚点估算，完成事件携带 Core 的实际窗口配置。
+async def test_stream_events_include_request_estimate_and_configured_window():
+    from kama_claude.core.bus.events import LlmTokenEvent, LlmUsageEvent
+    from kama_claude.core.compact.estimator import estimate_bytes
+
+    estimator = TokenEstimator()
+    prefix = [{"role": "user", "content": "old"}, {"role": "assistant", "content": "reply"}]
+    estimator.observe("system", prefix, [], 100, output_tokens=20)
+    tail = [{"role": "user", "content": "new request"}]
+    events = []
+    bus = EventBus()
+
+    async def collect(event):
+        events.append(event)
+
+    bus.subscribe(collect)
+
+    async def answer(**kwargs):
+        await kwargs["bus"].publish(LlmTokenEvent(run_id="run-test", token="hello", ts="now"))
+        await kwargs["bus"].publish(LlmUsageEvent(
+            run_id="run-test", input_tokens=20, total_input_tokens=100, output_tokens=5,
+            cache_read_input_tokens=80, cache_creation_input_tokens=0,
+            context_pct=0.001, context_window_tokens=200_000, ts="now",
+        ))
+        return LlmResponse("end_turn", text="hello", usage=UsageStats(20, 5, total_input_tokens=100))
+
+    managed = ManagedProvider(Mock(chat=AsyncMock(side_effect=answer)), estimator,
+                              CompactionConfig(context_window_tokens=1000))
+    await managed.chat([*prefix, *tail], [], bus, "run-test", system="system", max_output_tokens=10)
+    assert events[0].input_tokens_estimate == 120 + estimate_bytes(tail)
+    assert events[0].context_window_tokens == events[1].context_window_tokens == 1000
+    assert events[1].total_input_tokens == 100 and events[1].output_tokens == 5
 
 
 # 功能：验证最新 Usage 锚点随真实会话检查点跨新 Run 和存储重建保留

@@ -821,9 +821,21 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
 | `event_seq` | `integer` | no |
 | `next_cursor` | `integer | null` | no |
 | `history_end` | `integer` | no |
+| `permission_mode` | `object` | no |
 
 ```json
 {
+  "$defs": {
+    "PermissionMode": {
+      "enum": [
+        "ask",
+        "approve",
+        "full"
+      ],
+      "title": "PermissionMode",
+      "type": "string"
+    }
+  },
   "properties": {
     "session": {
       "additionalProperties": true,
@@ -888,6 +900,10 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
       "default": 0,
       "title": "History End",
       "type": "integer"
+    },
+    "permission_mode": {
+      "$ref": "#/$defs/PermissionMode",
+      "default": "ask"
     }
   },
   "required": [
@@ -983,6 +999,84 @@ History is paged: session.open returns the first page plus next_cursor and histo
   "type": "object"
 }
 ```
+### SessionSetPermissionModeCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+| `mode` | `object` | yes |
+
+```json
+{
+  "$defs": {
+    "PermissionMode": {
+      "enum": [
+        "ask",
+        "approve",
+        "full"
+      ],
+      "title": "PermissionMode",
+      "type": "string"
+    }
+  },
+  "properties": {
+    "type": {
+      "const": "session.set_permission_mode",
+      "default": "session.set_permission_mode",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "mode": {
+      "$ref": "#/$defs/PermissionMode"
+    }
+  },
+  "required": [
+    "session_id",
+    "mode"
+  ],
+  "title": "SessionSetPermissionModeCommand",
+  "type": "object"
+}
+```
+### SessionSetPermissionModeResult
+
+| Field | Type | Required |
+|---|---|---|
+| `permission_mode` | `object` | yes |
+
+```json
+{
+  "$defs": {
+    "PermissionMode": {
+      "enum": [
+        "ask",
+        "approve",
+        "full"
+      ],
+      "title": "PermissionMode",
+      "type": "string"
+    }
+  },
+  "properties": {
+    "permission_mode": {
+      "$ref": "#/$defs/PermissionMode"
+    }
+  },
+  "required": [
+    "permission_mode"
+  ],
+  "title": "SessionSetPermissionModeResult",
+  "type": "object"
+}
+```
+
+Permission mode is per session and in memory only: ask (existing approvals), approve (ask for high-risk/opaque commands and external file writes), full (skip prompts). Explicit denials apply in every mode. Mode changes affect future calls, never answer pending approvals, and are broadcast to session subscribers. session.open returns the current mode; Core restart resets it to ask.
+
 ### PermissionRespondCommand
 
 | Field | Type | Required |
@@ -1057,7 +1151,7 @@ History is paged: session.open returns the first page plus next_cursor and histo
 
 ## Request Admission and Connection Sending
 
-Requests are validated and admitted before a handler Task is created. Ordinary limits are 8 per connection and 64 globally; core.ping and permission.respond have separate limits of 2 per connection and 8 globally. Full capacity returns -32034 Server busy without creating waiting Tasks. Quotas include response sending. Shutdown rejects new ordinary work with -32035 Server shutting down while existing connections can still process control requests during Run cleanup.
+Requests are validated and admitted before a handler Task is created. Ordinary limits are 8 per connection and 64 globally; core.ping, permission.respond and session.set_permission_mode have separate limits of 2 per connection and 8 globally. Full capacity returns -32034 Server busy without creating waiting Tasks. Quotas include response sending. Shutdown rejects new ordinary work with -32035 Server shutting down while existing connections can still process control requests during Run cleanup.
 
 Responses, live events and replay share one FIFO ConnectionSender per connection. Live publication only enqueues; RPC and replay wait for their frame to be written. The queue allows 128 frames and 64 MiB + 1 byte including in-flight frames. Queue overflow, a 5-second drain timeout or write failure closes that connection and fails send waiters. Other connections and Core-owned Runs continue. Trace stage=queued is not delivery confirmation; stage=written follows drain. Changing subscriptions does not close the Sender. Pending requests, Sender drain and connection close each use 2-second shutdown waits.
 
@@ -2348,6 +2442,8 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `token` | `string` | yes |
+| `input_tokens_estimate` | `integer | null` | no |
+| `context_window_tokens` | `integer | null` | no |
 | `ts` | `string` | yes |
 
 ```json
@@ -2366,6 +2462,30 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "token": {
       "title": "Token",
       "type": "string"
+    },
+    "input_tokens_estimate": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Input Tokens Estimate"
+    },
+    "context_window_tokens": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Context Window Tokens"
     },
     "ts": {
       "title": "Ts",
@@ -2405,6 +2525,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | `cache_read_input_tokens` | `integer` | yes |
 | `cache_creation_input_tokens` | `integer` | yes |
 | `context_pct` | `number` | no |
+| `context_window_tokens` | `integer | null` | no |
 | `ts` | `string` | yes |
 
 ```json
@@ -2452,6 +2573,18 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
       "default": 0.0,
       "title": "Context Pct",
       "type": "number"
+    },
+    "context_window_tokens": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Context Window Tokens"
     },
     "ts": {
       "title": "Ts",
@@ -2796,6 +2929,56 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
   "type": "session.closed",
   "session_id": "sess-abc123def456",
   "ts": "2026-05-16T10:00:00.001Z"
+}
+```
+### SessionPermissionModeChangedEvent
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+| `permission_mode` | `object` | yes |
+| `ts` | `string` | yes |
+
+```json
+{
+  "$defs": {
+    "PermissionMode": {
+      "enum": [
+        "ask",
+        "approve",
+        "full"
+      ],
+      "title": "PermissionMode",
+      "type": "string"
+    }
+  },
+  "properties": {
+    "type": {
+      "const": "session.permission_mode_changed",
+      "default": "session.permission_mode_changed",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "permission_mode": {
+      "$ref": "#/$defs/PermissionMode"
+    },
+    "ts": {
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "permission_mode",
+    "ts"
+  ],
+  "title": "SessionPermissionModeChangedEvent",
+  "type": "object"
 }
 ```
 

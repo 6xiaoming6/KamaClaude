@@ -85,7 +85,7 @@ class AgentLoop:
         context = self._context
         run = context.run
         self._budget.check()
-        if run.step >= run.max_steps:
+        if run.max_steps > 0 and run.step >= run.max_steps:
             context.mark_failed("exceeded_max_steps")
             self._save_checkpoint()
             return False
@@ -189,7 +189,7 @@ class AgentLoop:
                     self._persistence.record_message("user", [block])
             run.tools = []
             run.phase = "ready"
-            if run.step >= run.max_steps:
+            if run.max_steps > 0 and run.step >= run.max_steps:
                 context.mark_failed("exceeded_max_steps")
         self._save_checkpoint()
 

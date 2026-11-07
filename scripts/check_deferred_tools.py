@@ -9,6 +9,8 @@ from typing import Any
 import anthropic
 from dotenv import load_dotenv
 
+from kama_claude.core.discovery.tool import SearchToolParams
+
 
 async def check() -> None:
     load_dotenv()
@@ -19,8 +21,7 @@ async def check() -> None:
         {"name": "search_tool", "description": (
             "Find an echo tool. Search only once; after receiving its tool reference, "
             "call the referenced tool with text hello."),
-         "input_schema": {"type": "object", "properties": {"description": {"type": "string"}},
-                          "required": ["description"]}, "defer_loading": False},
+         "input_schema": SearchToolParams.model_json_schema(), "defer_loading": False},
         {"name": "verification_echo", "description": "Echo the given text without side effects.",
          "input_schema": {"type": "object", "properties": {"text": {"type": "string"}},
                           "required": ["text"]}, "defer_loading": True},
@@ -39,6 +40,7 @@ async def check() -> None:
         calls = [block for block in first.content if block.type == "tool_use"]
         if len(calls) != 1 or calls[0].name != "search_tool":
             raise RuntimeError("first response did not produce the requested search tool call")
+        SearchToolParams.model_validate(calls[0].input)
         messages.extend([
             {"role": "assistant", "content": [block.model_dump(exclude_none=True) for block in first.content]},
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": calls[0].id,

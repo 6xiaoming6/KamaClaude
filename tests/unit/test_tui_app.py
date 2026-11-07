@@ -6,6 +6,7 @@ from textual.widget import Widget
 from kama_claude.tui.app import KamaTuiApp
 from kama_claude.tui.formatting import _param_summary, _preview
 from kama_claude.tui.widgets.conversation import LLMStreamBlock, ToolCallBlock
+from kama_claude.tui.widgets.usage import ReplyUsage
 
 
 # 功能：验证 _preview 超出长度时截断并追加省略号
@@ -34,9 +35,10 @@ def test_llm_tokens_accumulate_in_block() -> None:
     app._handle_event({"type": "llm.token", "token": "Hello", "run_id": "r", "ts": "t"})
     app._handle_event({"type": "llm.token", "token": " world", "run_id": "r", "ts": "t"})
 
-    assert len(appended) == 1  # same block reused
-    assert isinstance(appended[0], LLMStreamBlock)
-    assert appended[0]._text == "Hello world"  # type: ignore[attr-defined]
+    blocks = [widget for widget in appended if isinstance(widget, LLMStreamBlock)]
+    assert len(blocks) == 1  # 同一回复复用文字块和用量行，不随片段数量增加。
+    assert blocks[0]._text == "Hello world"
+    assert len([widget for widget in appended if isinstance(widget, ReplyUsage)]) == 1
 
 
 # 功能：验证 LLMStreamBlock 结束时会把累积文本渲染为 Rich Markdown

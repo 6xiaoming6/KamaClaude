@@ -213,7 +213,7 @@ class ToolBatchExecutor:
     def _finish_tool_batch(self) -> None:
         context = self._context
         run = context.run
-        if run.step >= run.max_steps:
+        if run.max_steps > 0 and run.step >= run.max_steps:
             context.mark_failed("exceeded_max_steps")
         # 如果这一个循环没有完成任务，就继续设置为ready阶段，准备下一次循环
         run.phase = "ready" if not context.is_done() else "finished"

@@ -43,7 +43,7 @@ class BaseTool(ABC):
     input_schema: dict[str, object]
     retry_safe: ClassVar[bool] = False
     ends_run: ClassVar[bool] = False
-    timeout_s: ClassVar[float] = 120.0
+    timeout_s: ClassVar[float | None] = 120.0  # None 表示由工具自身和外层 Run 预算约束。
     params_model: ClassVar[type[BaseModel] | None] = None
 
     # 执行工具调用，返回结果或错误

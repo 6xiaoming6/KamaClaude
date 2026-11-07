@@ -22,6 +22,8 @@ def apply_env(config: KamaConfig) -> None:
 
 # 环境变量沿用 TOML 的字段和验证规则，不读取远程模型地址或密钥。
 def _apply_tool_search(config: KamaConfig) -> None:
+    if "KAMA_TOOL_SEARCH_MAX_LOADED_SCHEMA_TOKENS" in os.environ:
+        raise SystemExit("Config migration: use KAMA_TOOL_SEARCH_MAX_LOADED_SCHEMA_RATIO")
     values = asdict(config.tool_search)
     for key in values:
         raw = os.environ.get(f"KAMA_TOOL_SEARCH_{key.upper()}")
@@ -31,11 +33,16 @@ def _apply_tool_search(config: KamaConfig) -> None:
             if raw.lower() not in {"true", "false", "1", "0"}:
                 raise SystemExit("Config error: KAMA_TOOL_SEARCH_ENABLED must be a boolean")
             values[key] = raw.lower() in {"true", "1"}
-        elif key in {"top_k", "max_loaded_schema_tokens"}:
+        elif key == "top_k":
             try:
                 values[key] = int(raw)
             except ValueError as exc:
                 raise SystemExit(f"Config error: tool_search.{key} must be an integer") from exc
+        elif key == "max_loaded_schema_ratio":
+            try:
+                values[key] = float(raw)
+            except ValueError as exc:
+                raise SystemExit("Config error: tool_search schema ratio must be numeric") from exc
         else:
             values[key] = raw
     try:
@@ -92,9 +99,9 @@ def _apply_agent(config: KamaConfig) -> None:
     if max_steps_str is not None:
         try:
             val = int(max_steps_str)
-            if val <= 0:
+            if val < 0:
                 raise SystemExit(
-                    "Config error: KAMA_MAX_STEPS must be a positive integer,"
+                    "Config error: KAMA_MAX_STEPS must be a nonnegative integer (0=unlimited),"
                     f" got: {max_steps_str!r}"
                 )
             config.agent.max_steps = val
@@ -154,16 +161,24 @@ def _apply_permission(config: KamaConfig) -> None:
 
 
 def _apply_compaction(config: KamaConfig) -> None:
+    if any(name in os.environ for name in (
+        "KAMA_COMPACT_OUTPUT_TOKENS", "KAMA_COMPACT_RECENT_TOKENS", "KAMA_COMPACT_SUMMARY_TOKENS",
+    )):
+        raise SystemExit(
+            "Config migration: replace KAMA_COMPACT_OUTPUT_TOKENS, KAMA_COMPACT_RECENT_TOKENS "
+            "and KAMA_COMPACT_SUMMARY_TOKENS with KAMA_COMPACT_OUTPUT_RATIO, "
+            "KAMA_COMPACT_RECENT_RATIO and KAMA_COMPACT_SUMMARY_RATIO"
+        )
     if any(key in os.environ for key in ("KAMA_COMPACT_KEEP_GROUPS", "KAMA_COMPACT_PRUNE_TARGET")):
         raise SystemExit(
             "Config migration: remove KAMA_COMPACT_PRUNE_TARGET; use KAMA_COMPACT_KEEP_TURNS "
-            "and KAMA_COMPACT_RECENT_TOKENS instead of KAMA_COMPACT_KEEP_GROUPS"
+            "and KAMA_COMPACT_RECENT_RATIO instead of KAMA_COMPACT_KEEP_GROUPS"
         )
     compact_threshold = os.environ.get("KAMA_COMPACT_THRESHOLD")
     if compact_threshold is not None:
         try:
             compact_threshold_val = float(compact_threshold)
-            if not (0.0 <= compact_threshold_val <= 1.0):
+            if not (0.0 <= compact_threshold_val < 1.0):
                 raise SystemExit(
                     "Config error: KAMA_COMPACT_THRESHOLD must be between 0 and 1, "
                     f"got: {compact_threshold!r}"
@@ -207,10 +222,7 @@ def _apply_compaction(config: KamaConfig) -> None:
             )
     for suffix, key in {
         "WINDOW_TOKENS": "context_window_tokens",
-        "OUTPUT_TOKENS": "output_reserve_tokens",
         "KEEP_TURNS": "keep_recent_turns",
-        "RECENT_TOKENS": "recent_token_budget",
-        "SUMMARY_TOKENS": "summary_max_tokens",
     }.items():
         name = "KAMA_COMPACT_" + suffix
         value = os.environ.get(name)
@@ -223,18 +235,43 @@ def _apply_compaction(config: KamaConfig) -> None:
         if parsed <= 0:
             raise SystemExit(f"Config error: {name} must be a positive integer")
         setattr(config.compaction, key, parsed)
+    for suffix, key in {
+        "OUTPUT_RATIO": "output_reserve_ratio",
+        "SAFETY_RATIO": "safety_margin_ratio",
+        "RECENT_RATIO": "recent_history_ratio",
+        "SUMMARY_RATIO": "summary_max_ratio",
+        "SUMMARY_TARGET_RATIO": "summary_target_ratio",
+    }.items():
+        name = "KAMA_COMPACT_" + suffix
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        try:
+            ratio = float(raw)
+        except ValueError as exc:
+            raise SystemExit(f"Config error: {name} must be a ratio between 0 and 1") from exc
+        if not 0 < ratio < 1:
+            raise SystemExit(f"Config error: {name} must be a ratio between 0 and 1")
+        setattr(config.compaction, key, ratio)
 
 
 def _apply_memory(config: KamaConfig) -> None:
-    for key in ("global_auto_tokens", "project_index_tokens"):
+    if any(name in os.environ for name in (
+        "KAMA_MEMORY_GLOBAL_AUTO_TOKENS", "KAMA_MEMORY_PROJECT_INDEX_TOKENS",
+    )):
+        raise SystemExit(
+            "Config migration: use KAMA_MEMORY_GLOBAL_AUTO_RATIO "
+            "and KAMA_MEMORY_PROJECT_INDEX_RATIO"
+        )
+    for key in ("global_auto_ratio", "project_index_ratio"):
         name = f"KAMA_MEMORY_{key.upper()}"
         raw = os.environ.get(name)
         if raw is None:
             continue
         try:
-            memory_amount = int(raw)
+            memory_amount = float(raw)
         except ValueError as exc:
-            raise SystemExit(f"Config error: {name} must be a positive integer") from exc
-        if memory_amount <= 0:
-            raise SystemExit(f"Config error: {name} must be a positive integer")
+            raise SystemExit(f"Config error: {name} must be a ratio between 0 and 1") from exc
+        if not 0 < memory_amount < 1:
+            raise SystemExit(f"Config error: {name} must be a ratio between 0 and 1")
         setattr(config.memory, key, memory_amount)

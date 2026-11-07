@@ -4,6 +4,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Discriminator, Field
 
+from kama_claude.core.permissions.mode import PermissionMode
 from kama_claude.core.session.model import SessionMode, SessionStatus
 
 
@@ -143,6 +144,17 @@ class SessionOpenResult(BaseModel):
     event_seq: int = 0
     next_cursor: int | None = None
     history_end: int = 0
+    permission_mode: PermissionMode = PermissionMode.ASK
+
+
+class SessionSetPermissionModeCommand(BaseModel):
+    type: Literal["session.set_permission_mode"] = "session.set_permission_mode"
+    session_id: str
+    mode: PermissionMode
+
+
+class SessionSetPermissionModeResult(BaseModel):
+    permission_mode: PermissionMode
 
 
 class SessionResumeCommand(BaseModel):
@@ -171,6 +183,7 @@ Command = Annotated[
     | SessionCompactCommand
     | SessionListCommand
     | SessionOpenCommand
-    | SessionResumeCommand,
+    | SessionResumeCommand
+    | SessionSetPermissionModeCommand,
     Discriminator("type"),
 ]

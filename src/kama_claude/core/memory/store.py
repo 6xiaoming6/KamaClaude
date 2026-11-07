@@ -7,7 +7,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from kama_claude.core.compact.estimator import estimate_bytes
-from kama_claude.core.config import MemoryConfig
+from kama_claude.core.config import CompactionConfig, MemoryConfig
 from kama_claude.core.memory.files import atomic_write, read_optional
 from kama_claude.core.memory.model import MemoryEntry, MemoryError, MemoryType
 from kama_claude.core.memory.paths import checked_path, project_id, project_root
@@ -20,6 +20,7 @@ class MemoryStore:
     def __init__(
         self, workspace: Path, config: MemoryConfig | None = None, *, home: Path | None = None,
         project: Path | None = None,
+        context_budget: CompactionConfig | None = None,
     ) -> None:
         self.home = (home or Path.home() / ".kama").expanduser().resolve()
         self.project_root = (
@@ -28,6 +29,10 @@ class MemoryStore:
         self.project_id = project_id(self.project_root)
         self.root = self.home / "projects" / self.project_id / "memory"
         self.config = config or MemoryConfig()
+        self._context_budget = context_budget or CompactionConfig()
+
+    def _budget(self, ratio: float) -> int:
+        return max(1, int(self._context_budget.context_window_tokens * ratio))
 
     # 自动文件只能经专用入口维护，拒绝链接到用户规则或其他存储位置。
     def global_path(self) -> Path:
@@ -36,7 +41,9 @@ class MemoryStore:
     # 自动注入读取全文并检查预算；工具读取仍可查看超预算文件以便修复。
     def global_text(self) -> str:
         text = read_optional(self.global_path())
-        self._check_budget(text, self.config.global_auto_tokens, "global automatic memory")
+        self._check_budget(
+            text, self._budget(self.config.global_auto_ratio), "global automatic memory",
+        )
         return text
 
     # key 不能选择目录、索引或 Windows 保留文件名。
@@ -102,7 +109,7 @@ class MemoryStore:
             f"- [{entry.key}]({entry.key}.md) ({entry.type})：{entry.summary}\n"
             for entry in sorted(entries, key=lambda item: (item.type, item.key))
         ) if entries else ""
-        self._check_budget(text, self.config.project_index_tokens, "project index")
+        self._check_budget(text, self._budget(self.config.project_index_ratio), "project index")
         return text
 
     # 缺失或陈旧索引先修复，再用于读取或注入；空目录不会因查询而创建。
@@ -167,7 +174,9 @@ class MemoryStore:
         current = self.read_global()
         path = self.global_path()
         if content is not None:
-            self._check_budget(content, self.config.global_auto_tokens, "global automatic memory")
+            self._check_budget(
+                content, self._budget(self.config.global_auto_ratio), "global automatic memory",
+            )
         if content is None and not path.exists():
             return {"status": "already_absent", "scope": "global"}
         if content is not None and current["content"] == content and (

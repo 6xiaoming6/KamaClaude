@@ -45,7 +45,9 @@ def run_state(**kwargs):
 def discovery_history():
     return [{"role": "user", "content": "get issue"},
             {"role": "assistant", "content": [{"type": "tool_use", "id": "s",
-                                               "name": "search_tool", "input": {"description": "issue"}}]},
+                                               "name": "search_tool", "input": {
+                                                   "description": "issue", "keywords": ["issue"],
+                                               }}]},
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "s",
                                           "content": ToolResult("found", tool_references=[
                                               "remote__get_issue",
@@ -299,7 +301,7 @@ async def test_native_referenced_tool_still_requires_permission(tmp_path, monkey
 # 额度不足就不返回引用，完整目录不变，也不会把业务工具提前放行。
 async def test_native_schema_budget_rejects_without_reference(tmp_path, monkeypatch):
     config, manager, client = await setup_manager(tmp_path, monkeypatch)
-    config.tool_search.max_loaded_schema_tokens = 1
+    config.tool_search.max_loaded_schema_ratio = 1 / config.compaction.context_window_tokens
     provider = NativeScriptedProvider([search_response(), remote_response(), LlmResponse("end_turn", text="done")])
     await AgentRunner(config, provider=provider, mcp_manager=manager,
                       runs_dir=tmp_path / "runs").run_and_capture("goal")

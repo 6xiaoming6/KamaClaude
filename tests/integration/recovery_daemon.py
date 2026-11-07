@@ -110,14 +110,21 @@ async def main(root: Path, port: int) -> None:
             return registry
 
     config = KamaConfig()
+    if (root / "long-output").exists():
+        # 故障注入用小阈值触发归档，不依赖日常开发配置的默认限长。
+        config.compaction.tool_result_limit = 8_000
+        config.compaction.tool_result_keep = 4_000
     if (root / "s9-mode").exists():
+        # 此用例用短历史验证压缩后重启，固定小窗口以控制触发条件。
+        config.compaction.context_window_tokens = 65_536
         config.compaction.auto_threshold = 0.05
     if (root / "s9-program-mode").exists():
         config.compaction.context_window_tokens = 65_536
         config.compaction.auto_threshold = 0.05
-        config.compaction.recent_token_budget = 2_000
-        config.compaction.output_reserve_tokens = 512
-        config.compaction.summary_max_tokens = 256
+        config.compaction.recent_history_ratio = 2_000 / 65_536
+        config.compaction.output_reserve_ratio = 512 / 65_536
+        config.compaction.summary_max_ratio = 256 / 65_536
+        config.compaction.summary_target_ratio = 128 / 65_536
     app._sessions = SessionManager(
         SessionStore(root / "sessions"),
         lambda: Runner(config, provider=Provider(root), bus=app._bus),

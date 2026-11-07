@@ -26,7 +26,7 @@ async def test_search_then_call_real_mcp(mcp_endpoint, tmp_path, native):
         provider_type = NativeScriptedProvider if native else ScriptedProvider
         provider = provider_type([
             LlmResponse("tool_use", tool_calls=[ToolCallBlock(
-                "search", "search_tool", {"description": "add two numbers"},
+                "search", "search_tool", {"description": "add two numbers", "keywords": ["add"]},
             )]),
             LlmResponse("tool_use", tool_calls=[ToolCallBlock(
                 "add", "remote__add", {"a": 10, "b": 20},

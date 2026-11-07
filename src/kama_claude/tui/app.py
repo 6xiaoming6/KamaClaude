@@ -11,11 +11,13 @@ from textual.css.query import NoMatches
 from textual.widgets import Button, Label, Static
 
 from kama_claude.core.config import KamaConfig
+from kama_claude.core.permissions.mode import PermissionMode
 from kama_claude.core.skills.loader import SkillLoader
 from kama_claude.core.transport.socket_client import IpcError, SocketClient
 from kama_claude.tui.conversation import ConversationView
 from kama_claude.tui.formatting import _preview
 from kama_claude.tui.recovery import RecoveryActions, SessionPicker
+from kama_claude.tui.settings import PermissionModePicker
 from kama_claude.tui.widgets.input import ChatTextArea, SlashCompleteWidget
 from kama_claude.tui.widgets.permissions import PermissionBlock, PermissionSelect
 
@@ -30,6 +32,7 @@ class KamaTuiApp(App[None]):
         Binding("ctrl+q", "quit", "退出", priority=True),
         Binding("ctrl+o", "open_sessions", "历史会话", priority=True),
         Binding("ctrl+w", "close_session", "关闭会话", priority=True),
+        Binding("ctrl+p", "permission_mode", "审批模式", priority=True),
     ]
     CSS = """
     Screen { background: $background; }
@@ -81,6 +84,9 @@ class KamaTuiApp(App[None]):
         self._client: SocketClient | None = None
         self._pending_permission_blocks: dict[str, PermissionBlock] = {}
         self._session_id: str | None = None
+        self._permission_mode = PermissionMode.ASK
+        self._permission_mode_updates = 0
+        self._header_state = "connecting"
         self._busy = False
         self._opening = False
         self._open_lock = asyncio.Lock()
@@ -98,7 +104,8 @@ class KamaTuiApp(App[None]):
     def on_mount(self) -> None:
         self._slash_items = self._build_slash_items()
         self._view.append(Static(self._BANNER, id="banner"))
-        self.run_worker(self._socket_loop(), exclusive=True, name="socket")
+        # exclusive 按 group 取消任务；连接必须独立，不能被设置弹窗取消。
+        self.run_worker(self._socket_loop(), group="connection", exclusive=True, name="socket")
         prompt = self.query_one("#prompt", ChatTextArea)
         prompt.disabled = True
         prompt.border_title = "connecting..."
@@ -122,7 +129,7 @@ class KamaTuiApp(App[None]):
     # 根据 / 前缀查询字符串挂载、更新或移除自动补全弹窗
     def on_chat_text_area_slash_changed(self, event: ChatTextArea.SlashChanged) -> None:
         # 模态查看窗口打开后，忽略旧聊天输入框迟到的补全事件
-        if self._prompt() is None:
+        if len(self.screen_stack) > 1 or self._prompt() is None:
             return
         query = event.query
         if query is None:
@@ -153,7 +160,7 @@ class KamaTuiApp(App[None]):
     # 记录按键焦点；当 PermissionSelect 失去焦点后作为兜底处理权限快捷键
     def on_key(self, event: events.Key) -> None:
         log.debug("App.on_key  key=%r  focused=%r", event.key, self.focused)
-        if not self._pending_permission_blocks:
+        if len(self.screen_stack) > 1 or not self._pending_permission_blocks:
             return
         try:
             select = self.query_one(PermissionSelect)
@@ -181,6 +188,44 @@ class KamaTuiApp(App[None]):
     # 退出仅断开界面，保留可重新打开的会话
     async def action_quit(self) -> None:
         self.exit()
+
+    # 模式弹窗使用独立 Worker 组，不能取消连接和正在等待的 RPC。
+    def action_permission_mode(self) -> None:
+        if (
+            self._client is not None and self._session_id is not None
+            and not self._opening and len(self.screen_stack) == 1
+        ):
+            self.run_worker(
+                self._pick_permission_mode(), group="permission_mode",
+                name="permission_mode", exclusive=True,
+            )
+
+    async def _pick_permission_mode(self) -> None:
+        client, sid = self._client, self._session_id
+        selected = await self.push_screen_wait(PermissionModePicker(self._permission_mode))
+        if selected is None or self._client is not client or self._session_id != sid:
+            return
+        await self._set_permission_mode(selected)
+
+    async def _set_permission_mode(self, mode: PermissionMode) -> None:
+        client, sid = self._client, self._session_id
+        if client is None or sid is None:
+            return
+        updates = self._permission_mode_updates
+        try:
+            result = await client.send_command(
+                "session.set_permission_mode", {"session_id": sid, "mode": mode.value},
+            )
+            # 更晚的模式广播优先；迟到响应也不能修改已切换的会话。
+            if (
+                self._client is client and self._session_id == sid
+                and self._permission_mode_updates == updates
+            ):
+                self._permission_mode = PermissionMode(result["permission_mode"])
+                self._update_header(self._header_state)
+        except (IpcError, RuntimeError, OSError, ValueError) as exc:
+            if self._client is client and self._session_id == sid:
+                self._view.append(Static(f"审批模式设置失败：{exc}", markup=False))
 
     # 打开历史选择器，不取消当前 Core 中的运行
     def action_open_sessions(self) -> None:
@@ -304,19 +349,23 @@ class KamaTuiApp(App[None]):
 
     # 将选择控件挂载到 Screen 顶层（#prompt 之前），避免 VerticalScroll 争抢焦点
     def _mount_permission_select(self, select: PermissionSelect) -> None:
-        self.mount(select, before="#prompt")
+        self.screen_stack[0].mount(select, before="#prompt")
 
     # 安全获取输入框，便于组件测试中未挂载时跳过 UI 操作
     def _prompt(self) -> ChatTextArea | None:
         try:
-            return self.query_one("#prompt", ChatTextArea)
+            # 设置弹窗打开时，后台事件仍更新主界面。
+            return self.screen_stack[0].query_one("#prompt", ChatTextArea)
         except Exception:
             return None
 
     # 根据连接和运行状态刷新顶部标题
     def _update_header(self, state: str) -> None:
+        self._header_state = state
+        if not self.screen_stack:
+            return
         try:
-            header = self.query_one("#header", Label)
+            header = self.screen_stack[0].query_one("#header", Label)
         except NoMatches:
             return
         session = f"  [dim]{self._session_id}[/dim]" if self._session_id else ""
@@ -331,6 +380,7 @@ class KamaTuiApp(App[None]):
         header.update(
             f"[bold]KamaClaude[/bold]  [dim]{self._host}:{self._port}[/dim]"
             f"{session}  [{color}]{state}[/{color}]"
+            f"  权限：{self._permission_mode.value.upper()}  [dim]Ctrl+P 切换[/dim]"
         )
 
     # 选择历史或新建会话，仅用户明确操作才恢复中断任务，选择后并打开会话
@@ -369,12 +419,14 @@ class KamaTuiApp(App[None]):
         if self._client is None:
             return
         previous = self._session_id
+        previous_mode = self._permission_mode
         # 加载期间先缓冲事件，避免历史快照与实时更新交叉覆盖
         self._opening = True
         self._event_buffer = []
         self._session_id = sid
         try:
             data = await self._client.send_command("session.open", {"session_id": sid})
+            self._permission_mode = PermissionMode(data.get("permission_mode", "ask"))
             cursor = data.get("next_cursor")
             while cursor is not None:
                 page = await self._client.send_command("session.get_history", {
@@ -392,9 +444,9 @@ class KamaTuiApp(App[None]):
             await view.remove_children()
             view.reset()
             self._pending_permission_blocks.clear()
-            for select in list(self.query(PermissionSelect)):
+            for select in list(self.screen_stack[0].query(PermissionSelect)):
                 select.remove()
-            for control in list(self.query(RecoveryActions)):
+            for control in list(self.screen_stack[0].query(RecoveryActions)):
                 control.remove()
             self._snapshot_revision = int(data["revision"])
             # 水位过滤旧事件，完成 ID 再防止迟到通知重复显示
@@ -454,6 +506,7 @@ class KamaTuiApp(App[None]):
                 self._handle_event_inner(permission)
         except BaseException:
             self._session_id = previous
+            self._permission_mode = previous_mode
             raise
         finally:
             self._opening = False
@@ -592,11 +645,12 @@ class KamaTuiApp(App[None]):
     # App 处理会话和审批操作；普通展示事件交给对话视图。
     def _handle_event_inner(self, event: dict[str, Any]) -> None:
         kind = str(event.get("type", ""))
-        if kind != "llm.token":
+        if kind not in {"llm.token", "session.permission_mode_changed"}:
             self._view.break_stream()
         if kind in {
             "session.waiting_for_input",
             "session.closed",
+            "session.permission_mode_changed",
             "run.interrupted",
             "run.resumed",
         }:
@@ -608,7 +662,11 @@ class KamaTuiApp(App[None]):
 
     def _handle_session_event(self, event: dict[str, Any]) -> None:
         t = event.get("type", "")
-        if t == "session.waiting_for_input":
+        if t == "session.permission_mode_changed":
+            self._permission_mode = PermissionMode(event["permission_mode"])
+            self._permission_mode_updates += 1
+            self._update_header(self._header_state)
+        elif t == "session.waiting_for_input":
             self._busy = False
             prompt = self._prompt()
             if prompt is not None:
@@ -726,7 +784,7 @@ class KamaTuiApp(App[None]):
                 perm_block = self._pending_permission_blocks.pop(request_id)
                 perm_block._resolve(decision)
                 try:
-                    for select in self.query(PermissionSelect):
+                    for select in self.screen_stack[0].query(PermissionSelect):
                         if select._request_id == request_id:
                             select.remove()
                 except Exception:

@@ -9,6 +9,7 @@ import pytest
 
 import kama_claude.core.app as core_app
 from kama_claude.core.config import KamaConfig
+from kama_claude.core.config.models import McpServerConfig
 
 
 @pytest.mark.parametrize(
@@ -101,4 +102,36 @@ async def test_shutdown_gates_requests_first_and_keeps_cleanup_on_failure(monkey
         await task
     assert order == ["gate", "sessions", "mcp", "server", "trace"]
     controls = {call.args[0] for call in server.register.call_args_list if call.kwargs.get("control")}
-    assert controls == {"core.ping", "permission.respond"}
+    assert controls == {"core.ping", "permission.respond", "session.set_permission_mode"}
+
+
+async def test_startup_log_excludes_configured_credentials(monkeypatch, caplog):
+    config = KamaConfig()
+    config.trace.enabled = False
+    secrets = ["fake-execution-secret", "fake-header-secret", "fake-mcp-secret",
+               "fake-argument-secret", "fake-url-secret"]
+    config.execution.env = {"CUSTOM_TOKEN": secrets[0]}
+    config.mcp.servers = [McpServerConfig(
+        "remote", transport="streamable-http", headers={"Authorization": secrets[1]},
+        env={"CUSTOM_TOKEN": secrets[2]}, args=["--token=" + secrets[3]],
+        url="https://example.invalid/mcp?key=" + secrets[4],
+    )]
+    started = asyncio.Event()
+    server = Mock()
+    server.start = AsyncMock(side_effect=lambda: started.set() or "local")
+    server.stop = AsyncMock()
+    mcp = Mock(start_all=AsyncMock(), stop_all=AsyncMock())
+    monkeypatch.setattr(core_app, "get_config", lambda: config)
+    monkeypatch.setattr(core_app, "setup_logging", Mock())
+    monkeypatch.setattr(core_app, "SocketServer", Mock(return_value=server))
+    monkeypatch.setattr(core_app, "McpServerManager", Mock(return_value=mcp))
+    monkeypatch.setattr(core_app, "sys", SimpleNamespace(platform="win32"))
+    with caplog.at_level("INFO", logger=core_app.__name__):
+        task = asyncio.create_task(core_app.CoreApp().run())
+        try:
+            await asyncio.wait_for(started.wait(), timeout=2)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    assert "config" in caplog.text
+    assert not any(secret in caplog.text for secret in secrets)

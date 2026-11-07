@@ -5,6 +5,7 @@ from enum import StrEnum
 from typing import Any
 
 from kama_claude.core.permissions.bash import CommandRule, command_decision
+from kama_claude.core.permissions.mode import PermissionMode
 from kama_claude.core.workspace import PathAccess
 
 
@@ -90,6 +91,7 @@ def evaluate(
 def assess(
     tool_name: str, params: dict[str, Any], policy: ToolPolicy | None = None, *,
     path_access: PathAccess | None = None,
+    mode: PermissionMode = PermissionMode.ASK,
 ) -> PermissionAssessment:
     policy = policy or DEFAULT_POLICIES.get(tool_name)
     if policy is not None and policy.default == PermissionDecision.DENY:
@@ -97,8 +99,20 @@ def assess(
     if tool_name == "bash":
         decision, reason = command_decision(
             str(params.get("command", "")), rules=policy.command_rules if policy else [],
+            mode=mode,
         )
         return PermissionAssessment(PermissionDecision(decision), reason, reusable=False)
+    if mode == PermissionMode.FULL:
+        return PermissionAssessment(PermissionDecision.ALLOW, "full 模式：无需审批")
+    if mode == PermissionMode.APPROVE:
+        if (
+            path_access is not None and path_access.outside_workspace
+            and tool_name in {"write_file", "edit_file"}
+        ):
+            return PermissionAssessment(
+                PermissionDecision.ASK, "写入工作区外路径", reusable=False,
+            )
+        return PermissionAssessment(PermissionDecision.ALLOW, "approve 模式：普通操作无需审批")
     if path_access is not None and path_access.outside_workspace:
         return PermissionAssessment(PermissionDecision.ASK, "访问工作区外路径", reusable=False)
     default = policy.default if policy is not None else _UNKNOWN_TOOL_DEFAULT

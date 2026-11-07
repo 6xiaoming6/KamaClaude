@@ -41,6 +41,15 @@ def get_config() -> KamaConfig:
     comp = config.compaction
     if comp.tool_result_keep > comp.tool_result_limit:
         raise SystemExit("Config error: tool_result_keep must not exceed tool_result_limit")
-    if comp.input_limit <= 0 or comp.context_window_tokens <= comp.summary_max_tokens + 1_024:
-        raise SystemExit("Config error: context window must allow input, output and safety margin")
+    try:
+        comp.validate()
+    except ValueError as exc:
+        raise SystemExit(f"Config error: {exc}") from exc
+    allocations = (
+        comp.output_reserve_ratio + comp.safety_margin_ratio + comp.recent_history_ratio
+        + comp.summary_max_ratio + config.memory.global_auto_ratio
+        + config.memory.project_index_ratio + config.tool_search.max_loaded_schema_ratio
+    )
+    if allocations >= 1:
+        raise SystemExit("Config error: context allocations must leave room for fixed user rules")
     return config

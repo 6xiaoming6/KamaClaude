@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from kama_claude.core.permissions.mode import PermissionMode
 from kama_claude.core.permissions.policy import (
     DEFAULT_POLICIES,
     PermissionDecision,
@@ -44,6 +45,7 @@ class PermissionManager:
         self._policies = dict(DEFAULT_POLICIES if policies is None else policies)
         self._pending: dict[str, _PendingRequest] = {}
         self._file_grants: set[tuple[str, str, str]] = set()
+        self.session_premission_modes: dict[str, PermissionMode] = {}
         # 其他工具保留完整参数授权；文件不再使用目录或资源范围。
         self._session_grants: dict[ApprovalScope, bool] = {}
         # 旧文件只保留拒绝记录；旧工具级允许不再自动放行，也不改写原文件。
@@ -52,6 +54,13 @@ class PermissionManager:
         if "allow" in stored.values():
             logger.warning("legacy tool-wide allows ignored; approve scoped operations again")
         self._timeout_s = timeout_s
+
+    # 模式只属于当前 Core 中的会话；不写入检查点，不允许模型参数覆盖。
+    def get_mode(self, session_id: str) -> PermissionMode:
+        return self.session_premission_modes.get(session_id, PermissionMode.ASK)
+
+    def set_mode(self, session_id: str, mode: PermissionMode) -> None:
+        self.session_premission_modes[session_id] = PermissionMode(mode)
 
     # 查询静态禁止与默认策略，不读取会话文件授权。
     def evaluate(self, tool_name: str, params: dict[str, Any]) -> PermissionDecision:
@@ -76,6 +85,7 @@ class PermissionManager:
         params = deepcopy(params)
         assessment = assess(
             tool_name, params, self._policies.get(tool_name), path_access=path_access,
+            mode=self.get_mode(session_id),
         )
         if (
             assessment.decision == PermissionDecision.DENY
@@ -174,6 +184,7 @@ class PermissionManager:
 
     # 主动关闭会话时拒绝待审批调用，并撤销该会话内的所有授权。
     def cancel_session(self, session_id: str, reason: str = "session_closed") -> None:
+        self.session_premission_modes.pop(session_id, None)
         for request_id, req in list(self._pending.items()):
             if req.payload["session_id"] == session_id:
                 self._pending.pop(request_id)

@@ -173,7 +173,7 @@ async def test_old_references_drop_and_required_reference_returns(tmp_path: Path
     _, loaded = validate_candidate(run, result, None, config, TokenEstimator())
     assert loaded == ["remote__get_issue"]
     # 引用展开后的定义计入近期额度，不能用短引用掩盖真实占用。
-    too_small = CompactionConfig(keep_recent_turns=1, recent_token_budget=100)
+    too_small = CompactionConfig(keep_recent_turns=1, recent_history_ratio=(100) / (1_048_576))
     model = provider()
     rejected = await Compactor(too_small).compact_messages(
         [*messages, latest, call, answer], model, tool_schemas=schemas,
@@ -199,7 +199,7 @@ async def test_thinking_only_removed_from_anthropic_rewritten_projection(provide
 
 # 全文先归档，结果 ID/错误与结构化引用仍由原 ToolResult 提供。
 def test_output_preparer_keeps_full_result_and_references(tmp_path: Path) -> None:
-    result = ToolResult("HEAD" + "x" * 10_000 + "TAIL", tool_references=["remote"])
+    result = ToolResult("HEAD" + "x" * 40_000 + "TAIL", tool_references=["remote"])
     before = copy.deepcopy(result)
     preparer = ToolOutputPreparer(CompactionConfig(), tmp_path)
     preview = preparer.prepare("call", result)
@@ -234,11 +234,12 @@ def test_removed_environment_requires_migration(old: str, monkeypatch: pytest.Mo
 
 def test_recent_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
     config = KamaConfig()
-    apply_toml(config, {"compaction": {"keep_recent_turns": 4, "recent_token_budget": 12_000}})
+    apply_toml(config, {"compaction": {"keep_recent_turns": 4, "recent_history_ratio": 0.3}})
     monkeypatch.setenv("KAMA_COMPACT_KEEP_TURNS", "2")
-    monkeypatch.setenv("KAMA_COMPACT_RECENT_TOKENS", "8000")
+    monkeypatch.setenv("KAMA_COMPACT_RECENT_RATIO", "0.2")
     apply_env(config)
-    assert config.compaction.keep_recent_turns == 2 and config.compaction.recent_token_budget == 8000
+    assert config.compaction.keep_recent_turns == 2
+    assert config.compaction.recent_token_budget == int(config.compaction.context_window_tokens * 0.2)
 
 
 # 候选和自动记忆必须一次提交，不能在保存失败后留下半套内存状态。
@@ -287,7 +288,7 @@ def test_refreshed_memory_cannot_erase_required_savings(tmp_path: Path) -> None:
     from kama_claude.core.config import MemoryConfig
 
     run = fresh_run(tmp_path)
-    memory = MemoryStore(tmp_path, MemoryConfig(global_auto_tokens=2000))
+    memory = MemoryStore(tmp_path, MemoryConfig(global_auto_ratio=2000 / 1_048_576))
     memory.home.mkdir(parents=True)
     initialize_prompt(run, memory, "BASE")
     before_memory = run.memory_snapshot.model_copy(deep=True)

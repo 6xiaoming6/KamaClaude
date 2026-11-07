@@ -18,3 +18,13 @@ def parse_commands(command: str) -> list[list[str]] | None:
             return None
         commands.append(argv)
     return commands or None
+
+
+# 不完整脚本中的字面量前缀仅用于禁止检查，绝不能用于自动放行。
+def literal_command_prefixes(command: str) -> list[list[str]]:
+    prefixes: list[list[str]] = []
+    for segment in _OPERATORS.split(command):
+        match = _LITERAL.match(segment.lstrip(" \t"))
+        if match is not None and match.group().strip():
+            prefixes.append(match.group().split())
+    return prefixes
