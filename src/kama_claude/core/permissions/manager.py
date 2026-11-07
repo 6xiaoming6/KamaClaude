@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from kama_claude.core.context import RunStopRequested
 from kama_claude.core.permissions.mode import PermissionMode
 from kama_claude.core.permissions.policy import (
     DEFAULT_POLICIES,
@@ -27,7 +28,10 @@ logger = logging.getLogger(__name__)
 _DEFAULT_DECISIONS = ("allow_once", "always_allow", "deny_once", "always_deny")
 _FILE_DECISIONS = ("allow_once", "deny_once", "always_allow")
 _ONCE_DECISIONS = ("allow_once", "deny_once")
-_FILE_TOOLS = {"read_file", "write_file", "edit_file", "list_dir", "find_files", "search_text"}
+_FILE_TOOLS = {
+    "read_file", "write_file", "edit_file", "list_dir", "find_files", "search_text",
+    "get_file_outline", "search_symbol", "read_symbol",
+}
 
 
 @dataclass
@@ -161,6 +165,17 @@ class PermissionManager:
             self._pending.pop(request_id, None)
             if not future.done():
                 future.cancel()
+            elif not future.cancelled():
+                future.exception()  # 事件发布失败时也回收已设置的停止异常。
+
+    # 停止会话当前任务树的审批等待；不取消已开始的工具或撤销会话授权。
+    def interrupt_waiting(self, session_id: str) -> None:
+        for request in list(self._pending.values()):
+            if (
+                request.payload["session_id"] == session_id
+                and not request.future.done()
+            ):
+                request.future.set_exception(RunStopRequested())
 
     # 只重现活跃请求，不持久化 Future 和单次授权。
     def pending_for_session(self, session_id: str) -> list[dict[str, Any]]:

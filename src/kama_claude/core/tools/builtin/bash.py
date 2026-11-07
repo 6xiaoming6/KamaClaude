@@ -29,7 +29,12 @@ class BashTool(BaseTool):
         "Non-interactive only — commands requiring user input will hang and time out. "
         "Each call starts in the fixed workspace; cd does not persist to the next call. "
         f"Current platform is {_SHELL}. "
-        "Prefer short, focused commands. Output is truncated at 64 KiB."
+        "Use dedicated file/search/edit tools when they support the operation; use this tool for "
+        "programs, tests and operations without a dedicated tool. Prefer short, finite commands. "
+        "Timeout is 1-120 seconds (default 60); output is truncated at 64 KiB. "
+        "Do not launch persistent servers with start /b or equivalent: inherited output pipes can "
+        "keep the call open. Windows cmd does not support POSIX heredocs; write complex scripts "
+        "to a file first. The cmd timeout command requires interactive input; do not use it here."
     )
     input_schema = BashParams.model_json_schema()
 
@@ -46,8 +51,12 @@ class BashTool(BaseTool):
         executor = CommandExecutor(self.workspace, self._execution)
         result = await executor.execute(p.command, p.timeout)
         if result.error:
+            content = result.error
+            if result.output:
+                content += f"\nCaptured output:\n{result.output}"
             return ToolResult(
-                content=result.error, is_error=True,
+                content=content,
+                is_error=True,
                 error_type="timeout" if result.error.startswith("timeout") else "runtime_error",
                 outcome_unknown=result.outcome_unknown,
             )

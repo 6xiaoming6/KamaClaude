@@ -4,6 +4,8 @@ import logging
 from typing import Any
 
 from rich.markdown import Markdown
+from rich.markup import escape
+from rich.text import Text
 from textual.app import ComposeResult
 from textual.widget import Widget
 from textual.widgets import Static
@@ -20,7 +22,7 @@ class LLMStreamBlock(Static):
 
     # 初始化为空文本块
     def __init__(self) -> None:
-        super().__init__("")
+        super().__init__("", markup=False)
         self._text = ""
         self._finalized = False
 
@@ -63,14 +65,14 @@ class ToolCallBlock(Widget):
 
     def compose(self) -> ComposeResult:
         yield Static(self._summary(), classes="summary")
-        yield Static("", classes="detail")
+        yield Static("", classes="detail", markup=False)
 
     # 生成摘要行文本
     def _summary(self) -> str:
         params_pre = _param_summary(self._tool_name, self._params)
-        line = f"  [dim]tool[/dim] [bold]{self._tool_name}[/bold]"
+        line = f"  [dim]tool[/dim] [bold]{escape(self._tool_name)}[/bold]"
         if params_pre:
-            line += f"  [dim]{params_pre}[/dim]"
+            line += f"  [dim]{escape(params_pre)}[/dim]"
         if self._finished:
             color = "red" if self._is_error else "green"
             status = "failed" if self._is_error else "done"
@@ -95,9 +97,10 @@ class ToolCallBlock(Widget):
             self.remove_class("expanded")
         else:
             detail = self.query_one(".detail", Static)
-            detail.update(
-                f"[dim]params[/dim]\n{self._params_full}\n\n"
-                f"[dim]output[/dim]\n{self._output}\n\n"
-                f"[dim]elapsed:[/dim] {self._elapsed_ms}ms"
-            )
+            # 工具数据是代码或任意原文，不能当作 Textual/Rich 标记解析。
+            detail.update(Text.assemble(
+                ("params\n", "dim"), self._params_full,
+                ("\n\noutput\n", "dim"), self._output,
+                (f"\n\nelapsed: {self._elapsed_ms}ms", "dim"),
+            ))
             self.add_class("expanded")

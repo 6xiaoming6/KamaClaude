@@ -61,6 +61,7 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
 | `server_version` | `string` | yes |
 | `uptime_ms` | `integer` | yes |
 | `received_at` | `string` | yes |
+| `pid` | `integer` | no |
 
 ```json
 {
@@ -76,6 +77,11 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
     "received_at": {
       "title": "Received At",
       "type": "string"
+    },
+    "pid": {
+      "default": 0,
+      "title": "Pid",
+      "type": "integer"
     }
   },
   "required": [
@@ -97,8 +103,66 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
   "result": {
     "server_version": "0.2.0",
     "uptime_ms": 12,
-    "received_at": "2026-05-16T10:00:00.001Z"
+    "received_at": "2026-05-16T10:00:00.001Z",
+    "pid": 1234
   }
+}
+```
+
+### CoreShutdownCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `expected_pid` | `integer` | yes |
+| `expected_created_at` | `number` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "core.shutdown",
+      "default": "core.shutdown",
+      "title": "Type",
+      "type": "string"
+    },
+    "expected_pid": {
+      "exclusiveMinimum": 0,
+      "title": "Expected Pid",
+      "type": "integer"
+    },
+    "expected_created_at": {
+      "exclusiveMinimum": 0,
+      "title": "Expected Created At",
+      "type": "number"
+    }
+  },
+  "required": [
+    "expected_pid",
+    "expected_created_at"
+  ],
+  "title": "CoreShutdownCommand",
+  "type": "object"
+}
+```
+
+### CoreShutdownResult
+
+| Field | Type | Required |
+|---|---|---|
+| `accepted` | `boolean` | no |
+
+```json
+{
+  "properties": {
+    "accepted": {
+      "default": true,
+      "title": "Accepted",
+      "type": "boolean"
+    }
+  },
+  "title": "CoreShutdownResult",
+  "type": "object"
 }
 ```
 
@@ -735,6 +799,96 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
   "type": "object"
 }
 ```
+### SessionInterruptCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+| `run_id` | `string | null` | no |
+| `wait` | `boolean` | no |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "session.interrupt",
+      "default": "session.interrupt",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "run_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Run Id"
+    },
+    "wait": {
+      "default": false,
+      "title": "Wait",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "session_id"
+  ],
+  "title": "SessionInterruptCommand",
+  "type": "object"
+}
+```
+### SessionInterruptResult
+
+| Field | Type | Required |
+|---|---|---|
+| `run_id` | `string | null` | no |
+| `status` | `string` | yes |
+| `revision` | `integer` | yes |
+
+```json
+{
+  "properties": {
+    "run_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Run Id"
+    },
+    "status": {
+      "title": "Status",
+      "type": "string"
+    },
+    "revision": {
+      "title": "Revision",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "status",
+    "revision"
+  ],
+  "title": "SessionInterruptResult",
+  "type": "object"
+}
+```
+
+session.interrupt requests a graceful stop: the current model/tool call finishes and its result is committed before stopping; pending tools do not start. Waiting approval is interrupted without executing the tool. The session and recovery position are retained. Optional run_id rejects stale requests (-32031). wait=false returns status=stopping immediately; run.interrupted confirms the saved stop. wait=true waits for cleanup. No forced tool cancellation is performed. session.close still requires an idle/stopped Run; closing an interrupted Run records matching results for unexecuted tools and ends that session.
+
 ### SessionListCommand
 
 | Field | Type | Required |
@@ -1151,7 +1305,7 @@ Permission mode is per session and in memory only: ask (existing approvals), app
 
 ## Request Admission and Connection Sending
 
-Requests are validated and admitted before a handler Task is created. Ordinary limits are 8 per connection and 64 globally; core.ping, permission.respond and session.set_permission_mode have separate limits of 2 per connection and 8 globally. Full capacity returns -32034 Server busy without creating waiting Tasks. Quotas include response sending. Shutdown rejects new ordinary work with -32035 Server shutting down while existing connections can still process control requests during Run cleanup.
+Requests are validated and admitted before a handler Task is created. Ordinary limits are 8 per connection and 64 globally; core.ping, core.shutdown, permission.respond, session.interrupt and session.set_permission_mode have separate limits of 2 per connection and 8 globally. Full capacity returns -32034 Server busy without creating waiting Tasks. Quotas include response sending. Shutdown rejects new ordinary work with -32035 Server shutting down while existing connections can still process control requests during Run cleanup.
 
 Responses, live events and replay share one FIFO ConnectionSender per connection. Live publication only enqueues; RPC and replay wait for their frame to be written. The queue allows 128 frames and 64 MiB + 1 byte including in-flight frames. Queue overflow, a 5-second drain timeout or write failure closes that connection and fails send waiters. Other connections and Core-owned Runs continue. Trace stage=queued is not delivery confirmation; stage=written follows drain. Changing subscriptions does not close the Sender. Pending requests, Sender drain and connection close each use 2-second shutdown waits.
 

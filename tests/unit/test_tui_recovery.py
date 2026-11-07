@@ -58,6 +58,13 @@ class Client:
             self.state["running"] = not aborted
             self.state["run"]["status"] = "failed" if aborted else "running"
             return {"run_id": "run-test", "status": self.state["run"]["status"], "revision": 8}
+        if method == "session.interrupt":
+            self.state["session"]["status"] = "interrupted"
+            self.state["running"] = False
+            return {"run_id": "run-test", "status": "interrupted", "revision": 7}
+        if method == "session.close":
+            self.state["session"]["status"] = "closed"
+            return {"status": "closed"}
         raise AssertionError(method)
 
 
@@ -186,17 +193,87 @@ async def test_snapshot_tool_result_is_not_replayed(monkeypatch: pytest.MonkeyPa
         assert blocks[0]._output == "saved"
 
 
-# 功能：验证退出界面不主动关闭会话
-# 设计：替换 exit 以观察调用，假后端拒绝任何未预期的关闭 RPC
-async def test_quit_does_not_close_session(monkeypatch: pytest.MonkeyPatch) -> None:
+# Ctrl+Q 等待有序停止，确认关闭成功后才退出 TUI。
+async def test_quit_closes_session_before_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(KamaTuiApp, "_socket_loop", idle_socket)
     app = KamaTuiApp("127.0.0.1", 1)
     client = Client()
-    app._client = client
-    app._session_id = "sess-test"
     exits: list[bool] = []
     monkeypatch.setattr(app, "exit", lambda: exits.append(True))
-    await app.action_quit()
-    assert exits == [True] and client.calls == []
+    async with app.run_test(size=(110, 36)) as pilot:
+        app._client = client
+        await app._open_session("sess-test")
+        await pilot.press("ctrl+q")
+        await pilot.pause()
+        assert exits == [True]
+        assert client.calls[-2:] == [
+            ("session.interrupt", {"session_id": "sess-test", "run_id": "run-test", "wait": True}),
+            ("session.close", {"session_id": "sess-test"}),
+        ]
+
+
+async def test_ctrl_c_stops_run_but_keeps_session_and_recovery(monkeypatch):
+    monkeypatch.setattr(KamaTuiApp, "_socket_loop", idle_socket)
+    app, client = KamaTuiApp("127.0.0.1", 1), Client()
+    async with app.run_test(size=(110, 36)) as pilot:
+        app._client = client
+        await app._open_session("sess-test")
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        assert app._session_id == "sess-test" and app.query_one(RecoveryActions)
+        assert ("session.interrupt", {"session_id": "sess-test", "run_id": "run-test"}) in client.calls
+        assert not any(method == "session.close" for method, _ in client.calls)
+
+
+async def test_quit_waits_for_backend_and_does_not_exit_on_failure(monkeypatch):
+    monkeypatch.setattr(KamaTuiApp, "_socket_loop", idle_socket)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class WaitingClient(Client):
+        async def send_command(self, method, params):
+            if method == "session.interrupt":
+                entered.set()
+                await release.wait()
+            if method == "session.close":
+                raise RuntimeError("checkpoint save failed")
+            return await super().send_command(method, params)
+
+    app, client = KamaTuiApp("127.0.0.1", 1), WaitingClient()
+    exits = []
+    monkeypatch.setattr(app, "exit", lambda: exits.append(True))
+    async with app.run_test(size=(110, 36)) as pilot:
+        app._client = client
+        await app._open_session("sess-test")
+        await pilot.press("ctrl+q")
+        await asyncio.wait_for(entered.wait(), 2)
+        assert not exits and app._header_state == "stopping"
+        release.set()
+        await pilot.pause()
+        assert not exits and app._session_id == "sess-test"
+        assert app._session_action is None
+
+
+async def test_ctrl_w_leaves_running_session_and_ignores_old_events(monkeypatch):
+    monkeypatch.setattr(KamaTuiApp, "_socket_loop", idle_socket)
+    app, client = KamaTuiApp("127.0.0.1", 1), Client()
+    client.state["running"] = True
+    client.state["session"]["status"] = "active"
+    client.state["run"]["status"] = "running"
+    async with app.run_test(size=(110, 36)) as pilot:
+        app._client = client
+        await app._open_session("sess-test")
+        await pilot.press("ctrl+w")
+        await pilot.pause()
+        assert isinstance(app.screen, SessionPicker) and app._session_id is None
+        assert not any(method in {"session.close", "session.interrupt"} for method, _ in client.calls)
+        app._handle_event({"type": "permission.requested", "session_id": "sess-test", "request_id": "old"})
+        assert not app._pending_permission_blocks
+        await pilot.press("escape")
+        assert app.query_one(ChatTextArea).disabled
+        await pilot.press("ctrl+o")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app._session_id == "sess-test" and app._busy
 
 
 # 功能：验证打开快照期间的旧事件被丢弃，新事件仅渲染一次

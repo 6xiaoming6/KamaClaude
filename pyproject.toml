@@ -20,10 +20,14 @@ dependencies = [
     "psutil>=6.0,<8",
     "pathspec>=1.1,<2",    # 目录遍历的 .gitignore 规则
     "regex>=2024.11",     # 内容正则搜索使用有界超时
+    "Pillow>=11,<14",     # 图片验证、尺寸限制与缩放
     "mcp>=2.3,<3",        # 官方 MCP 会话与 stdio / Streamable HTTP 传输
     "httpx2>=2.13,<3",    # 官方 MCP SDK 的 HTTP 客户端，请求头与超时由本项目配置
-    "tree-sitter>=0.25,<0.27",       # Bash AST 解析运行时
+    "tree-sitter>=0.25.2,<0.26",     # 避开 0.26.0 Point 属性的原生内存错误
     "tree-sitter-bash>=0.25,<0.26",  # Bash 语法，不用于解释 Windows cmd
+    "tree-sitter-python>=0.25,<0.26", # 代码定义定位，不做语义引用分析
+    "tree-sitter-javascript>=0.25,<0.26",
+    "tree-sitter-typescript>=0.23,<0.24",
     "rank-bm25>=0.2.2,<0.3",       # MCP 工具关键词召回
 ]
 

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import sys
 import time
 from typing import Any
 
+from kama_claude.cli.console import readline as _readline
+from kama_claude.cli.permissions import PermissionPrompts
 from kama_claude.core.config import KamaConfig
+from kama_claude.core.permissions.policy import param_preview
 from kama_claude.core.transport.socket_client import IpcError, SocketClient
 
 
@@ -48,7 +50,7 @@ class StdoutPrinter:
             if event.get("tool_name") == "finish":
                 return
             self._ensure_newline()
-            params_str = json.dumps(event.get("params", {}), ensure_ascii=False)
+            params_str = param_preview(str(event.get("tool_name", "")), event.get("params", {}))
             print(f"[tool] {event.get('tool_name', '')} {params_str}")
 
         elif t == "tool.call_finished":
@@ -91,83 +93,89 @@ class StdoutPrinter:
             print(f"[run] {status}  {event.get('steps')} steps  {elapsed:.1f}s")
 
 
-# 异步核心：连接 daemon，订阅事件，触发 run，等待 run.finished
+# 一次性 Run 也使用会话订阅，子任务审批与其他会话严格隔离。
 async def _run_async(goal: str, config: KamaConfig) -> int:
-    # 和core建立 TCP 连接
     client = SocketClient(config.host, config.port)
-    try:
-        await client.connect()
-    except (ConnectionRefusedError, OSError):
-        print(f"error: core not running ({config.host}:{config.port})", file=sys.stderr)
-        return 1
-
-    printer = StdoutPrinter()
-    finished = asyncio.Event()
-    exit_code = 0
+    printer, permissions = StdoutPrinter(), PermissionPrompts()
+    finished, approval_received = asyncio.Event(), asyncio.Event()
     expected_run: str | None = None
-    buffered: list[dict[str, Any]] = []
+    session_id = ""
+    exit_code = 0
+    tasks: list[asyncio.Task[Any]] = []
 
-    # 事件回调函数，core的事件发布后都会经过这个函数
     async def on_event(event: dict[str, Any]) -> None:
-        nonlocal exit_code
-        if expected_run is None:
-            buffered.append(event)
+        nonlocal expected_run, exit_code
+        if event.get("session_id", session_id) != session_id:
             return
-        if event.get("run_id") != expected_run:
+        kind = event.get("type")
+        if kind == "run.started" and not event.get("parent_run_id") and expected_run is None:
+            expected_run = str(event["run_id"])
+        if kind in {"permission.requested", "permission.granted", "permission.denied"}:
+            printer._ensure_newline()
+            permissions.handle(event)
+            approval_received.set()
+        if expected_run is None or event.get("run_id") != expected_run:
             return
-        # 先打印这个事件
         await printer.handle(event)
-        # 如果事件是任务完成事件的话，就把finished等待设为完成，就会结束_run_async
-        if event.get("type") in ("run.finished", "run.interrupted"):
-            if event.get("type") == "run.interrupted" or event.get("status") != "success":
+        if kind in {"run.finished", "run.interrupted"}:
+            if kind == "run.interrupted" or event.get("status") != "success":
                 exit_code = 1
             finished.set()
-    # 注册事件回调函数，client收到事件后，交给这个函数处理
-    client.on_event(on_event)
-    # 创建任务持续读取core发来的数据
-    # 一定要先创建循环监听服务器消息再send_command，不然前面的请求可能会接收不到响应
 
-    loop_task = asyncio.create_task(client.run_event_loop())
+    async def answer_permissions() -> None:
+        nonlocal exit_code
+        input_closed = False
+        while True:
+            await approval_received.wait()
+            approval_received.clear()
+            while permissions.pending:
+                request_id = next(iter(permissions.pending))
+                try:
+                    content = "n" if input_closed else await _readline("[approval] > ")
+                except EOFError:
+                    print("error: no approval input; denying pending operations", file=sys.stderr)
+                    input_closed, exit_code, content = True, 1, "n"
+                await permissions.answer(client, request_id, content)
 
     try:
-        # 先向core发送消息注册订阅，并等待响应
-        await client.send_command(
-            "event.subscribe",
-            {
-                "topics": ["run.*", "step.*", "tool.*", "llm.token", "llm.usage"],
-                "scope": "global",
-            },
-        )
-        # 再启动运行，AgentRunner在后端启动，前端cli只负责发送命令和查看进度
-        result = await client.send_command("agent.run", {"goal": goal})
-        expected_run = str(result["run_id"])
-        for event in buffered:
-            await on_event(event)
-        buffered.clear()
-    except (IpcError, OSError) as e:
-        print(f"error: {e}", file=sys.stderr)
-        loop_task.cancel()
-        await asyncio.gather(loop_task, return_exceptions=True)
-        await client.close()
+        await client.connect()
+        client.on_event(on_event)
+        loop_task = asyncio.create_task(client.run_event_loop())
+        tasks.append(loop_task)
+        created = await client.send_command("session.create", {"mode": "one_shot"})
+        session_id = str(created["session_id"])
+        print(f"[session: {session_id}]")
+        await client.send_command("event.subscribe", {
+            "topics": ["run.*", "step.*", "tool.*", "llm.token", "llm.usage", "permission.*"],
+            "scope": f"session:{session_id}",
+        })
+        send_task = asyncio.create_task(client.send_command("session.send_message", {
+            "session_id": session_id, "content": goal,
+        }))
+        approval_task = asyncio.create_task(answer_permissions())
+        waiter = asyncio.create_task(finished.wait())
+        tasks.extend([send_task, approval_task, waiter])
+        watching = {send_task, approval_task, loop_task, waiter}
+        while not finished.is_set():
+            done, _ = await asyncio.wait(watching, return_when=asyncio.FIRST_COMPLETED)
+            if finished.is_set():
+                break
+            if loop_task in done:
+                raise ConnectionError("Core disconnected; reopen the session in TUI to inspect it")
+            if approval_task in done:
+                approval_task.result()
+            if send_task in done:
+                send_task.result()  # 初始化或执行请求失败不能被忽略。
+                watching.discard(send_task)
+        return exit_code
+    except (IpcError, RuntimeError, OSError, TimeoutError) as exc:
+        print(f"error: {exc}" + (f"; session={session_id}" if session_id else ""), file=sys.stderr)
         return 1
-
-    # 等待业务终态或连接结束，断线时不再永久挂在 finished.wait
-    waiter = asyncio.create_task(finished.wait())
-    try:
-        await asyncio.wait({waiter, loop_task}, return_when=asyncio.FIRST_COMPLETED)
-        if not finished.is_set():
-            print(
-                "error: Core disconnected; reopen the session in TUI to inspect it",
-                file=sys.stderr,
-            )
-            exit_code = 1
     finally:
-        waiter.cancel()
-        if not loop_task.done():
-            loop_task.cancel()
-        await asyncio.gather(waiter, loop_task, return_exceptions=True)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await client.close()
-    return exit_code
 
 
 # 执行 kama run --goal "..." 命令

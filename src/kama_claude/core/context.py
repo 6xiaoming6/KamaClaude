@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
 from kama_claude.core.checkpoint.checkpoint import RunCheckpoint
 from kama_claude.core.memory.context import compose_system
 from kama_claude.core.memory.model import MemorySnapshot
+
+
+class RunStopRequested(Exception):
+    """只在安全边界退出，不用于取消正在执行的工具。"""
 
 
 @dataclass
@@ -15,6 +20,11 @@ class ExecutionContext:
     messages: list[dict[str, Any]] = field(default_factory=list)
     # 子 Agent 角色可覆盖默认提示；Skill 正文独立放在工作历史中。
     system_prompt_override: str | None = None
+    stop_event: asyncio.Event | None = None  # 本次 Core 中的停止请求，不是另一份执行状态。
+
+    def check_stop(self) -> None:
+        if self.stop_event is not None and self.stop_event.is_set() and not self.is_done():
+            raise RunStopRequested()
 
     # 复制输入历史，新会话则以当前 Run 目标建立第一条消息
     def __post_init__(self) -> None:

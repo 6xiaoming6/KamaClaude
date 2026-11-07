@@ -21,6 +21,10 @@ def build_process_env(
         if name.upper() in _BASE_NAMES
         or (name.upper() if os.name == "nt" else name) in requested
     }
+    # Python 子进程默认统一 UTF-8，避免 Windows 管道输出使用本地代码页。
+    for name, value in {"PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}.items():
+        if not any(key.upper() == name for key in child):
+            child[name] = value
     # 显式传值优先；Windows 环境变量不区分大小写。
     for name, value in (env or {}).items():
         if os.name == "nt":

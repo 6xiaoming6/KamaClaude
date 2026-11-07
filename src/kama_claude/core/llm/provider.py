@@ -10,6 +10,7 @@ import anthropic
 
 from kama_claude.core.bus.events import LlmModelSelectedEvent, LlmTokenEvent, LlmUsageEvent
 from kama_claude.core.events.bus import EventBus
+from kama_claude.core.llm.images import openai_image, supports_images, validate_images
 from kama_claude.core.llm.tool_loading import project_references
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock, UsageStats
 
@@ -81,6 +82,9 @@ class AnthropicProvider:
         system: str | None = None,
         max_output_tokens: int = 8_192,
     ) -> LlmResponse:
+        validate_images(messages, supported=supports_images(
+            "deepseek" if isinstance(self, DeepseekProvider) else "anthropic", self._model,
+        ))
         await bus.publish(
             LlmModelSelectedEvent(run_id=run_id, model=self._model, strategy="static", ts=_now())
         )
@@ -194,8 +198,15 @@ class OpenaiProvider:
         converted: list[dict[str, object]] = [
             {"role": "system", "content": system or _SYSTEM_PROMPT}
         ]
+        pending_images: list[dict[str, object]] = []
         for message in messages:
             role, content = message["role"], message["content"]
+            results_only = (role == "user" and isinstance(content, list)
+                            and all(b.get("type") == "tool_result" for b in content))
+            # 先交齐同批工具结果，再发送图片 user 消息，避免打断 tool_call_id 配对。
+            if pending_images and not results_only:
+                converted.append({"role": "user", "content": list(pending_images)})
+                pending_images.clear()
             if isinstance(content, str):
                 converted.append({"role": role, "content": content})
                 continue
@@ -204,6 +215,7 @@ class OpenaiProvider:
 
             texts: list[str] = []
             calls: list[dict[str, object]] = []
+            user_images: list[dict[str, object]] = []
             for block in content:
                 if block["type"] == "text":
                     texts.append(block["text"])
@@ -218,21 +230,33 @@ class OpenaiProvider:
                             },
                         }
                     )
+                elif block["type"] == "image" and role == "user":
+                    user_images.append(openai_image(block))
                 elif block["type"] == "tool_result" and role == "user":
                     if texts:
                         converted.append({"role": role, "content": "".join(texts)})
                         texts.clear()
+                    result_content = block["content"]
+                    if isinstance(result_content, list):
+                        for item in result_content:
+                            if item.get("type") == "image":
+                                pending_images.extend([
+                                    {"type": "text", "text": (
+                                        f"Image from tool {block['tool_use_id']}"
+                                    )},
+                                    openai_image(item),
+                                ])
+                        result_content = "\n".join(
+                            str(item.get("text", "")) if item.get("type") == "text"
+                            else f"Discovered tool: {item.get('tool_name', '')}"
+                            for item in result_content if item.get("type") != "image"
+                        )
                     converted.append(
                         {
                             "role": "tool",
                             "tool_call_id": block["tool_use_id"],
                             # Chat Completions 不接受 Anthropic 引用块；跨 Run 历史投影成文字。
-                            "content": block["content"] if isinstance(block["content"], str)
-                            else "\n".join(
-                                str(item.get("text", "")) if item.get("type") == "text"
-                                else f"Discovered tool: {item.get('tool_name', '')}"
-                                for item in block["content"]
-                            ),
+                            "content": result_content,
                         }
                     )
                 else:
@@ -243,8 +267,12 @@ class OpenaiProvider:
                 if calls:
                     assistant["tool_calls"] = calls
                 converted.append(assistant)
-            elif texts:
-                converted.append({"role": role, "content": "".join(texts)})
+            elif texts or user_images:
+                content_out: object = ([{"type": "text", "text": "".join(texts)}, *user_images]
+                                       if user_images else "".join(texts))
+                converted.append({"role": role, "content": content_out})
+        if pending_images:
+            converted.append({"role": "user", "content": pending_images})
         return converted
 
     # 流式调用 OpenAI，转换工具协议并发布与 Anthropic 相同的模型、文本和用量事件
@@ -259,6 +287,7 @@ class OpenaiProvider:
         system: str | None = None,
         max_output_tokens: int = 8_192,
     ) -> LlmResponse:
+        validate_images(messages)
         await bus.publish(
             LlmModelSelectedEvent(run_id=run_id, model=self._model, strategy="static", ts=_now())
         )

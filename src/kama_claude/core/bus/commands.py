@@ -17,6 +17,17 @@ class PongResult(BaseModel):
     server_version: str
     uptime_ms: int
     received_at: str  # ISO 8601
+    pid: int = 0  # 旧客户端可忽略；后台启动核对真正监听的进程。
+
+
+class CoreShutdownCommand(BaseModel):
+    type: Literal["core.shutdown"] = "core.shutdown"
+    expected_pid: int = Field(gt=0)
+    expected_created_at: float = Field(gt=0)
+
+
+class CoreShutdownResult(BaseModel):
+    accepted: bool = True
 
 
 class AgentRunCommand(BaseModel):
@@ -78,6 +89,19 @@ class SessionGetHistoryResult(BaseModel):
 class SessionCloseCommand(BaseModel):
     type: Literal["session.close"] = "session.close"
     session_id: str
+
+
+class SessionInterruptCommand(BaseModel):
+    type: Literal["session.interrupt"] = "session.interrupt"
+    session_id: str
+    run_id: str | None = None  # 提供时只取消该 Run，防止迟到操作影响后续任务。
+    wait: bool = False  # 等待当前工具和检查点收尾；不会强制取消工具。
+
+
+class SessionInterruptResult(BaseModel):
+    run_id: str | None = None
+    status: str
+    revision: int
 
 
 class SessionCloseResult(BaseModel):
@@ -173,12 +197,14 @@ class SessionResumeResult(BaseModel):
 # 根据 type 字段决定命令类型的判别联合
 Command = Annotated[
     PingCommand
+    | CoreShutdownCommand
     | AgentRunCommand
     | EventSubscribeCommand
     | SessionCreateCommand
     | SessionSendMessageCommand
     | SessionGetHistoryCommand
     | SessionCloseCommand
+    | SessionInterruptCommand
     | PermissionRespondCommand
     | SessionCompactCommand
     | SessionListCommand

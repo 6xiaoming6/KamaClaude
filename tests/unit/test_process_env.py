@@ -29,6 +29,15 @@ def test_minimum_environment_and_explicit_forwarding(monkeypatch: pytest.MonkeyP
     assert "OPENAI_API_KEY" not in child
 
 
+def test_python_utf8_defaults_and_explicit_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PYTHONIOENCODING", raising=False)
+    monkeypatch.delenv("PYTHONUTF8", raising=False)
+    child = build_process_env()
+    assert child["PYTHONIOENCODING"] == "utf-8" and child["PYTHONUTF8"] == "1"
+    child = build_process_env(env={"PYTHONIOENCODING": "gbk", "PYTHONUTF8": "0"})
+    assert child["PYTHONIOENCODING"] == "gbk" and child["PYTHONUTF8"] == "0"
+
+
 async def test_real_command_environment_is_filtered(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "s10-fake-key")
     monkeypatch.setenv("S10_BUILD_FLAG", "configured")

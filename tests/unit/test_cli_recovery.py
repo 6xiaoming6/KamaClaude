@@ -15,12 +15,15 @@ async def test_cli_interrupted_run_is_not_confused_with_other_run(capsys: Any) -
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         while line := await reader.readline():
             request = json.loads(line)
-            if request["method"] == "event.subscribe":
+            if request["method"] == "session.create":
+                result = {"session_id": "session-target"}
+            elif request["method"] == "event.subscribe":
                 result = {}
             else:
                 result = {"run_id": "target"}
                 for event in [
-                    {"type": "run.finished", "run_id": "other", "status": "success"},
+                    {"type": "run.finished", "run_id": "other", "status": "success",
+                     "session_id": "another-session"},
                     {"type": "run.started", "run_id": "target"},
                     {"type": "run.interrupted", "run_id": "target", "reason": "core_restarted"},
                 ]:
@@ -56,7 +59,7 @@ async def test_cli_interrupted_run_is_not_confused_with_other_run(capsys: Any) -
 async def test_cli_disconnect_does_not_wait_forever(capsys: Any) -> None:
     # 完成订阅和接受任务后主动断开
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        for _ in range(2):
+        for _ in range(3):
             request = json.loads(await reader.readline())
             writer.write(
                 (
@@ -64,7 +67,7 @@ async def test_cli_disconnect_does_not_wait_forever(capsys: Any) -> None:
                         {
                             "jsonrpc": "2.0",
                             "id": request["id"],
-                            "result": {"run_id": "target"},
+                            "result": {"run_id": "target", "session_id": "session-target"},
                         }
                     )
                     + "\n"

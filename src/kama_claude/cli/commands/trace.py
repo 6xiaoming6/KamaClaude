@@ -34,7 +34,7 @@ def cmd_trace(
         print(f"trace file not found: {trace_path}", file=sys.stderr)
         sys.exit(1)
 
-    with open(trace_path) as f:
+    with open(trace_path, encoding="utf-8") as f:
         for line in f:
             _process_line(
                 line.strip(),
@@ -44,9 +44,8 @@ def cmd_trace(
                 raw=raw,
             )
 
-    if follow:
-        with open(trace_path) as f:
-            f.seek(0, 2)
+        if follow:
+            # 沿用读取历史的文件位置，不重新打开并跳到末尾，避免遗漏间隙里的新记录。
             while True:
                 line = f.readline()
                 if line:

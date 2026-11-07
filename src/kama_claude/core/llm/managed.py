@@ -12,6 +12,7 @@ from kama_claude.core.compact.estimator import TokenEstimator
 from kama_claude.core.config import CompactionConfig
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.base import LLMProvider
+from kama_claude.core.llm.images import supports_images, validate_images
 from kama_claude.core.llm.types import LlmResponse
 from kama_claude.core.run_budget import RunBudget, publish_budget
 
@@ -80,6 +81,10 @@ class ManagedProvider:
         max_output_tokens: int | None = None,
     ) -> LlmResponse:
         kind = "summary" if run_id == "compact" else "normal"
+        # 本地已知的图片能力/体积错误发生在预留之前，不能当成已花费的 API 请求。
+        validate_images(messages, supported=supports_images(
+            self.estimator.provider, self.estimator.model,
+        ))
         if max_output_tokens is None:
             max_output_tokens = self._config.output_reserve_tokens
         counter = self.estimator.select(system or "", messages, tool_schemas, kind=kind)

@@ -10,6 +10,8 @@ from pathlib import Path
 from kama_claude.core.bus.commands import (
     AgentRunCommand,
     AgentRunResult,
+    CoreShutdownCommand,
+    CoreShutdownResult,
     EventSubscribeCommand,
     EventSubscribeResult,
     PermissionRespondCommand,
@@ -24,6 +26,8 @@ from kama_claude.core.bus.commands import (
     SessionCreateResult,
     SessionGetHistoryCommand,
     SessionGetHistoryResult,
+    SessionInterruptCommand,
+    SessionInterruptResult,
     SessionListCommand,
     SessionListResult,
     SessionOpenCommand,
@@ -113,6 +117,7 @@ def generate() -> str:
             "server_version": "0.2.0",
             "uptime_ms": 12,
             "received_at": ts,
+            "pid": 1234,
         },
     }
     agent_run_req_example = {
@@ -187,6 +192,10 @@ def generate() -> str:
         "\n",
         _model_section("PongResult", PongResult, pong_resp_example),
         "\n",
+        _model_section("CoreShutdownCommand", CoreShutdownCommand),
+        "\n",
+        _model_section("CoreShutdownResult", CoreShutdownResult),
+        "\n",
         _model_section("AgentRunCommand", AgentRunCommand, agent_run_req_example),
         "\n",
         _model_section("AgentRunResult", AgentRunResult, agent_run_resp_example),
@@ -212,6 +221,16 @@ def generate() -> str:
         _model_section("SessionCloseCommand", SessionCloseCommand),
         "\n",
         _model_section("SessionCloseResult", SessionCloseResult),
+        _model_section("SessionInterruptCommand", SessionInterruptCommand),
+        _model_section("SessionInterruptResult", SessionInterruptResult),
+        "\nsession.interrupt requests a graceful stop: the current model/tool call finishes "
+        "and its result is committed before stopping; pending tools do not start. Waiting "
+        "approval is interrupted without executing the tool. The session and recovery "
+        "position are retained. Optional run_id rejects stale requests (-32031). "
+        "wait=false returns status=stopping immediately; run.interrupted confirms the saved "
+        "stop. wait=true waits for cleanup. No forced tool cancellation is performed. "
+        "session.close still requires an idle/stopped Run; closing an interrupted Run "
+        "records matching results for unexecuted tools and ends that session.\n\n",
         _model_section("SessionListCommand", SessionListCommand),
         _model_section("SessionListResult", SessionListResult),
         _model_section("SessionOpenCommand", SessionOpenCommand),
@@ -236,8 +255,8 @@ def generate() -> str:
         _model_section("PermissionRespondResult", PermissionRespondResult),
         "\n## Request Admission and Connection Sending\n\n",
         "Requests are validated and admitted before a handler Task is created. Ordinary "
-        "limits are 8 per connection and 64 globally; core.ping, permission.respond "
-        "and session.set_permission_mode "
+        "limits are 8 per connection and 64 globally; core.ping, core.shutdown, permission.respond, "
+        "session.interrupt and session.set_permission_mode "
         "have separate limits of 2 per connection and 8 globally. Full capacity returns "
         "-32034 Server busy without creating waiting Tasks. Quotas include response sending. "
         "Shutdown rejects new ordinary work with -32035 Server shutting down while "
