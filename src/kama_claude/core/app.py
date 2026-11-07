@@ -13,7 +13,7 @@ from datetime import UTC
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 import kama_claude
 from kama_claude.core.bus.commands import (
@@ -40,12 +40,14 @@ from kama_claude.core.bus.commands import (
     SessionResumeResult,
     SessionSendMessageCommand,
     SessionSendMessageResult,
+    SessionSetPermissionModeCommand,
+    SessionSetPermissionModeResult,
 )
 from kama_claude.core.bus.envelope import EventPushEnvelope, HandlerError
 from kama_claude.core.config import KamaConfig, get_config
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.provider import DeepseekProvider
-from kama_claude.core.logging_setup import setup_logging
+from kama_claude.core.logging_setup import config_summary, setup_logging
 from kama_claude.core.mcp.server import McpServerManager
 from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.permissions.storage import load_policy_file
@@ -211,6 +213,18 @@ class CoreApp:
         await self._sessions.close(cmd.session_id)
         return SessionCloseResult(status="closed")
 
+    # 用户切换会话审批模式；模型工具参数不能修改这一设置。
+    async def _session_permission_mode_handler(
+        self, params: dict[str, Any],
+    ) -> SessionSetPermissionModeResult:
+        assert self._sessions is not None
+        try:
+            cmd = SessionSetPermissionModeCommand.model_validate(params)
+        except ValidationError as exc:
+            raise HandlerError(-32602, "Invalid permission mode parameters", str(exc)) from exc
+        mode = await self._sessions.set_permission_mode(cmd.session_id, cmd.mode)
+        return SessionSetPermissionModeResult(permission_mode=mode)
+
     # 注册客户端事件订阅，可选先回放 events.jsonl 历史再接收实时流
     async def _subscribe_handler(self, params: dict[str, Any]) -> EventSubscribeResult:
         cmd = EventSubscribeCommand.model_validate(params)
@@ -333,10 +347,13 @@ class CoreApp:
         server.register("session.close", self._session_close_handler)
         server.register("permission.respond", self._permission_respond_handler, control=True)
         server.register("session.compact", self._session_compact_handler)
+        server.register(
+            "session.set_permission_mode", self._session_permission_mode_handler, control=True,
+        )
 
         addr = await server.start()
         logger.info("kama-core %s listening addr=%s", kama_claude.__version__, addr)
-        logger.info("config: %s", self._config)
+        logger.info("config summary: %s", config_summary(self._config))
 
         loop = asyncio.get_running_loop()
         shutdown = asyncio.Event()

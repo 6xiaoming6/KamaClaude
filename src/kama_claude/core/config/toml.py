@@ -45,6 +45,8 @@ def apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
 def _apply_tool_search(config: KamaConfig, value: Any) -> None:
     if not isinstance(value, dict):
         raise SystemExit("Config error: [tool_search] must be a table")
+    if "max_loaded_schema_tokens" in value:
+        raise SystemExit("Config migration: use tool_search.max_loaded_schema_ratio")
     unknown = set(value) - set(ToolSearchConfig.__dataclass_fields__)
     if unknown:
         raise SystemExit(f"Unknown [tool_search] keys: {', '.join(sorted(unknown))}")
@@ -113,8 +115,10 @@ def _apply_agent(config: KamaConfig, value: Any) -> None:
         raise SystemExit(f"Unknown [agent] keys: {', '.join(sorted(unknown_agent))}")
     if "max_steps" in agent:
         val = agent["max_steps"]
-        if not isinstance(val, int) or val <= 0:
-            raise SystemExit("Config error: agent.max_steps must be a positive integer")
+        if type(val) is not int or val < 0:
+            raise SystemExit(
+                "Config error: agent.max_steps must be a nonnegative integer (0=unlimited)"
+            )
         config.agent.max_steps = val
 
     for key in ("max_run_seconds", "max_total_tokens", "repeat_failure_limit", "no_progress_limit"):
@@ -200,21 +204,37 @@ def _apply_compaction(config: KamaConfig, value: Any) -> None:
         raise SystemExit("Config error: [compaction] must be a table")
     positive_keys = {
         "tool_result_limit", "tool_result_keep", "context_window_tokens",
-        "output_reserve_tokens", "keep_recent_turns", "recent_token_budget", "summary_max_tokens",
+        "keep_recent_turns",
     }
+    ratio_keys = {
+        "output_reserve_ratio", "safety_margin_ratio", "recent_history_ratio",
+        "summary_max_ratio", "summary_target_ratio",
+    }
+    if {"output_reserve_tokens", "recent_token_budget", "summary_max_tokens"} & set(comp):
+        raise SystemExit(
+            "Config migration: replace output_reserve_tokens, recent_token_budget and "
+            "summary_max_tokens with output_reserve_ratio, recent_history_ratio and "
+            "summary_max_ratio; all are fractions of context_window_tokens"
+        )
     if {"prune_target_ratio", "keep_recent_groups"} & set(comp):
         raise SystemExit(
             "Config migration: remove prune_target_ratio; replace keep_recent_groups with "
-            "keep_recent_turns and recent_token_budget"
+            "keep_recent_turns and recent_history_ratio"
         )
-    unknown_comp = set(comp) - {"auto_threshold", *positive_keys}
+    unknown_comp = set(comp) - {"auto_threshold", *positive_keys, *ratio_keys}
     if unknown_comp:
         raise SystemExit(f"Unknown [compaction] keys: {', '.join(sorted(unknown_comp))}")
     if "auto_threshold" in comp:
         val = comp["auto_threshold"]
-        if not isinstance(val, (int, float)) or not (0.0 <= val <= 1.0):
+        if type(val) not in (int, float) or not (0.0 <= val < 1.0):
             raise SystemExit("Config error: compaction.auto_threshold must be between 0 and 1")
         config.compaction.auto_threshold = float(val)
+    for key in ratio_keys:
+        if key in comp:
+            val = comp[key]
+            if type(val) not in (int, float) or not 0 < val < 1:
+                raise SystemExit(f"Config error: compaction.{key} must be between 0 and 1")
+            setattr(config.compaction, key, float(val))
     for key in positive_keys:
         if key in comp:
             val = comp[key]
@@ -225,15 +245,17 @@ def _apply_compaction(config: KamaConfig, value: Any) -> None:
 
 def _apply_memory(config: KamaConfig, value: Any) -> None:
     memory = value
-    keys = {"global_auto_tokens", "project_index_tokens"}
+    keys = {"global_auto_ratio", "project_index_ratio"}
     if not isinstance(memory, dict):
         raise SystemExit("Config error: [memory] must be a table")
+    if {"global_auto_tokens", "project_index_tokens"} & set(memory):
+        raise SystemExit("Config migration: use memory.global_auto_ratio and project_index_ratio")
     if set(memory) - keys:
         raise SystemExit("Config error: unknown [memory] keys")
     for key, val in memory.items():
-        if type(val) is not int or val <= 0:
-            raise SystemExit(f"Config error: memory.{key} must be a positive integer")
-        setattr(config.memory, key, val)
+        if type(val) not in (int, float) or not 0 < val < 1:
+            raise SystemExit(f"Config error: memory.{key} must be a ratio between 0 and 1")
+        setattr(config.memory, key, float(val))
 
 
 def _apply_mcp(config: KamaConfig, value: Any) -> None:

@@ -38,6 +38,7 @@ def create_agent_loop(
     memory = MemoryStore(
         Path(context.run.workspace), memory_config,
         project=Path(context.run.memory_project_root) if context.run.memory_project_root else None,
+        context_budget=compaction,
     )
     if not context.run.system_prompt:
         initialize_prompt(context.run, memory, context.system_prompt_override or DEFAULT_SYSTEM)

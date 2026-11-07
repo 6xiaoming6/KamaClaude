@@ -372,6 +372,7 @@ async def test_compacted_snapshot_survives_restart(
     # 调小软阈值，让实际长历史触发压缩，而不是伪造上一次 API 的占比
     def factory() -> AgentRunner:
         runner = original_factory()
+        runner._config.compaction.context_window_tokens = 65_536
         runner._config.compaction.auto_threshold = 0.1
         return runner
 

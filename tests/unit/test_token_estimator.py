@@ -85,7 +85,7 @@ async def test_usage_does_not_shrink_compaction_threshold():
     messages = [{"role": "user", "content": "x" * 400}]
     estimator.observe("", messages, [], 4_000)
     counter = estimator.select("", messages, [])
-    config = CompactionConfig(context_window_tokens=12_000, output_reserve_tokens=512)
+    config = CompactionConfig(context_window_tokens=12_000, output_reserve_ratio=(512) / (12_000))
     assert counter.request("", messages, []) == 4_000
     assert 4_000 < int(config.input_limit * config.auto_threshold)
     model = provider()
@@ -144,10 +144,10 @@ def test_compaction_counter_keeps_raw_comparison():
 
 
 # 功能：验证运行保护配置保留，同时移除 tokenizer 配置入口
-# 设计：默认额度关闭，环境覆盖生效，旧 tokenizer 小节按未知配置拒绝
+# 设计：默认时间保护开启、累计 Token 关闭，环境覆盖生效，旧 tokenizer 小节拒绝
 def test_budget_config_and_removed_tokenizer_config(monkeypatch):
     config = KamaConfig()
-    assert config.agent.max_total_tokens == config.agent.max_run_seconds == 0
+    assert config.agent.max_total_tokens == 0 and config.agent.max_run_seconds == 1800
     apply_toml(config, {"agent": {"max_run_seconds": 60, "repeat_failure_limit": 0}})
     monkeypatch.setenv("KAMA_AGENT_MAX_TOTAL_TOKENS", "20000")
     apply_env(config)
@@ -158,7 +158,7 @@ def test_budget_config_and_removed_tokenizer_config(monkeypatch):
         apply_toml(config, {"token_estimation": {"tokenizer_path": "unused"}})
 
 
-# 功能：验证真实总 Usage 超过固定阈值时触发四层压缩。
+# 功能：验证真实总 Usage 超过固定阈值时触发历史摘要。
 # 设计：粗估低于阈值而实际量超过阈值，断言仍只调用一次摘要。
 async def test_anchor_pressure_reaches_existing_compaction_pipeline():
     from kama_claude.core.compact.compactor import Compactor
@@ -167,9 +167,11 @@ async def test_anchor_pressure_reaches_existing_compaction_pipeline():
     messages = history()
     estimator = TokenEstimator()
     raw = TokenCounter().raw_request("", messages, [])
-    config = CompactionConfig(context_window_tokens=12000, output_reserve_tokens=512)
-    estimator.observe("", messages, [], int(config.input_limit * config.auto_threshold) + 1)
-    assert raw < config.input_limit * config.auto_threshold
+    # 小窗口显式保留较小的摘要额度，避免默认输出预留改变本测试的输入条件。
+    config = CompactionConfig(context_window_tokens=12000, output_reserve_ratio=(512) / (12000),
+                              summary_max_ratio=(2048) / (12000), summary_target_ratio=(2048) / (2 * (12000)))
+    estimator.observe("", messages, [], config.trigger_tokens + 1)
+    assert raw < config.trigger_tokens
     model = provider()
     result = await Compactor(config, estimator).prepare_context(messages, model)
     assert result.compacted and result.llm_used
@@ -251,7 +253,7 @@ async def test_budget_event_keeps_configured_threshold():
     bus = EventBus()
     bus.subscribe(collect)
     run = run_state()
-    config = CompactionConfig(output_reserve_tokens=100)
+    config = CompactionConfig(output_reserve_ratio=(100) / (1_048_576))
     model = provider(
         LlmResponse("end_turn", text="one", usage=UsageStats(1000, 20)),
         LlmResponse("end_turn", text="two", usage=UsageStats(10000, 20)),
@@ -268,7 +270,7 @@ async def test_budget_event_keeps_configured_threshold():
     await managed.chat(messages, [], bus, run.run_id, max_output_tokens=100)
     assert len(events) == 4
     assert {event["trigger_tokens"] for event in events} == {
-        int(config.input_limit * config.auto_threshold),
+        config.trigger_tokens,
     }
     assert all("underestimate_factor" not in event for event in events)
 
@@ -284,11 +286,12 @@ async def test_anchor_hard_limit_still_checked_when_auto_disabled():
     messages = [{"role": "user", "content": "goal"}]
     run = run_state(system_prompt="system")
     estimator = TokenEstimator()
-    estimator.observe("system", messages, [], 60000)
+    config = CompactionConfig(auto_threshold=0)
+    estimator.observe("system", messages, [], config.input_limit + 1)
     model = provider()
     context = ExecutionContext(run=run, messages=messages)
     loop = build_test_loop(model, ToolRegistry(), EventBus(), context=context, estimator=estimator,
-                     compaction=CompactionConfig(auto_threshold=0))
+                     compaction=config)
     await loop.run()
     assert run.status == "interrupted" and run.reason == "context_budget_exceeded"
     model.chat.assert_not_called()

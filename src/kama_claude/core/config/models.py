@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 _DEFAULT_HOST = "127.0.0.1"
@@ -8,8 +9,8 @@ _DEFAULT_LOG_LEVEL = "INFO"
 _DEFAULT_LOG_FILE = "~/.kama/logs/core.log"
 _DEFAULT_LOG_FORMAT = "text"
 _DEFAULT_CONFIG_PATH = "~/.kama/config.toml"
-_DEFAULT_MAX_STEPS = 20
-_DEFAULT_MODEL = "claude-sonnet-4-6"
+_DEFAULT_MAX_STEPS = 0  # 0 表示不限步数，时间与无进展保护仍独立生效。
+_DEFAULT_MODEL = "deepseek-flash"
 _DEFAULT_TRACE_FILE = "~/.kama/traces/daemon.jsonl"
 
 
@@ -23,7 +24,7 @@ class LoggingConfig:
 @dataclass
 class AgentConfig:
     max_steps: int = _DEFAULT_MAX_STEPS
-    max_run_seconds: int = 0
+    max_run_seconds: int = 1800
     max_total_tokens: int = 0
     repeat_failure_limit: int = 5
     no_progress_limit: int = 5
@@ -31,13 +32,15 @@ class AgentConfig:
     def __post_init__(self) -> None:
         from kama_claude.core.progress import validate_progress_limit
 
+        if type(self.max_steps) is not int or self.max_steps < 0:
+            raise ValueError("max_steps must be a nonnegative integer (0 means unlimited)")
         validate_progress_limit(self.no_progress_limit)
 
 
 @dataclass
 class SubagentConfig:
-    max_active: int = 3
-    max_total: int = 8
+    max_active: int = 2
+    max_total: int = 6
 
     # 独立构造配置时同样检查正整数，避免绕过 TOML 和环境变量校验。
     def __post_init__(self) -> None:
@@ -61,7 +64,7 @@ class TraceConfig:
 
 @dataclass
 class PermissionConfig:
-    timeout_s: float = 60.0  # 审批超时秒数；0 表示不超时
+    timeout_s: float = 300.0  # 审批超时秒数；0 表示不超时
 
 
 @dataclass
@@ -73,31 +76,94 @@ class ExecutionConfig:
 @dataclass
 class CompactionConfig:
     auto_threshold: float = 0.8  # 请求前按估算输入触发，0 表示关闭自动摘要
-    tool_result_limit: int = 8_000  # tool_result 截断触发字符数
-    tool_result_keep: int = 4_000  # 头尾保留的总字符数
-    context_window_tokens: int = 65_536  # 按实际模型配置，并非模型能力声明
-    output_reserve_tokens: int = 8_192
+    tool_result_limit: int = 32_000  # 固定字符数，避免普通代码片段过早裁剪。
+    tool_result_keep: int = 24_000  # 头尾保留的总字符数
+    context_window_tokens: int = 1_048_576  # 默认按 DeepSeek 官方 1M，其他模型按实际能力配置。
+    output_reserve_ratio: float = 0.03125  # 1M 窗口对应 32K 单次输出。
+    safety_margin_ratio: float = 0.02
     keep_recent_turns: int = 3
-    recent_token_budget: int = 16_384
-    summary_max_tokens: int = 2_048
+    recent_history_ratio: float = 0.20
+    summary_max_ratio: float = 0.03125  # 硬上限为窗口的 3.125%。
+    summary_target_ratio: float = 0.0078125  # 1M 下软目标最多 8K，小历史再按比例缩小。
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        if type(self.context_window_tokens) is not int or self.context_window_tokens <= 0:
+            raise ValueError("context_window_tokens must be a positive integer")
+        for name in (
+            "output_reserve_ratio", "safety_margin_ratio", "recent_history_ratio",
+            "summary_max_ratio", "summary_target_ratio",
+        ):
+            value = getattr(self, name)
+            if type(value) not in (int, float) or not math.isfinite(value) or not 0 < value < 1:
+                raise ValueError(f"{name} must be a finite ratio between 0 and 1")
+        if (
+            type(self.auto_threshold) not in (int, float)
+            or not math.isfinite(self.auto_threshold) or not 0 <= self.auto_threshold < 1
+        ):
+            raise ValueError("auto_threshold must be 0 (disabled) or a ratio below 1")
+        if self.summary_target_ratio > self.summary_max_ratio:
+            raise ValueError("summary_target_ratio must not exceed summary_max_ratio")
+        if sum((self.output_reserve_ratio, self.safety_margin_ratio,
+                self.recent_history_ratio, self.summary_max_ratio)) >= 1:
+            raise ValueError("context allocations must leave space for fixed prompts and tools")
+        reserve = max(self.output_reserve_ratio, self.summary_max_ratio) + self.safety_margin_ratio
+        if self.auto_threshold and self.auto_threshold + reserve >= 1:
+            raise ValueError("auto_threshold must leave room for output and safety margin")
+        if self.input_limit <= 0 or self.summary_input_limit <= 0:
+            raise ValueError("context window is too small for output and safety margin")
+
+    # 都是派生额度，不另存固定 Token 数；修改窗口后下次读取即重新计算。
+    @property
+    def output_reserve_tokens(self) -> int:
+        return max(1, int(self.context_window_tokens * self.output_reserve_ratio))
+
+    @property
+    def safety_margin_tokens(self) -> int:
+        return max(1, math.ceil(self.context_window_tokens * self.safety_margin_ratio))
+
+    @property
+    def recent_token_budget(self) -> int:
+        return max(1, int(self.context_window_tokens * self.recent_history_ratio))
+
+    @property
+    def summary_max_tokens(self) -> int:
+        return max(1, int(self.context_window_tokens * self.summary_max_ratio))
+
+    def summary_target_for(self, old_tokens: int) -> int:
+        # 窗口比例是上限，小段旧历史不应被扩写成大摘要。
+        window_target = int(self.context_window_tokens * self.summary_target_ratio)
+        return max(1, min(window_target, old_tokens // 4))
+
+    @property
+    def trigger_tokens(self) -> int:
+        return int(self.context_window_tokens * self.auto_threshold)
+
+    def input_limit_for(self, output_tokens: int) -> int:
+        return self.context_window_tokens - output_tokens - self.safety_margin_tokens
 
     @property
     # 输入预算始终预留输出空间和安全余量
     def input_limit(self) -> int:
-        return self.context_window_tokens - self.output_reserve_tokens - 1_024
+        return self.input_limit_for(self.output_reserve_tokens)
+
+    @property
+    def summary_input_limit(self) -> int:
+        return self.input_limit_for(self.summary_max_tokens)
 
 
 @dataclass
 class MemoryConfig:
-    global_auto_tokens: int = 512
-    project_index_tokens: int = 1_024
+    global_auto_ratio: float = 0.0005
+    project_index_ratio: float = 0.001
 
     # 自动入口必须保持有限预算，用户规则不受这两项裁剪。
     def __post_init__(self) -> None:
-        if any(type(value) is not int or value <= 0 for value in (
-            self.global_auto_tokens, self.project_index_tokens,
-        )):
-            raise ValueError("memory budgets must be positive integers")
+        for value in (self.global_auto_ratio, self.project_index_ratio):
+            if type(value) not in (int, float) or not math.isfinite(value) or not 0 < value < 1:
+                raise ValueError("memory ratios must be finite values between 0 and 1")
 
 
 @dataclass
@@ -106,7 +172,10 @@ class ToolSearchConfig:
     db_path: str = "~/.kama/tool_catalog.sqlite3"
     model_path: str = ""
     top_k: int = 3
-    max_loaded_schema_tokens: int = 8_192
+    max_loaded_schema_ratio: float = 0.01
+
+    def schema_budget(self, window_tokens: int) -> int:
+        return max(1, int(window_tokens * self.max_loaded_schema_ratio))
 
     # 空模型路径使用官方模型缓存；未安装可选推理库时搜索仍可降级。
     def __post_init__(self) -> None:
@@ -118,8 +187,9 @@ class ToolSearchConfig:
             raise ValueError("tool_search.model_path must be a string")
         if type(self.top_k) is not int or not 1 <= self.top_k <= 5:
             raise ValueError("tool_search.top_k must be between 1 and 5")
-        if type(self.max_loaded_schema_tokens) is not int or self.max_loaded_schema_tokens <= 0:
-            raise ValueError("tool_search.max_loaded_schema_tokens must be positive")
+        ratio = self.max_loaded_schema_ratio
+        if type(ratio) not in (int, float) or not math.isfinite(ratio) or not 0 < ratio < 1:
+            raise ValueError("tool_search.max_loaded_schema_ratio must be between 0 and 1")
 
 
 @dataclass

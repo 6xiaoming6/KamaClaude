@@ -54,20 +54,20 @@ async def test_embedding_cache_invalidation(tmp_path):
     embedding = FakeEmbedder()
     retriever = ToolRetriever(store, ToolSearchConfig(), embedding)
     tool = record()
-    assert (await retriever.search([tool], "task", "缺陷详情")).method == "hybrid"
+    assert (await retriever.search([tool], "task", "缺陷详情", ["issue"])).method == "hybrid"
     assert embedding.encoded == 1
-    await retriever.search([tool], "task", "缺陷详情")
-    await retriever.search([record(default=2)], "task", "缺陷详情")
+    await retriever.search([tool], "task", "缺陷详情", ["issue"])
+    await retriever.search([record(default=2)], "task", "缺陷详情", ["issue"])
     assert embedding.encoded == 1
     changed = record(description="Get issue details and comments")
-    await retriever.search([changed], "task", "缺陷详情")
+    await retriever.search([changed], "task", "缺陷详情", ["issue"])
     assert embedding.encoded == 2
     embedding.key = "fake-v2"
-    await retriever.search([tool], "task", "缺陷详情")
+    await retriever.search([tool], "task", "缺陷详情", ["issue"])
     assert embedding.encoded == 3
     with sqlite3.connect(store.path) as db:
         db.execute("UPDATE vectors SET values_json='[NaN]' WHERE model_key='fake-v2'")
-    await retriever.search([tool], "task", "缺陷详情")
+    await retriever.search([tool], "task", "缺陷详情", ["issue"])
     assert embedding.encoded == 4
 
 
@@ -84,7 +84,7 @@ async def test_semantic_failures_fall_back(tmp_path, monkeypatch, failure):
     else:
         monkeypatch.setattr(store, "save_vectors", Mock(side_effect=RuntimeError("disk full")))
     result = await ToolRetriever(store, ToolSearchConfig(), embedding).search(
-        [record()], "task", "issue",
+        [record()], "task", "issue", ["issue"],
     )
     assert result.method == "keyword_only" and result.reason
     assert result.ranking[0][0] == "github__get_issue"
@@ -101,11 +101,46 @@ async def test_filtered_catalog_and_query_context(tmp_path):
     store.sync(hidden.server_id, [hidden])
     embedding = FakeEmbedder()
     result = await ToolRetriever(store, ToolSearchConfig(), embedding).search(
-        [allowed], "x" * 2000, "缺陷",
+        [allowed], "x" * 2000, "缺陷", ["unknown_keyword"],
     )
     assert result.ranking == []
     assert len(embedding.queries[0][0]) == 1000
     assert embedding.queries[0][1] == "缺陷"
+
+
+# 任务背景、描述故意指向数据库；词面检索只能被明确传入的 issue 关键词影响。
+@pytest.mark.parametrize("degraded", [False, True])
+async def test_keywords_are_independent_from_semantic_description(tmp_path, degraded):
+    embedder = FakeEmbedder()
+    if degraded:
+        embedder.fingerprint = Mock(side_effect=RuntimeError("model unavailable"))
+    retriever = ToolRetriever(CatalogStore(tmp_path / "tools.db"), ToolSearchConfig(), embedder)
+    issue = record()
+    database = CatalogTool.from_definition("server", "db", {
+        "name": "query_database", "description": "Query SQL database", "inputSchema": {},
+    })
+    mode = "hybrid" if degraded else "keyword"
+    result = await retriever.search(
+        [issue, database], "database SQL " * 80, "query database", ["get_issue"], mode=mode,
+    )
+    assert result.method == "keyword_only"
+    assert [name for name, _ in result.ranking] == [issue.public_name]
+    assert bool(result.reason) == degraded
+    assert embedder.queries == []
+
+
+# 关键词反过来指向 issue，向量查询仍只收到任务背景和语义描述。
+async def test_semantic_query_does_not_include_keywords(tmp_path):
+    embedder = FakeEmbedder()
+    retriever = ToolRetriever(CatalogStore(tmp_path / "tools.db"), ToolSearchConfig(), embedder)
+    database = CatalogTool.from_definition("server", "db", {
+        "name": "query_database", "description": "Query SQL database", "inputSchema": {},
+    })
+    result = await retriever.search(
+        [record(), database], "inspect tables", "query database", ["get_issue"], mode="semantic",
+    )
+    assert [name for name, _ in result.ranking] == [database.public_name]
+    assert embedder.queries == [("inspect tables", "query database")]
 
 
 # 功能：本地目录不存在时绝不触发 Hugging Face 下载。
@@ -138,17 +173,17 @@ def test_tool_search_config(monkeypatch):
 async def test_real_local_e5_smoke(tmp_path):
     embedder = LocalE5Embedder(os.environ["KAMA_TEST_E5_MODEL_PATH"])
     retriever = ToolRetriever(CatalogStore(tmp_path / "tools.db"), ToolSearchConfig(), embedder)
-    result = await retriever.search([record()], "查看 GitHub 问题", "获取 issue 详情")
+    result = await retriever.search([record()], "查看 GitHub 问题", "获取 issue 详情", ["issue"])
     assert result.method == "hybrid", result.reason
     assert result.ranking[0][0] == "github__get_issue"
     assert retriever.embedding_recomputations == 1
-    await retriever.search([record()], "查看 GitHub 问题", "获取 issue 详情")
+    await retriever.search([record()], "查看 GitHub 问题", "获取 issue 详情", ["issue"])
     assert retriever.embedding_recomputations == 1
     # 模拟模型实例重建，已有文本向量继续从 SQLite 读取。
     restored = ToolRetriever(retriever.store, ToolSearchConfig(), LocalE5Embedder(
         os.environ["KAMA_TEST_E5_MODEL_PATH"],
     ))
-    assert (await restored.search([record()], "查看 GitHub 问题", "获取 issue 详情")).method == "hybrid"
+    assert (await restored.search([record()], "查看 GitHub 问题", "获取 issue 详情", ["issue"])).method == "hybrid"
     assert restored.embedding_recomputations == 0
 
 
@@ -204,13 +239,13 @@ async def test_cancelled_waiter_keeps_model_serialized(tmp_path):
 
     embedding.query = query
     retriever = ToolRetriever(CatalogStore(tmp_path / "tools.db"), ToolSearchConfig(), embedding)
-    first = asyncio.create_task(retriever.search([record()], "task", "first"))
+    first = asyncio.create_task(retriever.search([record()], "task", "first", ["issue"]))
     try:
         assert await asyncio.to_thread(entered.wait, 3)
         first.cancel()
         with pytest.raises(asyncio.CancelledError):
             await first
-        second = asyncio.create_task(retriever.search([record()], "task", "second"))
+        second = asyncio.create_task(retriever.search([record()], "task", "second", ["issue"]))
         await asyncio.sleep(0.05)
         assert not second_entered.is_set()
     finally:

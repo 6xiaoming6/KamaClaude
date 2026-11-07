@@ -8,8 +8,9 @@ from textual.containers import VerticalScroll
 from textual.widget import Widget
 from textual.widgets import Static
 
-from kama_claude.tui.formatting import _preview, render_context_bar
+from kama_claude.tui.formatting import _preview
 from kama_claude.tui.widgets.conversation import LLMStreamBlock, ToolCallBlock
+from kama_claude.tui.widgets.usage import ReplyUsage
 
 
 class ConversationView(VerticalScroll):
@@ -30,6 +31,7 @@ class ConversationView(VerticalScroll):
         self.subagent_runs: dict[str, str] = {}
         self.subagent_start_times: dict[str, float] = {}
         self.last_context_pct = 0.0
+        self.reply_usage: dict[str, ReplyUsage] = {}
 
     def append(self, widget: Widget) -> None:
         self.mount(widget)
@@ -161,27 +163,26 @@ class ConversationView(VerticalScroll):
                 self.append(llm_block)
                 self.current_llm = llm_block
             self.current_llm.append_token(token)
+            if run_id not in self.subagent_runs:
+                usage = self._reply_usage(run_id)
+                usage.append_output(event)
+                self.last_context_pct = usage.context_pct or 0.0
             return
         elif t == "llm.usage":
             run_id = event.get("run_id", "")
             if run_id in self.subagent_runs:
                 return
-            pct = float(event.get("context_pct") or 0.0)
-            self.last_context_pct = pct
-            ctx_bar = render_context_bar(pct)
-            total_input = event.get("total_input_tokens")
-            if total_input is None:
-                total_input = event.get("input_tokens")
-            self.append(
-                Static(
-                    f"[dim]  tokens  "
-                    f"in={total_input} "
-                    f"out={event.get('output_tokens')} "
-                    f"cache={event.get('cache_read_input_tokens')}[/dim]"
-                    f"  {ctx_bar}",
-                    classes="usage",
-                )
-            )
+            usage = self._reply_usage(str(run_id))
+            usage.finish(event)
+            self.last_context_pct = usage.context_pct or 0.0
+
+    def _reply_usage(self, run_id: str) -> ReplyUsage:
+        usage = self.reply_usage.get(run_id)
+        if usage is None:
+            usage = ReplyUsage()
+            self.reply_usage[run_id] = usage
+            self.append(usage)
+        return usage
 
     def _handle_run(self, event: dict[str, Any]) -> None:
         t = event.get("type", "")
@@ -222,46 +223,11 @@ class ConversationView(VerticalScroll):
         elif t == "run.budget":
             if str(event.get("run_id", "")) in self.subagent_runs:
                 return
-            method = "Usage+增量" if event.get("method") == "usage_anchor" else "UTF-8字节"
-            estimate = event.get("estimated_input_tokens", 0)
-            actual = event.get("actual_tokens", 0)
-            uncertain = event.get("estimated_tokens", 0)
-            budget_elapsed = float(event.get("elapsed_seconds", 0))
             reason = str(event.get("reason") or "")
             if reason == "model_retry":
                 self.break_stream()
+                self.reply_usage.pop(str(event.get("run_id", "")), None)
                 self.append(Static("上段模型输出未完成，正在重新请求。", markup=False))
-            budget_text = (
-                ("任务树用量更新" if event.get("method") == "subagent_activity"
-                 else f"预算：{method}输入估算 {estimate}")
-                + (
-                    f" / 压缩阈值 {event.get('trigger_tokens')}"
-                    if event.get("trigger_tokens")
-                    else ""
-                )
-                + f"；累计已知 {actual}"
-                f" + 估算占用 {uncertain} tokens；执行 {budget_elapsed:.1f}s"
-                + (
-                    f"；其中后代 {event.get('child_actual_tokens', 0)}"
-                    f" + 估算 {event.get('child_estimated_tokens', 0)}（已包含）"
-                    if event.get("child_actual_tokens") or event.get("child_estimated_tokens")
-                    else ""
-                )
-                + (f"；提示：{reason}" if reason else "")
-            )
-            budget_id = "budget-" + str(event.get("run_id", ""))
-            matches = [widget for widget in self.query(Static) if widget.id == budget_id]
-            if matches:
-                matches[0].update(budget_text)
-            else:
-                self.append(
-                    Static(
-                        budget_text,
-                        id=budget_id,
-                        markup=False,
-                        classes="usage",
-                    )
-                )
 
     def _handle_skill(self, event: dict[str, Any]) -> None:
         t = event.get("type", "")
@@ -299,11 +265,6 @@ class ConversationView(VerticalScroll):
             start = self.subagent_start_times.pop(run_id, None)
             elapsed = f"  [dim]{time.monotonic() - start:.1f}s[/dim]" if start is not None else ""
             desc_part = f"[cyan]{_preview(description, 72)}[/cyan]{elapsed}"
-            if "actual_tokens" in event:
-                desc_part += (
-                    f"  [dim]已知 {event.get('actual_tokens', 0)}"
-                    f" + 估算 {event.get('estimated_tokens', 0)} tokens[/dim]"
-                )
             if event.get("reason"):
                 desc_part += f"  [dim]{escape(str(event['reason']))}[/dim]"
             if status == "success":
@@ -328,6 +289,8 @@ class ConversationView(VerticalScroll):
             self.streamed_text[str(run_id)] = ""
             if run_id in self.subagent_runs:
                 return
+            self.break_stream()
+            self.reply_usage.pop(str(run_id), None)
             step = event.get("step", "")
             self.append(
                 Static(

@@ -271,7 +271,7 @@ async def test_assistant_message_blocks_added_to_context() -> None:
         ("end_turn", False, 1, ["step.started", "step.finished"]),
         ("max_tokens", False, 1, ["step.started", "step.finished"]),
         ("end_turn", True, 1, ["step.started"]),
-        ("end_turn", False, 0, []),
+        ("end_turn", False, 0, ["step.started", "step.finished"]),
     ],
 )
 # 功能：验证正常结束、输出上限、模型异常和预算耗尽保留原有步骤事件边界
@@ -288,6 +288,36 @@ async def test_step_event_boundaries(
     events = await _events(bus)
     await loop.run()
     assert [event.type for event in events] == expected_events  # type: ignore[attr-defined]
+
+
+# 不限步数仍计数；恢复模型调用不加步数，截断和工具批次也不能误判为耗尽。
+@pytest.mark.parametrize("phase", ["ready", "llm"])
+async def test_unlimited_steps_continue_after_checkpoint_roundtrip(phase) -> None:
+    ctx = _ctx(max_steps=0)
+    ctx.run.step = 150
+    ctx.run.phase = phase
+    ctx.run = RunCheckpoint.model_validate_json(ctx.run.model_dump_json())
+    registry = ToolRegistry()
+    registry.register(_EchoTool())
+    provider = _MockProvider([
+        LlmResponse(stop_reason="max_tokens", tool_calls=[_tc(uid="partial")]),
+        LlmResponse(stop_reason="tool_use", tool_calls=[_tc(uid="complete")]),
+        LlmResponse(stop_reason="end_turn", text="done"),
+    ])
+    loop, _ = _make_loop(provider, registry, context=ctx)
+    await loop.run()
+    assert ctx.run.status == "success" and ctx.run.max_steps == 0
+    assert ctx.run.step == (153 if phase == "ready" else 152)
+    assert ctx.run.result == "done"
+
+
+async def test_unlimited_steps_keep_token_budget_protection() -> None:
+    ctx = _ctx(max_steps=0)
+    ctx.run.max_total_tokens = ctx.run.actual_tokens = 1
+    loop, _ = _make_loop(_MockProvider([]), context=ctx)
+    await loop.run()
+    assert ctx.run.status == "failed" and ctx.run.reason == "run_token_budget_exceeded"
+    assert ctx.run.step == 0
 
 
 # 功能：验证输出达到上限时不执行残缺工具请求，但补齐工具结果后仍可进入下一步

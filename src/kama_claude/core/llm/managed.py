@@ -77,15 +77,16 @@ class ManagedProvider:
     async def chat(
         self, messages: list[dict[str, object]], tool_schemas: list[dict[str, object]],
         bus: EventBus, run_id: str, *, step: int = 0, system: str | None = None,
-        max_output_tokens: int = 8_192,
+        max_output_tokens: int | None = None,
     ) -> LlmResponse:
         kind = "summary" if run_id == "compact" else "normal"
-        limit = self._config.context_window_tokens - max_output_tokens - 1_024
+        if max_output_tokens is None:
+            max_output_tokens = self._config.output_reserve_tokens
         counter = self.estimator.select(system or "", messages, tool_schemas, kind=kind)
         # 固定本次实际提交的输入，不能拿回复追加后的消息去匹配 Usage
         request_messages = deepcopy(messages)
         request_schemas = deepcopy(tool_schemas)
-        trigger = int(limit * self._config.auto_threshold)
+        trigger = self._config.trigger_tokens
         estimate = counter.request(system or "", messages, tool_schemas)
         # 事件只转发观察信息，Usage 比例使用配置的窗口而不是模型名猜测
         async def forward(event: BaseModel) -> None:
@@ -96,6 +97,13 @@ class ManagedProvider:
                     total = raw.get("input_tokens", 0)
                 event = event.model_copy(update={
                     "context_pct": total / self._config.context_window_tokens,
+                    "context_window_tokens": self._config.context_window_tokens,
+                })
+            elif getattr(event, "type", "") == "llm.token":
+                # 复用原有流式事件携带展示元数据，不增加每个片段的额外通知。
+                event = event.model_copy(update={
+                    "input_tokens_estimate": estimate,
+                    "context_window_tokens": self._config.context_window_tokens,
                 })
             await bus.publish_safe(event)
 

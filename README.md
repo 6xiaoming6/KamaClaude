@@ -22,6 +22,14 @@ Core 持有后台 Task，客户端通过 `asyncio.shield()` 等待。TUI 断线�
 
 DeepSeek / Anthropic 使用原生延迟加载模式：完整目录及顺序在本轮冻结，MCP 标记 `defer_loading=true`，内置工具和 `search_tool` 常驻。模型调用 `search_tool` 后，本地 BM25＋E5 向量检索、RRF 融合返回 `tool_reference`，下一步再使用对应工具。完整目录仍通过 HTTP 发送；非原生 Provider 使用本地按需展示完整 Schema 的兼容路径。
 
+`search_tool` 接收两个必填参数：`description` 描述所需能力，用于“本轮原始用户输入＋描述”的语义检索；`keywords` 是 1～3 个关键词的数组，只供 BM25 词面匹配，可填写服务名、工具名或参数名。两路仍用 RRF 融合，关键词不是必须全部命中的硬过滤。语义模型不可用时只使用关键词降级检索，不把描述和背景重新混入关键词查询。例如：
+
+```json
+{"description": "读取 GitHub 问题的详情及讨论，定位用户反馈的故障", "keywords": ["github", "get_issue", "comments"]}
+```
+
+关键词去掉首尾空白后每项为 1～100 字符，描述最多 2000 字符。工具名称仍为 `search_tool`，数据库和向量缓存格式不变；此次入参 Schema 已变更，冻结旧定义的中断 Run 仍按原规则拒绝续跑，可终止旧 Run 后开始新任务。
+
 **加载工具或 Skill，就获得执行权限了吗？**
 
 没有。Skill 提供流程说明，工具搜索只发现定义。实际操作仍经过参数校验、权限审批、路径复核、执行意图保存和结果提交。
@@ -100,9 +108,9 @@ uv run kama chat
 
 - **固定前缀**：基础/角色提示＋全局用户 `AGENTS.md`＋项目用户 `AGENTS.md`，同一 Run 内冻结；完整允许工具目录与顺序同样冻结；非原生兼容模式的可见子集可按需变化，恢复使用保存值。
 - **自动记忆**：全局 `AGENTS.auto.md` 和项目 `MEMORY.md` 索引通过标准上下文消息注入，不写入完整对话。普通步骤复用快照；真正采用摘要后刷新并与候选历史一起提交。主题详情通过 `memory_read` 按需读取，`memory_write` 维护自动信息和项目主题。
-- **输出入口限长**：普通工具正文超过 8,000 字符时，先保存结果并归档全文，再把头尾共 4,000 字符的预览放进工作历史。输出整理失败会中断，已完成工具不重跑。
+- **输出入口限长**：普通工具正文超过 32,000 字符时，先保存结果并归档全文，再把头尾共 24,000 字符的预览放进工作历史。输出整理失败会中断，已完成工具不重跑。
 - **请求前估算**：使用有效的上次实际输入＋输出 Usage，加上新增部分 UTF-8 字节数除以四向上取整；前缀改变则重新全文估算。没有 tokenizer 或动态阈值校准。
-- **历史摘要**：默认达到输入硬预算的 80% 时尝试一次；优先保留最近三轮，工具调用与结果不可拆开。旧历史合并成一份六节结构化摘要，校验后才保存。`/compact` 与自动入口共用规则，未达阈值不调用摘要模型。
+- **历史摘要**：默认输入估算达到配置窗口的 80% 时尝试一次；优先保留最近三轮，工具调用与结果不可拆开。旧历史合并成一份六节结构化摘要，校验后才保存。`/compact` 与自动入口共用规则，未达阈值不调用摘要模型。
 - **Skill**：只从 `~/.kama/skills/<name>/SKILL.md` 加载。可输入 `/review src`，也可让模型调用 `load_skill(name)`。每个 Run 最多一个活动 Skill，正文随检查点保存，压缩后按需补回。首次补齐 review、summarize、orchestrate、init 示例，已有文件不覆盖。
 
 旧 `context.md`、`notes.md` 不再自动读取或迁移；已删除 `note_save`、`/memory` 和 `memory.inspect`。用户维护的 `AGENTS.md` 对内置写入工具只读。Skill 不覆盖基础 system，不扩大工具白名单。
@@ -113,30 +121,53 @@ uv run kama chat
 
 ```toml
 [agent]
-max_steps = 20
-max_run_seconds = 0       # 0 关闭累计时间限制
+max_steps = 0             # 0 不限步数，仍累计 Step 并保存在检查点中
+max_run_seconds = 1800    # 30 分钟；0 关闭累计时间限制
 max_total_tokens = 0      # 整棵任务树累计 Token 上限，0 关闭
 repeat_failure_limit = 5
 no_progress_limit = 5     # 只读调用模式重复上限；0 关闭，启用范围 4～20
 
 [compaction]
 auto_threshold = 0.8      # 0 关闭自动摘要，硬预算检查仍生效
-context_window_tokens = 65536  # 请按实际模型配置
-output_reserve_tokens = 8192
+context_window_tokens = 1048576  # 默认按 DeepSeek 官方 1M；其他模型按实际能力配置
+output_reserve_ratio = 0.03125    # 1M 下单次输出最多 32K
+safety_margin_ratio = 0.02
 keep_recent_turns = 3
-recent_token_budget = 16384
-summary_max_tokens = 2048
+recent_history_ratio = 0.20
+summary_max_ratio = 0.03125       # 摘要硬上限 32K
+summary_target_ratio = 0.0078125  # 摘要软目标最多 8K
+tool_result_limit = 32000        # 固定字符数
+tool_result_keep = 24000
 
 [subagent]
-max_active = 3
-max_total = 8
+max_active = 2
+max_total = 6
+
+[permission]
+timeout_s = 300          # 给用户留出查看命令和编辑内容的时间
 
 [memory]
-global_auto_tokens = 512
-project_index_tokens = 1024
+global_auto_ratio = 0.0005
+project_index_ratio = 0.001
 ```
 
 Run 的累计执行时间包含模型、工具和审批等待；恢复不重置原 Run 的预算。普通模型调用、自动摘要与子 Agent 的模型请求纳入整棵树的共享预算，手动压缩单独记用量。
+
+所有上下文额度按 `context_window_tokens × ratio` 即时推导，不另存固定 Token 配置。自动摘要按整个窗口的 80% 触发，`0` 关闭自动摘要但保留硬预算检查；普通输入硬预算扣除 3.125% 输出预留和 2% 安全余量。摘要请求独立扣除 3.125% 摘要输出上限和相同安全余量。窗口仍须按实际模型能力配置。
+
+近期原文最多使用窗口的 20%，优先保留最近三轮；固定 system、用户规则、工具定义和自动记忆按实际估算占用扣除，剩余空间不足时进一步缩小近期额度，完整工具配对不可拆开。用户规则不静默截断，放不下会明确失败。
+
+摘要继续使用六节结构。软目标取“窗口的 0.78125%”与“被摘要旧历史的四分之一”中的较小值；API 上限为窗口的 3.125%，不要求用满。空摘要、截断或缩减不足仍不采用。以 1M 为例：触发线 838860，近期额度最多 209715，摘要软目标最多 8192、输出上限 32768，普通输出预留 32768，安全余量 20972 Token；取整后的个位差异来自向下取整和安全余量向上取整。
+
+`KAMA_COMPACT_WINDOW_TOKENS` 指定窗口；`KAMA_COMPACT_OUTPUT_RATIO`、`KAMA_COMPACT_SAFETY_RATIO`、`KAMA_COMPACT_RECENT_RATIO`、`KAMA_COMPACT_SUMMARY_RATIO`、`KAMA_COMPACT_SUMMARY_TARGET_RATIO` 覆盖对应比例。自动记忆用 `KAMA_MEMORY_GLOBAL_AUTO_RATIO`、`KAMA_MEMORY_PROJECT_INDEX_RATIO`；MCP 加载额度用 `KAMA_TOOL_SEARCH_MAX_LOADED_SCHEMA_RATIO`。比例必须有限且在 0 与 1 之间，合计必须给固定提示留空间，触发线也须给摘要输出留余量。
+
+升级时移除旧的 `output_reserve_tokens`、`recent_token_budget`、`summary_max_tokens`、`global_auto_tokens`、`project_index_tokens`、`max_loaded_schema_tokens` 及对应旧环境变量；检测到旧字段会明确提示迁移，不静默混用。自动记忆保持精简的小比例；缩小窗口后，超额的自动文件需精简或调高比例，不会被自动截断。配置加载需重启 Core。新 Run 的 MCP Schema 额度按比例推导后随检查点冻结，旧 Run 续跑保留已提交限制；步数和累计 Token、时间限额也保持原有恢复语义。
+
+工具输出限长保持固定：超过 32000 字符归档，头尾预览共 24000 字符，减少阅读代码时过早裁剪；文件、命令的 IO 大小限制不随窗口放大。累计 Token 和执行时间是多次请求的成本保护，不是单次上下文份额，继续独立配置。
+
+以上默认面向代码阅读、局部修改和测试验证。步数暂不设上限，但正常完成、取消、30 分钟执行时间、重复失败及无进展保护仍会结束本轮。TOML 或 `KAMA_MAX_STEPS` 设置正整数可重新启用步数限制，负数无效。主、子 Agent 沿用本轮冻结的限制，恢复不会因更改配置而重置旧 Run 的预算。
+
+TUI 在每次模型回复旁只显示输入 Token、输出 Token、缓存命中率和回复后的上下文占用。流式阶段使用 Usage 锚点或字节估算，并用 `≈` 标记；结束后改用 API 真实 Usage，输出包含服务端统计的工具参数及思考用量。缓存命中率为“缓存读取 / 总输入”，占用率为“本次总输入＋当前回复输出 / Core 配置窗口”，缓存输入不重复相加。生成期间只能估算已收到的可见文本，未收到的思考与工具参数在最终 Usage 到达后校正；旧累计预算行不再展示，预算记账、停止和重试提示仍保留。
 
 重复失败保护处理连续相同错误；无进展保护补充检测 `read_file`、`list_dir`、`find_files`、`search_text` 中连续重复且结果不变的调用，支持长度 1～3 的短循环。重复 3 轮时提醒模型改变方法，默认 5 轮时以 `no_progress` 停止本轮；至少等模型看到提醒后的下一 Step 仍重复才停止。同一查询结果变化、写入或其他工具调用会清空观察窗口，子 Agent 等待不纳入此检测。该机制不判断任务语义，其他形式的循环仍依靠 Step、时间及 Token 上限。
 
@@ -153,7 +184,7 @@ url = "https://your-mcp-server.example/mcp"
 [tool_search]
 enabled = true
 top_k = 3
-max_loaded_schema_tokens = 8192
+max_loaded_schema_ratio = 0.01
 # model_path = "C:/models/multilingual-e5-small"
 ```
 
@@ -161,9 +192,24 @@ max_loaded_schema_tokens = 8192
 
 ## 文件、命令与审批
 
-工作区内的普通文件读取、查找与搜索默认允许；`write_file`、`edit_file` 默认询问，可选择本次允许、本次拒绝或本会话允许该工具操作这个实际文件。授权键使用后端解析的真实路径，不绑定原始路径字符串。
+按 `Ctrl+P` 切换当前会话的审批模式，顶部显示 Core 确认的实际模式，`Esc` 关闭选择框。模式弹窗和连接使用独立 Worker 组，切换不会取消 TCP 连接或正在等待的请求。
 
-工作区外读写始终单次审批。执行前重新解析，目标变化则拒绝。Bash 独立检查命令及参数：Windows 使用保守 cmd 解析，POSIX 使用 Bash AST；完整解析且所有命令均匹配允许规则时才自动放行，明确禁止优先，其他情况询问。默认没有命令允许规则。
+| 操作 | ASK（默认） | APPROVE | FULL |
+|---|---|---|---|
+| 工作区内读取、搜索 | 允许 | 允许 | 允许 |
+| 工作区内写入、编辑 | 询问，可授权同工具操作同文件 | 允许 | 允许 |
+| 工作区外读取 | 单次询问 | 允许 | 允许 |
+| 工作区外写入、编辑 | 单次询问 | 单次询问 | 允许 |
+| 完整解析的普通命令 | 按命令允许规则 | 允许 | 允许 |
+| 高危、无法分析或要求询问的命令 | 按现有命令规则，未允许则询问 | 单次询问 | 允许 |
+| 其他已开放工具（含 MCP） | 沿用各工具策略 | 默认允许 | 允许 |
+| 明确禁止的操作 | 拒绝 | 拒绝 | 拒绝 |
+
+ASK 下的文件授权键仍是“会话＋工具＋后端实际文件路径”，不匹配原始字符串或父目录。所有模式执行前都重新解析路径，目标变化则拒绝。明确禁止包括工具策略、持久拒绝和可识别的命令禁止规则；用户 `AGENTS.md` 只读保护、工具白名单、Run 预算和未知结果恢复确认不会因切换模式失效。
+
+Bash 独立判断：Windows 使用保守 cmd 解析，POSIX 使用 Bash AST。ASK 下只有完整解析且所有命令匹配允许规则时才自动允许，默认允许规则为空。APPROVE 额外保留高危询问：删除、格式化、权限修改、终止进程、危险 Git 操作，以及解释器执行脚本、嵌套 Shell 等无法分析内容的调用；普通允许规则不能盖过该检查，显式询问规则也仍有效。该列表是保守分类，不能识别任意程序内部的危险行为；FULL 仍检查可识别的禁止规则，但不会因为无法解析而询问。
+
+模式保存在 `PermissionManager.session_premission_modes`，只在当前 Core 内存中生效；主、子 Agent 共用所属会话模式。断线重连保留，切换会话同步对应模式，关闭会话清除，Core 重启默认恢复 ASK。切换只影响后续工具调用，已发出的审批仍需按原选项回答，正在执行的工具不会被撤回。模式通过 `session.set_permission_mode` 修改，并向同一会话的前端广播；不写入检查点或模型参数。
 
 这些是应用层检查。获批 Shell 和远程 MCP 的实际能力不受文件工具路径校验限制；命令执行和子 Agent 没有系统沙箱。
 
@@ -181,6 +227,8 @@ agent_cancel(run_ids=["unneeded-child"])
 ```
 
 以上 ID 需替换为 spawn_agent 返回的真实 Run ID。`agent_result` 一次查询 1～8 个 ID；已有结果立即返回，否则最多等到任意任务完成或超时。取消查询不取消子任务。取消子任务后仍需查询终态；父任务未收集完后台结果时不能 `finish`。父任务退出时清理自己的后代，单轮取消等待最多 2 秒，不承诺强制终止忽略取消的协程。
+
+普通工具默认有 120 秒执行期限，部分工具另行指定。`spawn_agent` 不继承这个固定期限，前台等待由父子 Run 剩余时间、Token 和 Step 预算约束；取消仍传递到前台子任务。调用入口显式指定的工具超时仍优先，超时后继续保留未知副作用的保守语义。
 
 角色从项目 `.kama/agents/`、用户 `~/.kama/agents/`、内建配置依次选择。精简目录进入 `spawn_agent` 描述，实例保存配置快照；恢复时角色定义指纹变化会被冻结 Schema 校验拒绝。未选择角色默认使用只读 explorer。
 
@@ -211,6 +259,8 @@ agent_cancel(run_ids=["unneeded-child"])
 
 `KAMA_SESSIONS_DIR` 可覆盖会话根目录。独立运行未绑定 Session 的 Runner 时，默认写入当前目录的 `runs/`。
 
+启动日志只输出明确挑选的配置摘要，例如模型、步数、预算和 MCP 服务数量，不输出完整配置对象、请求头、环境变量值、MCP URL 或启动参数。JSON 日志使用真正的 JSON 序列化；引号、换行及异常堆栈会被转义，保持每条记录一行。这不是对任意业务消息或 Trace 内容的通用脱敏。
+
 通信单帧上限为 64 MiB，按 UTF-8 字节计量。`session.open` 返回历史首屏、`next_cursor` 和固定 `history_end`；后续通过 `session.get_history` 分页，TUI 自动加载完整快照。每页目标为 1 MiB 或 200 条消息，单条消息不拆分；单条或快照其他字段仍超帧时明确返回错误，不静默截断。无法解析所属请求的超限输入会关闭连接并结束所有等待，Core 业务 Run 保持独立。
 
 ## 通信保护与关闭
@@ -233,6 +283,8 @@ uv run python scripts/gen_protocol_doc.py --check
 ```
 
 这里的 `integration` 标记专指付费模型测试；非付费命令仍覆盖真实 TCP、Core 进程重启、MCP JSON/SSE 与 TUI。Embedding 真实离线验证需配置 `KAMA_TEST_E5_MODEL_PATH`。测试数量和实测结果以运行输出为准；机制测试不代表真实代码修复成功率或 Prompt Cache 收益。
+
+测试守护进程最多等待 15 秒启动；进程提前退出时立即失败，报告 PID、退出码和最多 8 KiB 的 stderr 尾部。失败和测试结束都会回收进程，避免只留下笼统的启动超时。
 
 当前边界：主 Agent 支持检查点恢复，未知副作用仍需用户核实；不恢复外部进程或未完成子任务树。子 Agent 在同一 Core 中运行，独立上下文、共享工作区，受根 Run 数量限制，通过 `agent_result(run_ids, wait_s)` 批量有界等待并交回报告，共享整棵任务树的 Token 上限。`finish` 不进行业务自动验收。长会话存储成本和真实任务评估仍是后续改进点。
 

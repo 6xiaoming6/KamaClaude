@@ -26,7 +26,9 @@ async def evaluate(
     recall, schema_tokens, reasons = [], [], []
     started = time.perf_counter()
     for query in queries:
-        result = await retriever.search(tools, query["background"], query["description"], mode=mode)
+        result = await retriever.search(
+            tools, query["background"], query["description"], query["keywords"], mode=mode,
+        )
         if mode != "keyword" and result.method == "keyword_only":
             reasons.append(result.reason)
             continue

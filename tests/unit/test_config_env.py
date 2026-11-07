@@ -5,10 +5,34 @@ from pathlib import Path
 import pytest
 
 from kama_claude.core.config import get_config
+from kama_claude.core.config.environment import apply_env
+from kama_claude.core.config.models import AgentConfig, KamaConfig
+from kama_claude.core.config.toml import apply_toml
 
 
 def _write_env(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
+
+
+@pytest.mark.parametrize("steps", [0, 7])
+def test_step_limit_accepts_unlimited_and_positive_settings(monkeypatch, steps) -> None:
+    config = KamaConfig()
+    apply_toml(config, {"agent": {"max_steps": steps}})
+    assert config.agent.max_steps == steps
+    monkeypatch.setenv("KAMA_MAX_STEPS", str(steps))
+    apply_env(config)
+    assert config.agent.max_steps == AgentConfig(max_steps=steps).max_steps == steps
+
+
+@pytest.mark.parametrize("steps", [-1, True, "unlimited"])
+def test_invalid_step_limit_is_rejected(monkeypatch, steps) -> None:
+    with pytest.raises(ValueError):
+        AgentConfig(max_steps=steps)
+    with pytest.raises(SystemExit):
+        apply_toml(KamaConfig(), {"agent": {"max_steps": steps}})
+    monkeypatch.setenv("KAMA_MAX_STEPS", str(steps))
+    with pytest.raises(SystemExit):
+        apply_env(KamaConfig())
 
 
 # 功能：验证 .env 文件中的值被正确加载并覆盖内建默认值

@@ -114,7 +114,7 @@ class LongTool(ProbeTool):
     # 返回足够长的原文，触发第一层整理；工具本身不裁剪
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         self.calls += 1
-        return ToolResult(content="HEAD" + "中" * 12_000 + "TAIL")
+        return ToolResult(content="HEAD" + "中" * 40_000 + "TAIL")
 
 
 # 功能：验证长工具原文和 thinking 保留，重开显示完整历史而模型只读取预览
@@ -137,7 +137,7 @@ async def test_full_history_survives_preview_and_next_run(tmp_path: Path) -> Non
     assert len(first["messages"]) == 5
     assert first["messages"][1]["content"][0] == response.thinking_blocks[0]
     full_result = first["messages"][2]["content"][0]["content"]
-    assert full_result == "HEAD" + "中" * 12_000 + "TAIL"
+    assert full_result == "HEAD" + "中" * 40_000 + "TAIL"
     model_result = provider.calls[1]["messages"][2]["content"][0]["content"]
     assert "chars omitted" in model_result and len(model_result) < len(full_result)
     await mgr.send_message(session.id, "继续追问")

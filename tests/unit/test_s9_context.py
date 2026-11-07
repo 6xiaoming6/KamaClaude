@@ -27,8 +27,9 @@ def make_loop(
     config: CompactionConfig | None = None, persistence: Any = None,
 ) -> tuple[AgentLoop, ExecutionContext, list[Any]]:
     config = config or CompactionConfig(
-        context_window_tokens=8_192, output_reserve_tokens=512,
-        summary_max_tokens=256, auto_threshold=0.1,
+        context_window_tokens=8_192, output_reserve_ratio=(512) / (8_192),
+        summary_max_ratio=(256) / (8_192), summary_target_ratio=(256) / (2 * (8_192)), auto_threshold=0.1,
+        tool_result_limit=8_000, tool_result_keep=4_000,  # 小窗口故障测试显式使用小预览。
     )
     context = ExecutionContext(
         run=RunCheckpoint(
@@ -78,17 +79,17 @@ async def test_request_preparation_compacts_before_model_and_keeps_step(tmp_path
 async def test_hard_budget_applies_with_auto_disabled(tmp_path: Path, large_part: str) -> None:
     model = provider()
     config = CompactionConfig(
-        auto_threshold=0, context_window_tokens=2_048, output_reserve_tokens=512,
-        summary_max_tokens=256,
+        auto_threshold=0, context_window_tokens=2_048, output_reserve_ratio=(512) / (2_048),
+        summary_max_ratio=(256) / (2_048), summary_target_ratio=(256) / (2 * (2_048)),
     )
     messages = [{"role": "user", "content": "hello"}]
     if large_part == "messages":
-        messages[0]["content"] = "中" * 1_000
+        messages[0]["content"] = "中" * 3_000
     loop, context, _ = make_loop(tmp_path, messages, model, config)
     if large_part == "system":
-        context.run.system_prompt = "中" * 1_000
+        context.run.system_prompt = "中" * 3_000
     if large_part == "tools":
-        loop._tools.registry = Mock(tool_schemas=Mock(return_value=[{"description": "中" * 1_000}]))
+        loop._tools.registry = Mock(tool_schemas=Mock(return_value=[{"description": "中" * 3_000}]))
     await loop.run()
     assert context.run.status == "interrupted"
     assert context.run.phase == "llm" and context.run.step == 3
@@ -104,9 +105,9 @@ async def test_failed_auto_compaction_obeys_hard_budget(tmp_path: Path, hard_lim
     model.chat.side_effect = [RuntimeError("offline"), LlmResponse("end_turn", text="done")]
     config = CompactionConfig(
         context_window_tokens=4_096 if hard_limit else 8_192,
-        output_reserve_tokens=1_024, summary_max_tokens=256, auto_threshold=0.1,
+        output_reserve_ratio=(1_024) / (4_096 if hard_limit else 8_192), summary_max_ratio=(256) / (4_096 if hard_limit else 8_192), summary_target_ratio=(256) / (2 * (4_096 if hard_limit else 8_192)), auto_threshold=0.1,
     )
-    original = history()
+    original = history(7)
     loop, context, events = make_loop(tmp_path, copy.deepcopy(original), model, config)
     await loop.run()
     assert model.chat.call_count == (0 if hard_limit else 2)
@@ -160,7 +161,7 @@ class LargeTool(BaseTool):
     # 返回超过裁剪阈值的确定结果
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         self.calls += 1
-        return ToolResult("HEAD" + "x" * 12_000 + "TAIL")
+        return ToolResult("HEAD" + "x" * 40_000 + "TAIL")
 
 
 # 功能：验证工具已完成后归档失败，继续运行只整理输出而不重新执行工具
@@ -229,8 +230,8 @@ async def test_manual_matches_auto_and_notifies_after_commit(tmp_path: Path) -> 
     from kama_claude.core.session.store import SessionStore
 
     config = CompactionConfig(
-        context_window_tokens=8_192, output_reserve_tokens=512,
-        summary_max_tokens=256, auto_threshold=0.1,
+        context_window_tokens=8_192, output_reserve_ratio=(512) / (8_192),
+        summary_max_ratio=(256) / (8_192), summary_target_ratio=(256) / (2 * (8_192)), auto_threshold=0.1,
     )
     store = SessionStore(tmp_path / "sessions")
     bus = EventBus()
@@ -271,8 +272,8 @@ async def test_manual_save_failure_preserves_disk_history(
     manager = SessionManager(
         store, Mock(), EventBus(), provider=provider(),
         compaction=CompactionConfig(
-            context_window_tokens=8_192, output_reserve_tokens=512,
-            summary_max_tokens=256, auto_threshold=0.1,
+            context_window_tokens=8_192, output_reserve_ratio=(512) / (8_192),
+            summary_max_ratio=(256) / (8_192), summary_target_ratio=(256) / (2 * (8_192)), auto_threshold=0.1,
         ),
     )
     session = await manager.create("chat")
@@ -333,19 +334,20 @@ def test_compaction_configuration(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     monkeypatch.chdir(tmp_path)
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        "[compaction]\ncontext_window_tokens=32768\noutput_reserve_tokens=1024\n"
-        "keep_recent_turns=3\nrecent_token_budget=16384\nsummary_max_tokens=512\n", encoding="utf-8",
+        "[compaction]\ncontext_window_tokens=32768\noutput_reserve_ratio=0.0625\n"
+        "keep_recent_turns=3\nrecent_history_ratio=0.3\nsummary_max_ratio=0.05\n"
+        "summary_target_ratio=0.025\n", encoding="utf-8",
     )
     monkeypatch.setenv("KAMA_CONFIG", str(config_path))
     monkeypatch.setenv("KAMA_COMPACT_WINDOW_TOKENS", "16384")
     config = get_config().compaction
     assert config.auto_threshold == 0.8
-    assert config.context_window_tokens == 16384 and config.input_limit == 14336
-    assert config.keep_recent_turns == 3 and config.summary_max_tokens == 512
+    assert config.context_window_tokens == 16384 and config.input_limit == 15032
+    assert config.keep_recent_turns == 3 and config.summary_max_tokens == 819
     monkeypatch.setenv("KAMA_COMPACT_THRESHOLD", "0")
     assert get_config().compaction.auto_threshold == 0
-    monkeypatch.setenv("KAMA_COMPACT_OUTPUT_TOKENS", "20000")
-    with pytest.raises(SystemExit, match="context window"):
+    monkeypatch.setenv("KAMA_COMPACT_OUTPUT_RATIO", "0.95")
+    with pytest.raises(SystemExit, match="context allocations"):
         get_config()
 
 

@@ -120,7 +120,7 @@ async def invoke_tool(
                 error_type="runtime_error",
             )
         )
-    # 调用者显式超时优先；搜索首次下载允许更长等待，整轮时间预算仍由外层约束。
+    # 显式超时优先；子 Agent 可关闭固定工具超时，仍受父子 Run 预算和取消约束。
     timeout = tool.timeout_s if timeout is None else timeout
     if tool.params_model is not None:
         try:
@@ -225,7 +225,7 @@ async def _authorize(
 
 async def _execute_attempt(
     tool: BaseTool, params: dict[str, object], path_access: PathAccess | None,
-    timeout: float,
+    timeout: float | None,
 ) -> ToolResult:
     try:
         # 可信批准路径作为 Python 关键字传入，不读取模型提供的同名参数
@@ -264,7 +264,8 @@ async def _execute_attempt(
     # 超时不代表操作未发生，非安全工具要保守记录结果未知
     except TimeoutError:
         result = ToolResult(
-            content=f"tool timed out after {timeout}s",
+            content=(f"tool timed out after {timeout}s" if timeout is not None
+                     else "tool operation timed out"),
             is_error=True,
             error_type="timeout",
             outcome_unknown=not tool.retry_safe,
@@ -282,7 +283,7 @@ async def _execute_attempt(
 
 async def _execute_with_retry(
     tool: BaseTool, tool_call: ToolCallBlock, params: dict[str, object],
-    path_access: PathAccess | None, bus: EventBus, run_id: str, timeout: float, *,
+    path_access: PathAccess | None, bus: EventBus, run_id: str, timeout: float | None, *,
     checkpoint_hook: ToolCheckpointHook | None, started_at: float,
 ) -> tuple[ToolResult, int]:
     for attempt in range(1, _MAX_RETRIES + 2):

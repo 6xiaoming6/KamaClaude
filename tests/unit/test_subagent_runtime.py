@@ -415,7 +415,7 @@ def test_restored_parent_passes_frozen_limits(tmp_path: Path) -> None:
 # 功能：验证子任务长工具结果归档并裁剪，模型不再重复接收全文
 # 设计：读取真实长文件，只跑两次普通请求，检查归档和第二次请求正文
 async def test_child_long_output_uses_compaction(tmp_path: Path) -> None:
-    text = "head-\n" + ("x" * 100 + "\n") * 100 + "-tail\n"
+    text = "head-\n" + ("x" * 400 + "\n") * 100 + "-tail\n"
     (tmp_path / "large.txt").write_text(text, encoding="utf-8")
     model = Provider(LlmResponse("tool_use", tool_calls=[ToolCallBlock(
         "read", "read_file", {"path": "large.txt"},
@@ -438,7 +438,7 @@ async def test_child_hard_context_limit_and_unknown_result(
 ) -> None:
     model = Provider()
     tool = spawn_tool(tmp_path, model, compaction=CompactionConfig(
-        context_window_tokens=2048, output_reserve_tokens=512, summary_max_tokens=128,
+        context_window_tokens=2048, output_reserve_ratio=(512) / (2048), summary_max_ratio=(128) / (2048), summary_target_ratio=(128) / (2 * (2048)),
         auto_threshold=0,
     ))
     result = await tool.invoke({"description": "big", "prompt": "中" * 5000})
@@ -479,8 +479,8 @@ async def test_child_summary_is_managed_and_charged(tmp_path: Path) -> None:
         )]) for index in range(3)
     ])
     outcome = await background_result(spawn_tool(tmp_path, model, compaction=CompactionConfig(
-        context_window_tokens=12_000, output_reserve_tokens=512, summary_max_tokens=128,
-        keep_recent_turns=1, recent_token_budget=2_000, auto_threshold=0.5,
+        context_window_tokens=12_000, output_reserve_ratio=(512) / (12_000), summary_max_ratio=(128) / (12_000), summary_target_ratio=(128) / (2 * (12_000)),
+        keep_recent_turns=1, recent_history_ratio=(2_000) / (12_000), auto_threshold=0.5,
     )))
     summaries = [call for call in model.calls if call["run_id"] == "compact"]
     assert outcome.status == "success" and summaries

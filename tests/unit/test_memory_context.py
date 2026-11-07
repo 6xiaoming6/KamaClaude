@@ -39,7 +39,8 @@ def test_four_sources_and_lazy_details(tmp_path: Path) -> None:
 # 功能：用户规则不受自动预算裁剪，重复构建不会追加旧注入片段。
 # 设计：极小自动预算配合较长用户规则，比较完整字符串与重复次数。
 def test_rules_are_not_truncated(tmp_path: Path) -> None:
-    store = memory(tmp_path, config=MemoryConfig(global_auto_tokens=1, project_index_tokens=1))
+    store = memory(tmp_path, config=MemoryConfig(global_auto_ratio=1 / 1_048_576,
+                                                project_index_ratio=1 / 1_048_576))
     rule = "USER_CONSTRAINT " * 300
     (tmp_path / "AGENTS.md").write_text(rule, encoding="utf-8")
     snapshot = build_memory_context(store)

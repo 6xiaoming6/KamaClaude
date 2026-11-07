@@ -67,7 +67,7 @@ def test_invalid_keys(tmp_path: Path, key: str) -> None:
 # 功能：索引预算不足时拒绝新内容，正文和索引都不部分提交。
 # 设计：很小的合法预算配合长摘要，在真正原子写入之前就触发错误。
 def test_index_budget_before_write(tmp_path: Path) -> None:
-    store = memory(tmp_path, config=MemoryConfig(project_index_tokens=5))
+    store = memory(tmp_path, config=MemoryConfig(project_index_ratio=5 / 1_048_576))
     with pytest.raises(MemoryError, match="shorten"):
         put(store)
     assert not store.root.exists()

@@ -38,28 +38,47 @@ async def running_daemon(free_port: int, tmp_path: Path) -> AsyncGenerator[subpr
     env["DEEPSEEK_API_KEY"] = ""
     env["ANTHROPIC_API_KEY"] = ""
 
-    proc = subprocess.Popen([sys.executable, "-m", "kama_claude.core"], env=env)
+    stderr_path = tmp_path / "daemon.stderr.log"
+    with stderr_path.open("wb") as stderr:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "kama_claude.core"], env=env, stderr=stderr,
+        )
+        try:
+            await _wait_for_daemon(proc, free_port, stderr_path)
+            yield proc
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
 
-    deadline = time.monotonic() + 3.0
+
+def _daemon_diagnostics(proc: subprocess.Popen[bytes], stderr_path: Path) -> str:
+    # 只读取日志尾部，启动失败也能看到退出状态，不用无限积累 PIPE 输出。
+    with stderr_path.open("rb") as stderr:
+        size = stderr.seek(0, 2)
+        stderr.seek(max(0, size - 8_192))
+        tail = stderr.read().decode("utf-8", errors="replace")
+    return f"pid={proc.pid}, exit_code={proc.poll()}\nstderr tail:\n{tail}"
+
+
+async def _wait_for_daemon(
+    proc: subprocess.Popen[bytes], port: int, stderr_path: Path, timeout_s: float = 15.0,
+) -> None:
+    deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            pytest.fail("Daemon exited before listening: " + _daemon_diagnostics(proc, stderr_path))
         await asyncio.sleep(0.05)
         try:
-            _reader, writer = await asyncio.open_connection("127.0.0.1", free_port)
+            _reader, writer = await asyncio.open_connection("127.0.0.1", port)
             writer.close()
             await writer.wait_closed()
-            break
+            return
         except (ConnectionRefusedError, OSError):
             pass
-    else:
-        proc.terminate()
-        proc.wait()
-        pytest.fail("Daemon did not start within 3 seconds")
-
-    yield proc
-
-    proc.terminate()
-    try:
-        proc.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
+    pytest.fail(f"Daemon did not start within {timeout_s:g} seconds: "
+                + _daemon_diagnostics(proc, stderr_path))

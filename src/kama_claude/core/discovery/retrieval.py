@@ -85,12 +85,12 @@ class ToolRetriever:
 
     # 关键词始终可用；模型或缓存出错时只降级搜索，不扩大候选范围。
     async def search(
-        self, tools: list[CatalogTool], background: str, description: str,
+        self, tools: list[CatalogTool], background: str, description: str, keywords: list[str],
         *, mode: Literal["keyword", "semantic", "hybrid"] = "hybrid",
     ) -> SearchResult:
         background = background[:1000]
-        query = f"任务背景：{background}\n当前需求：{description}"
-        lexical = keyword_ranking(tools, query)
+        # 两路使用独立输入：关键词不混入背景，向量不混入关键词。
+        lexical = keyword_ranking(tools, " ".join(keywords))
         if mode == "keyword":
             return SearchResult(lexical, "keyword_only")
         if not tools:

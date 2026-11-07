@@ -32,6 +32,8 @@ from kama_claude.core.bus.commands import (
     SessionResumeResult,
     SessionSendMessageCommand,
     SessionSendMessageResult,
+    SessionSetPermissionModeCommand,
+    SessionSetPermissionModeResult,
 )
 from kama_claude.core.bus.envelope import EventPushEnvelope
 from kama_claude.core.bus.events import (
@@ -53,6 +55,7 @@ from kama_claude.core.bus.events import (
     SessionClosedEvent,
     SessionCreatedEvent,
     SessionMessageReceivedEvent,
+    SessionPermissionModeChangedEvent,
     SessionResumedEvent,
     SessionWaitingForInputEvent,
     StepFinishedEvent,
@@ -222,11 +225,19 @@ def generate() -> str:
         "incoming frame closes the connection and fails pending requests.\n\n",
         _model_section("SessionResumeCommand", SessionResumeCommand),
         _model_section("SessionResumeResult", SessionResumeResult),
+        _model_section("SessionSetPermissionModeCommand", SessionSetPermissionModeCommand),
+        _model_section("SessionSetPermissionModeResult", SessionSetPermissionModeResult),
+        "\nPermission mode is per session and in memory only: ask (existing approvals), "
+        "approve (ask for high-risk/opaque commands and external file writes), full "
+        "(skip prompts). Explicit denials apply in every mode. Mode changes affect future "
+        "calls, never answer pending approvals, and are broadcast to session subscribers. "
+        "session.open returns the current mode; Core restart resets it to ask.\n\n",
         _model_section("PermissionRespondCommand", PermissionRespondCommand),
         _model_section("PermissionRespondResult", PermissionRespondResult),
         "\n## Request Admission and Connection Sending\n\n",
         "Requests are validated and admitted before a handler Task is created. Ordinary "
-        "limits are 8 per connection and 64 globally; core.ping and permission.respond "
+        "limits are 8 per connection and 64 globally; core.ping, permission.respond "
+        "and session.set_permission_mode "
         "have separate limits of 2 per connection and 8 globally. Full capacity returns "
         "-32034 Server busy without creating waiting Tasks. Quotas include response sending. "
         "Shutdown rejects new ordinary work with -32035 Server shutting down while "
@@ -317,6 +328,7 @@ def generate() -> str:
         "\n",
         _model_section("SessionClosedEvent", SessionClosedEvent,
             {"type": "session.closed", "session_id": session_id, "ts": ts}),
+        _model_section("SessionPermissionModeChangedEvent", SessionPermissionModeChangedEvent),
         "\n## Error Codes\n\n",
         "| Code | Name | Meaning |\n",
         "|------|------|---------|\n",
