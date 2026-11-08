@@ -60,7 +60,7 @@ async def test_candidate_preserves_recent_and_input() -> None:
 async def test_original_current_request_is_pinned_once() -> None:
     goal = {"role": "user", "content": "Only edit loop.py; do not commit."}
     messages = [goal, *[m for m in history() if m["role"] == "assistant"]]
-    result = await Compactor(CompactionConfig(recent_history_ratio=(1_500) / (1_048_576))).compact_messages(messages, provider())
+    result = await Compactor(CompactionConfig(context_window_tokens=1_048_576, recent_history_ratio=(1_500) / (1_048_576))).compact_messages(messages, provider())
     assert result.compacted
     assert result.messages.count(goal) == 1
     assert result.messages[2] == goal
@@ -108,7 +108,7 @@ async def test_invalid_summary_preserves_history(response: LlmResponse, reason: 
     messages = history()
     original = copy.deepcopy(messages)
     model = Mock(chat=AsyncMock(return_value=response))
-    result = await Compactor(CompactionConfig(summary_max_ratio=(2_048) / (1_048_576), summary_target_ratio=(2_048) / (2 * (1_048_576)))).compact_messages(
+    result = await Compactor(CompactionConfig(context_window_tokens=1_048_576, summary_max_ratio=(2_048) / (1_048_576), summary_target_ratio=(2_048) / (2 * (1_048_576)))).compact_messages(
         messages, model,
     )
     assert not result.compacted and result.reason == reason
@@ -125,7 +125,7 @@ async def test_summary_can_exceed_soft_target_when_within_api_limit() -> None:
 @pytest.mark.parametrize("limit", [512, 2_048, 8_192])
 async def test_summary_target_leaves_room_for_completion(limit: int) -> None:
     model = provider()
-    config = CompactionConfig(summary_max_ratio=limit / 1_048_576,
+    config = CompactionConfig(context_window_tokens=1_048_576, summary_max_ratio=limit / 1_048_576,
                               summary_target_ratio=limit / (2 * 1_048_576))
     await Compactor(config).compact_messages(history(), model)
     args = model.chat.call_args.kwargs
@@ -138,7 +138,7 @@ async def test_summary_target_leaves_room_for_completion(limit: int) -> None:
 # 功能：验证没有节省至少百分之十时，不接受更长或收益很小的摘要
 # 设计：放宽摘要输出上限，让验证确实进入整体缩减判断而不是先被长度限制挡住
 async def test_insufficient_reduction_preserves_history() -> None:
-    config = CompactionConfig(summary_max_ratio=(8_192) / (1_048_576), summary_target_ratio=(8_192) / (2 * (1_048_576)))
+    config = CompactionConfig(context_window_tokens=1_048_576, summary_max_ratio=(8_192) / (1_048_576), summary_target_ratio=(8_192) / (2 * (1_048_576)))
     result = await Compactor(config).compact_messages(history(), provider("x" * 10_000))
     assert not result.compacted and result.reason == "insufficient_reduction"
 
@@ -187,7 +187,7 @@ async def test_unfinished_tool_batch_is_rejected() -> None:
 async def test_recent_groups_shrink_without_splitting() -> None:
     messages = [*history(), {"role": "assistant", "content": "甲" * 6_000},
                 {"role": "assistant", "content": "乙" * 6_000}]
-    result = await Compactor(CompactionConfig(recent_history_ratio=(6_000) / (1_048_576))).compact_messages(messages, provider())
+    result = await Compactor(CompactionConfig(context_window_tokens=1_048_576, recent_history_ratio=(6_000) / (1_048_576))).compact_messages(messages, provider())
     assert result.compacted and result.messages[-1] == messages[-1]
     assert messages[-2] not in result.messages
 
@@ -196,11 +196,13 @@ async def test_recent_groups_shrink_without_splitting() -> None:
 # 设计：分别让近期单组及旧历史超限，断言两个分支都不调用模型
 async def test_uncompressible_inputs_do_not_call_model() -> None:
     model = provider()
-    result = await Compactor(CompactionConfig(recent_history_ratio=16_384 / 1_048_576)).compact_messages(
+    result = await Compactor(CompactionConfig(context_window_tokens=1_048_576, recent_history_ratio=16_384 / 1_048_576)).compact_messages(
         [*history(), {"role": "assistant", "content": "中" * 24_000}], model,
     )
     assert result.reason == "recent_context_too_large"
-    config = CompactionConfig(context_window_tokens=4_096, output_reserve_ratio=(512) / (4_096))
+    # 这个分支验证摘要输入超限，需给近期交互留够空间，避免提前命中近期额度不足。
+    config = CompactionConfig(context_window_tokens=4_096, output_reserve_ratio=(512) / (4_096),
+                              recent_history_ratio=0.2)
     result = await Compactor(config).compact_messages(history(12), model)
     assert result.reason == "summary_input_too_large"
     model.chat.assert_not_called()

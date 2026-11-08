@@ -2,7 +2,7 @@
 
 一个基于 Python 的本地 Coding Agent。用户通过 TUI 或 CLI 输入目标，独立 Core 调用模型、执行工具并保存运行状态，前端实时显示回复、工具进度和审批。
 
-`dev` 已整合 S0–S13，覆盖**可恢复执行、上下文组织、工具权限、MCP 按需发现、子 Agent 协作和代码仓库探索**。仓库工具支持 Python、JS/JSX、TS/TSX 的语法定义定位，以及视觉模型的本地图片读取。当前面向单用户、单 Core 使用；运行机制与工具正确性已有测试，真实复杂任务的成功率和成本收益仍需独立评估。
+`dev` 已整合 S0–S13，覆盖**可恢复执行、上下文组织、工具权限、MCP 按需发现、子 Agent 协作和代码仓库探索**。仓库工具支持 Python、JS/JSX、TS/TSX、C++、Java、Rust、Go 的语法定义定位，以及视觉模型的本地图片读取。当前面向单用户、单 Core 使用；运行机制与工具正确性已有测试，真实复杂任务的成功率和成本收益仍需独立评估。
 
 ## 先理解几个核心问题
 
@@ -121,8 +121,10 @@ uv run kama chat
 模型可以根据任务组合以下工具，不会自动创建搜索子 Agent：
 
 ```text
-list_dir / find_files → search_text → get_file_outline / search_symbol → read_symbol / read_file
+list_dir / find_files → search_text → get_file_outline → read_symbol / read_file
 ```
+
+`SearchSymbolTool` 保留实现，但不再默认注册给主 Agent 或子 Agent；按文件定位后，通过大纲获取符号名再阅读源码。
 
 | 工具 | 适合的问题 | 返回及下一步 |
 |---|---|---|
@@ -130,7 +132,6 @@ list_dir / find_files → search_text → get_file_outline / search_symbol → r
 | `find_files` | 某类文件在哪里？ | glob 匹配路径，再搜索内容或查看大纲 |
 | `search_text` | 哪些文件或行包含这段文字？ | `files` 返回匹配文件与匹配行数；`matches` 返回行号和短上下文 |
 | `get_file_outline` | 这个文件定义了什么？ | 定义名称、类型、签名、首尾行及文件哈希，不返回正文 |
-| `search_symbol` | `Service.handle` 在哪里定义？ | 精确或部分名称匹配，返回候选，不推断调用关系 |
 | `read_symbol` | 这个函数具体怎么实现？ | 源码页、文件哈希和续读行号；同名歧义要求明确选择 |
 | `read_file` | 查看文本或本地图片 | 文本带行号和 `next_start_line`；图片作为视觉内容返回模型 |
 
@@ -145,7 +146,7 @@ list_dir / find_files → search_text → get_file_outline / search_symbol → r
 ```
 
 ```json
-{"name":"Service.handle","path":"src","match":"exact"}
+{"path":"src/service.py"}
 ```
 
 ```json
@@ -153,6 +154,20 @@ list_dir / find_files → search_text → get_file_outline / search_symbol → r
 ```
 
 `read_symbol` 续读时传上次的 `next_start_line` 和 `expected_hash=file_hash`，文件变化返回 `conflict`。所有行号从 1 开始，结束行包含在范围内。工具返回中的路径相对 `root`，调用时需要组成对应的完整或工作区相对路径。
+
+符号提取共用 [symbols.py](./src/kama_claude/core/tools/symbols.py) 的读取、预算和结果处理，各语言规则独立放在 [syntax/](./src/kama_claude/core/tools/syntax/)。新增语言不改变 Agent 主循环或审批链路：
+
+| 语言 | 常见文件 | 支持的主要定义与限定名 |
+|---|---|---|
+| Python、JS/JSX、TS/TSX | `.py`、`.js`、`.jsx`、`.ts`、`.tsx` 等 | 保留装饰器、类、函数、方法、箭头函数、接口和类型定义；如 `Service.handle` |
+| C++ | `.cpp`、`.cc`、`.cxx`、`.C`、`.h`、`.hpp`、`.hh`、`.hxx`、`.ipp`、`.tpp` 等 | 类/结构体、枚举、普通函数及声明、构造/析构、常见运算符、模板和别名；如 `demo::Store::get` |
+| Java | `.java` | 类、接口、枚举、record、注解类型、方法和构造器；如 `Service.API.fetch` |
+| Rust | `.rs` | struct/union、enum、trait、类型别名、函数及 impl/trait 内方法；如 `demo::Store::get`，连续属性包含在读取范围内 |
+| Go | `.go` | 普通函数、接收者方法、结构体、接口及方法、具名类型和别名；如 `Store.Get`，支持指针和泛型接收者 |
+
+结果继续使用 `class/function/method/interface/type/enum` 六种类型：struct/union 归为 `class`，Rust trait 归为 `interface`，构造器归为 `method`。C++/Rust 使用 `::` 分隔作用域，其余使用 `.`；Java 包名和 Go 包名不添加到文件内限定名中。C++ 命名空间、Rust 内联模块用于限定子定义，不额外生成模块记录。重载、声明与定义或多个 trait 实现可能返回相同限定名，需按候选的 `start_line` 明确选择；同一行内仍无法区分的同名定义继续报告歧义。
+
+这些是语法级导航，不解析导入、头文件、继承关系或运行时类型，不展开 C++ 宏和 Rust 宏，也不提供引用查询。C++ 类外限定函数仅在同文件存在对应类型声明时进一步归为方法；复杂声明或解析不完整时，结合 `search_text` 和 `read_file` 核对源码。能力测试使用真实语法包，不等于编译通过或真实模型任务效果验证。
 
 新符号工具及结构化查找/搜索结果最多 8,000 字符、50 KiB，按完整记录或整行源码限长，避免 JSON 被通用预览截坏。它们仍计入模型输入预算。目录扫描沿用忽略规则、不跟随链接，受 5 秒、20 MiB 读取和 20,000 条目录项预算约束；符号解析每文件最多 1 MiB。`truncated=true` 表示需要缩小范围，不能以部分扫描的空结果证明符号不存在。未支持语言继续使用文本工具。
 
@@ -164,7 +179,7 @@ list_dir / find_files → search_text → get_file_outline / search_symbol → r
 - **自动记忆**：全局 `AGENTS.auto.md` 和项目 `MEMORY.md` 索引通过标准上下文消息注入，不写入完整对话。普通步骤复用快照；真正采用摘要后刷新并与候选历史一起提交。主题详情通过 `memory_read` 按需读取，`memory_write` 维护自动信息和项目主题。
 - **输出入口限长**：普通工具正文超过 32,000 字符时，先保存结果并归档全文，再把头尾共 24,000 字符的预览放进工作历史。输出整理失败会中断，已完成工具不重跑。
 - **请求前估算**：使用有效的上次实际输入＋输出 Usage，加上新增部分 UTF-8 字节数除以四向上取整；前缀改变则重新全文估算。没有 tokenizer 或动态阈值校准。
-- **历史摘要**：默认输入估算达到配置窗口的 80% 时尝试一次；优先保留最近三轮，工具调用与结果不可拆开。旧历史合并成一份六节结构化摘要，校验后才保存。`/compact` 与自动入口共用规则，未达阈值不调用摘要模型。
+- **历史摘要**：默认有效上下文窗口为 256K，输入估算达到其中 80%（约 200K）时尝试一次；优先保留最近三轮，工具调用与结果不可拆开。旧历史合并成一份六节结构化摘要，校验后才保存。`/compact` 与自动入口共用规则，未达阈值不调用摘要模型。
 - **Skill**：只从 `~/.kama/skills/<name>/SKILL.md` 加载。可输入 `/review src`，也可让模型调用 `load_skill(name)`。每个 Run 最多一个活动 Skill，正文随检查点保存，压缩后按需补回。首次补齐 review、summarize、orchestrate、init 示例，已有文件不覆盖。
 
 旧 `context.md`、`notes.md` 不再自动读取或迁移；已删除 `note_save`、`/memory` 和 `memory.inspect`。用户维护的 `AGENTS.md` 对内置写入工具只读。Skill 不覆盖基础 system，不扩大工具白名单。
@@ -172,6 +187,29 @@ list_dir / find_files → search_text → get_file_outline / search_symbol → r
 ## 配置与默认参数
 
 默认按“全局 `~/.kama/config.toml` → 项目 `.kama/config.toml` → 环境变量”覆盖；`.env` 不覆盖已有系统环境变量。设置 `KAMA_CONFIG` 时只读取指定 TOML，再应用环境覆盖。解析入口见 [config/](./src/kama_claude/core/config/)。
+
+提供两个完整列出上下文份额的配置，内建默认值采用 256K：
+
+| 配置 | 用途 | 有效窗口 | 摘要触发线 | 近期原文上限 | 单次输出 / 摘要上限 | 摘要软目标上限 |
+|---|---|---:|---:|---:|---:|---:|
+| [context-256k.toml](./configs/context-256k.toml) | 日常代码阅读、修改、验证 | 262,144 | 209,715 | 65,536 | 16,384 / 16,384 | 8,192 |
+| [context-1m.toml](./configs/context-1m.toml) | 需要大量上下文的长任务 | 1,048,576 | 838,860 | 209,715 | 32,768 / 32,768 | 8,192 |
+
+在项目根目录用 PowerShell 选择一个配置，再启动 Core：
+
+```powershell
+# 日常使用
+$env:KAMA_CONFIG = (Resolve-Path .\configs\context-256k.toml).Path
+uv run kama-core
+
+# 停止 Core 后，可切换到长任务配置再启动
+$env:KAMA_CONFIG = (Resolve-Path .\configs\context-1m.toml).Path
+uv run kama-core
+```
+
+绝对的 `KAMA_CONFIG` 路径也可用于从其他工作目录启动 Core。显式选择后不会合并原来的全局或项目 TOML；需要的 MCP 等配置应写入选中的文件，凭据仍通过环境变量提供。`KAMA_COMPACT_*` 等环境变量优先于文件中的值，比较两个配置时应清除不需要的同名覆盖。切换需重启 Core，不会自动切换模型；1M 配置只适用于实际支持该窗口的模型。两档均保留相同的工具输出字符限制，以及约 512 / 1K 的自动记忆和约 10K 的 MCP Schema 额度。
+
+下方展示内建默认值（256K）：
 
 ```toml
 [agent]
@@ -183,13 +221,13 @@ no_progress_limit = 5     # 只读调用模式重复上限；0 关闭，启用�
 
 [compaction]
 auto_threshold = 0.8      # 0 关闭自动摘要，硬预算检查仍生效
-context_window_tokens = 1048576  # 默认按 DeepSeek 官方 1M；其他模型按实际能力配置
-output_reserve_ratio = 0.03125    # 1M 下单次输出最多 32K
+context_window_tokens = 262144   # 日常编码使用 256K；不能超过模型实际窗口
+output_reserve_ratio = 0.0625     # 256K 下单次输出最多 16K
 safety_margin_ratio = 0.02
 keep_recent_turns = 3
-recent_history_ratio = 0.20
-summary_max_ratio = 0.03125       # 摘要硬上限 32K
-summary_target_ratio = 0.0078125  # 摘要软目标最多 8K
+recent_history_ratio = 0.25       # 256K 下近期原文最多 64K
+summary_max_ratio = 0.0625        # 摘要硬上限 16K
+summary_target_ratio = 0.03125    # 摘要软目标最多 8K
 tool_result_limit = 32000        # 固定字符数
 tool_result_keep = 24000
 
@@ -201,17 +239,20 @@ max_total = 6
 timeout_s = 300          # 给用户留出查看命令和编辑内容的时间
 
 [memory]
-global_auto_ratio = 0.0005
-project_index_ratio = 0.001
+global_auto_ratio = 0.002
+project_index_ratio = 0.004
+
+[tool_search]
+max_loaded_schema_ratio = 0.04  # 256K 下约 10K，不会默认注入所有 MCP Schema
 ```
 
 Run 的累计执行时间包含模型、工具和审批等待；恢复不重置原 Run 的预算。普通模型调用、自动摘要与子 Agent 的模型请求纳入整棵树的共享预算，手动压缩单独记用量。
 
-所有上下文额度按 `context_window_tokens × ratio` 即时推导，不另存固定 Token 配置。自动摘要按整个窗口的 80% 触发，`0` 关闭自动摘要但保留硬预算检查；普通输入硬预算扣除 3.125% 输出预留和 2% 安全余量。摘要请求独立扣除 3.125% 摘要输出上限和相同安全余量。窗口仍须按实际模型能力配置。
+所有上下文额度按 `context_window_tokens × ratio` 即时推导，不另存固定 Token 配置。默认将整个有效窗口从 1M 收到 256K，用于日常代码阅读、修改和验证；这是应用层上限，不改变 DeepSeek 服务端支持的最大窗口。模型实际窗口小于该值时还须调小。自动摘要在有效窗口的 80% 触发，`0` 关闭自动摘要但保留硬预算检查；普通输入硬预算扣除 6.25% 输出预留和 2% 安全余量。摘要请求独立扣除 6.25% 摘要输出上限和相同安全余量。软阈值不是强制裁切线，摘要失败但未超过硬预算时仍可继续。
 
-近期原文最多使用窗口的 20%，优先保留最近三轮；固定 system、用户规则、工具定义和自动记忆按实际估算占用扣除，剩余空间不足时进一步缩小近期额度，完整工具配对不可拆开。用户规则不静默截断，放不下会明确失败。
+近期原文最多使用窗口的 25%，优先保留最近三轮；固定 system、用户规则、工具定义和自动记忆按实际估算占用扣除，剩余空间不足时进一步缩小近期额度，完整工具配对不可拆开。用户规则不静默截断，放不下会明确失败。
 
-摘要继续使用六节结构。软目标取“窗口的 0.78125%”与“被摘要旧历史的四分之一”中的较小值；API 上限为窗口的 3.125%，不要求用满。空摘要、截断或缩减不足仍不采用。以 1M 为例：触发线 838860，近期额度最多 209715，摘要软目标最多 8192、输出上限 32768，普通输出预留 32768，安全余量 20972 Token；取整后的个位差异来自向下取整和安全余量向上取整。
+摘要继续使用六节结构。软目标取“窗口的 3.125%”与“被摘要旧历史的四分之一”中的较小值；API 上限为窗口的 6.25%，不要求用满。空摘要、截断或缩减不足仍不采用。以 256K 为例：触发线 209715，近期额度最多 65536，摘要软目标最多 8192、输出上限 16384，普通输出预留 16384，安全余量 5243，普通输入硬预算 240517 Token。256K 是面向日常编码的起始配置，不是行业统一最佳值；长任务确实需要更多原文时，可在模型能力范围内调大有效窗口。窗口缩小后摘要会更早发生，也可能增加摘要请求和历史前缀缓存重建，需结合任务完成率、实际用量和缓存统计评估。
 
 `KAMA_COMPACT_WINDOW_TOKENS` 指定窗口；`KAMA_COMPACT_OUTPUT_RATIO`、`KAMA_COMPACT_SAFETY_RATIO`、`KAMA_COMPACT_RECENT_RATIO`、`KAMA_COMPACT_SUMMARY_RATIO`、`KAMA_COMPACT_SUMMARY_TARGET_RATIO` 覆盖对应比例。自动记忆用 `KAMA_MEMORY_GLOBAL_AUTO_RATIO`、`KAMA_MEMORY_PROJECT_INDEX_RATIO`；MCP 加载额度用 `KAMA_TOOL_SEARCH_MAX_LOADED_SCHEMA_RATIO`。比例必须有限且在 0 与 1 之间，合计必须给固定提示留空间，触发线也须给摘要输出留余量。
 
@@ -223,7 +264,7 @@ Run 的累计执行时间包含模型、工具和审批等待；恢复不重置�
 
 TUI 在每次模型回复旁只显示输入 Token、输出 Token、缓存命中率和回复后的上下文占用。流式阶段使用 Usage 锚点或字节估算，并用 `≈` 标记；结束后改用 API 真实 Usage，输出包含服务端统计的工具参数及思考用量。缓存命中率为“缓存读取 / 总输入”，占用率为“本次总输入＋当前回复输出 / Core 配置窗口”，缓存输入不重复相加。生成期间只能估算已收到的可见文本，未收到的思考与工具参数在最终 Usage 到达后校正；旧累计预算行不再展示，预算记账、停止和重试提示仍保留。
 
-重复失败保护处理连续相同错误；无进展保护检测文件读取、查找、文本搜索及`get_file_outline`、`search_symbol`、`read_symbol`中连续重复且结果不变的调用，支持长度 1～3 的短循环。重复 3 轮时提醒模型改变方法，默认 5 轮时以 `no_progress` 停止本轮；至少等模型看到提醒后的下一 Step 仍重复才停止。同一查询结果变化、写入或其他工具调用会清空观察窗口，子 Agent 等待不纳入此检测。该机制不判断任务语义，其他形式的循环仍依靠 Step、时间及 Token 上限。
+重复失败保护处理连续相同错误；无进展保护检测文件读取、查找、文本搜索及`get_file_outline`、`read_symbol`中连续重复且结果不变的调用，支持长度 1～3 的短循环。重复 3 轮时提醒模型改变方法，默认 5 轮时以 `no_progress` 停止本轮；至少等模型看到提醒后的下一 Step 仍重复才停止。同一查询结果变化、写入或其他工具调用会清空观察窗口，子 Agent 等待不纳入此检测。该机制不判断任务语义，其他形式的循环仍依靠 Step、时间及 Token 上限。
 
 `no_progress_limit` 可通过 `KAMA_AGENT_NO_PROGRESS_LIMIT` 覆盖。限制与指纹随 Run 检查点保存，恢复不重置；新 Run 重新计数，旧 Run 缺少该字段时保持关闭。工具结果未知时不自动重试，仍需用户核实。
 

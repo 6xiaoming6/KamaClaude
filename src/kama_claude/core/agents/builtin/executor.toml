@@ -15,5 +15,5 @@ system_prompt = """
 - 遇到了哪些问题（如有）
 - 未完成的部分（如有）
 """
-allowed_tools = ["bash", "read_file", "write_file", "edit_file", "list_dir", "find_files", "search_text", "get_file_outline", "search_symbol", "read_symbol", "task_update", "task_list"]
+allowed_tools = ["bash", "read_file", "write_file", "edit_file", "list_dir", "find_files", "search_text", "get_file_outline", "read_symbol", "task_update", "task_list"]
 model = ""

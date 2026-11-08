@@ -75,16 +75,16 @@ class ExecutionConfig:
 
 @dataclass
 class CompactionConfig:
-    auto_threshold: float = 0.8  # 请求前按估算输入触发，0 表示关闭自动摘要
+    auto_threshold: float = 0.8  # 请求前按有效窗口的 80% 触发，0 表示关闭自动摘要。
     tool_result_limit: int = 32_000  # 固定字符数，避免普通代码片段过早裁剪。
     tool_result_keep: int = 24_000  # 头尾保留的总字符数
-    context_window_tokens: int = 1_048_576  # 默认按 DeepSeek 官方 1M，其他模型按实际能力配置。
-    output_reserve_ratio: float = 0.03125  # 1M 窗口对应 32K 单次输出。
+    context_window_tokens: int = 262_144  # 日常编码使用 256K 有效窗口，不能超过模型实际能力。
+    output_reserve_ratio: float = 0.0625  # 256K 窗口对应 16K 单次输出。
     safety_margin_ratio: float = 0.02
     keep_recent_turns: int = 3
-    recent_history_ratio: float = 0.20
-    summary_max_ratio: float = 0.03125  # 硬上限为窗口的 3.125%。
-    summary_target_ratio: float = 0.0078125  # 1M 下软目标最多 8K，小历史再按比例缩小。
+    recent_history_ratio: float = 0.25  # 256K 下最多保留 64K 近期原文。
+    summary_max_ratio: float = 0.0625  # 256K 下摘要输出硬上限 16K。
+    summary_target_ratio: float = 0.03125  # 256K 下软目标最多 8K，小历史再按比例缩小。
 
     def __post_init__(self) -> None:
         self.validate()
@@ -156,8 +156,8 @@ class CompactionConfig:
 
 @dataclass
 class MemoryConfig:
-    global_auto_ratio: float = 0.0005
-    project_index_ratio: float = 0.001
+    global_auto_ratio: float = 0.002  # 256K 下约 512 Token，不因窗口缩小而挤掉常驻信息。
+    project_index_ratio: float = 0.004
 
     # 自动入口必须保持有限预算，用户规则不受这两项裁剪。
     def __post_init__(self) -> None:
@@ -172,7 +172,7 @@ class ToolSearchConfig:
     db_path: str = "~/.kama/tool_catalog.sqlite3"
     model_path: str = ""
     top_k: int = 3
-    max_loaded_schema_ratio: float = 0.01
+    max_loaded_schema_ratio: float = 0.04  # 256K 下约 10K，保留多 MCP 工具的加载空间。
 
     def schema_budget(self, window_tokens: int) -> int:
         return max(1, int(window_tokens * self.max_loaded_schema_ratio))

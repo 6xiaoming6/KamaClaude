@@ -10,11 +10,15 @@ from kama_claude.core.tools.errors import ToolError
 from kama_claude.core.tools.files import ReadBudget
 from kama_claude.core.tools.output import fits_result, json_result
 from kama_claude.core.tools.symbols import SourceFile, Symbol, parse_source
+from kama_claude.core.tools.syntax import SUPPORTED_LANGUAGES
 
 
 class ReadSymbolParams(ToolParams):
-    path: str = Field(min_length=1, description="Concrete Python, JS/JSX or TS/TSX file.")
-    name: str = Field(min_length=1, max_length=256, description="Exact simple or qualified name.")
+    path: str = Field(min_length=1, description=f"Concrete {SUPPORTED_LANGUAGES} source file.")
+    name: str = Field(
+        min_length=1, max_length=256,
+        description="Exact simple or returned qualified name; C++/Rust scopes use ::.",
+    )
     max_lines: int = Field(default=200, ge=1, le=2000, description="Maximum source lines per page.")
     start_line: int | None = Field(
         default=None, ge=1,
@@ -32,9 +36,9 @@ class ReadSymbolTool(FileTool):
     params_model = ReadSymbolParams
     input_schema = ReadSymbolParams.model_json_schema()
     description = (
-        "Read the current source of one definition in a concrete Python, JS/JSX or TS/TSX file. "
+        f"Read the current source of one definition in a {SUPPORTED_LANGUAGES} file. "
         "Returns JSON symbol range, file_hash, exact source page and next_start_line. "
-        "Use qualified names from search_symbol/get_file_outline. Ambiguous names return "
+        "Use qualified names from get_file_outline. Ambiguous names return "
         "candidates; pass the definition start_line to select one. Continue with next_start_line "
         "and expected_hash to detect edits between pages. Source lines are never silently cut. "
         "Syntax errors are reported; use read_file for unsupported or oversized source. "

@@ -368,7 +368,7 @@ def test_runner_restore_and_nested_agents_share_workspace(
         registry = loop._tools.registry
         for depth in range(3):
             for name in ("read_file", "write_file", "list_dir", "get_file_outline",
-                         "search_symbol", "read_symbol"):
+                         "read_symbol"):
                 tool = registry.get(name)
                 assert isinstance(tool, FileTool)
                 assert tool.paths.root == root

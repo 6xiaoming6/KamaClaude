@@ -240,7 +240,7 @@ async def test_refreshed_prompt_rechecks_budget_and_anchor(tmp_path: Path) -> No
     estimator.observe(context.run.system_prompt, context.messages, schemas, 1)
     assert estimator.select(context.run.system_prompt, context.messages, schemas).method == "usage_anchor"
     memory = loop._context_manager._memory
-    memory.config.global_auto_ratio = 100_000 / 1_048_576
+    memory.config.global_auto_ratio = 100_000 / CompactionConfig().context_window_tokens
     memory.global_path().write_text("NEW_LARGE_AUTO " * 10_000, encoding="utf-8")
     await loop.run()
     assert context.run.reason == "context_budget_exceeded" and context.run.step == 3

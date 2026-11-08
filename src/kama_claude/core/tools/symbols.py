@@ -1,28 +1,15 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal
 
-import tree_sitter_javascript
-import tree_sitter_python
-import tree_sitter_typescript
-from tree_sitter import Language, Node, Parser
+from tree_sitter import Parser
 
 from kama_claude.core.tools.errors import ToolError
 from kama_claude.core.tools.files import MAX_FILE_BYTES, ReadBudget, check_target
-
-type SymbolKind = Literal["class", "function", "method", "interface", "type", "enum"]
-EXTENSIONS = frozenset({".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"})
-_KINDS: dict[str, SymbolKind] = {
-    "class_definition": "class", "class_declaration": "class",
-    "abstract_class_declaration": "class", "function_definition": "function",
-    "function_declaration": "function", "generator_function_declaration": "function",
-    "method_definition": "method", "method_signature": "method",
-    "abstract_method_signature": "method", "interface_declaration": "interface",
-    "type_alias_declaration": "type", "enum_declaration": "enum",
-}
+from kama_claude.core.tools.syntax import EXTENSIONS, normalized_suffix, syntax_for
+from kama_claude.core.tools.syntax.common import Definition, SymbolKind, qualify
 
 
 @dataclass(frozen=True)
@@ -34,6 +21,7 @@ class Symbol:
     end_line: int
     signature: str
 
+    # 统一工具输出字段，语言差异只体现在名称、签名及源码位置中。
     def record(self, path: str) -> dict[str, object]:
         return {
             "path": path, "name": self.name, "qualified_name": self.qualified_name,
@@ -41,6 +29,7 @@ class Symbol:
             "signature": self.signature,
         }
 
+    # 简单名和工具返回的限定名均可匹配，不推测导入别名或运行时类型。
     def matches(self, name: str, partial: bool = False) -> bool:
         values = (self.name, self.qualified_name)
         return any(name in value for value in values) if partial else name in values
@@ -54,64 +43,33 @@ class SourceFile:
     reason: str | None
 
 
-# Parser 属于一次调用，不在线程之间共享可变解析器或过期语法树。
-def _parser(suffix: str) -> Parser:
-    if suffix == ".py":
-        language = Language(tree_sitter_python.language())
-    elif suffix in {".ts", ".mts", ".cts"}:
-        language = Language(tree_sitter_typescript.language_typescript())
-    elif suffix == ".tsx":
-        language = Language(tree_sitter_typescript.language_tsx())
-    else:
-        language = Language(tree_sitter_javascript.language())
-    return Parser(language)
-
-
-def _text(raw: bytes, node: Node) -> str:
-    return raw[node.start_byte:node.end_byte].decode("utf-8")
-
-
-def _definition(node: Node) -> tuple[Node, SymbolKind] | None:
-    kind = _KINDS.get(node.type)
-    if kind is not None:
-        name = node.child_by_field_name("name")
-        if name is not None:
-            return name, kind
-    if node.type == "variable_declarator":
-        name, value = node.child_by_field_name("name"), node.child_by_field_name("value")
-        if (name is not None and name.type == "identifier" and value is not None
-                and value.type in {"arrow_function", "function_expression", "generator_function"}):
-            return name, "function"
-    return None
-
-
-def _symbol(node: Node, name: Node, kind: SymbolKind, scope: str, raw: bytes) -> Symbol:
-    # 装饰器、export 属于定义的源码范围；签名只取声明，正文不混入大纲。
-    outer = node
-    if node.parent is not None and node.parent.type in {"decorated_definition", "export_statement"}:
-        outer = node.parent
-    body = node.child_by_field_name("body")
-    if node.type == "variable_declarator":
-        value = node.child_by_field_name("value")
-        body = value.child_by_field_name("body") if value is not None else None
+# 源码范围包含装饰器或属性，签名仅截取声明，不混入函数、类型的正文。
+def _symbol(definition: Definition, scope: str, separator: str, raw: bytes) -> Symbol:
+    node, body = definition.node, definition.body
+    outer = definition.outer or node
     stop = body.start_byte if body is not None else node.end_byte
     signature = " ".join(raw[node.start_byte:min(stop, node.start_byte + 1200)]
                          .decode("utf-8", errors="ignore").split())
     if len(signature) > 300 or stop - node.start_byte > 1200:
         signature = signature[:300] + " …"
-    identifier = _text(raw, name)
-    end_line = outer.end_point.row + (1 if outer.end_point.column else 0)
-    return Symbol(identifier, f"{scope}.{identifier}" if scope else identifier, kind,
-                  outer.start_point.row + 1, max(outer.start_point.row + 1, end_line), signature)
+    end = outer if outer.end_byte > node.end_byte else node
+    end_line = end.end_point.row + (1 if end.end_point.column else 0)
+    return Symbol(
+        definition.name, qualify(scope, definition.qualified_name or definition.name, separator),
+        definition.kind, outer.start_point.row + 1,
+        max(outer.start_point.row + 1, end_line), signature,
+    )
 
 
+# 统一校验和有界遍历，语言适配器只识别声明及词法作用域。
 def parse_source(path: Path, budget: ReadBudget) -> SourceFile:
     check_target(path)
     if not path.is_file():
         if not path.exists():
             raise ToolError(f"file not found: {path}", "not_found")
         raise ToolError("path must be a concrete source file")
-    if path.suffix.lower() not in EXTENSIONS:
+    suffix = normalized_suffix(path.suffix)
+    if suffix not in EXTENSIONS:
         raise ToolError("unsupported language; use search_text and read_file", "invalid_operation")
     if not budget.check():
         raise ToolError(budget.reason, "resource_limit")
@@ -137,7 +95,8 @@ def parse_source(path: Path, budget: ReadBudget) -> SourceFile:
         raise ToolError("source is not valid UTF-8") from exc
     # Tree-sitter 的字节偏移必须对应实际送入解析器的 UTF-8 字节。
     source = text.encode("utf-8")
-    tree = _parser(path.suffix.lower()).parse(source)
+    syntax = syntax_for(suffix)
+    tree = Parser(syntax.language).parse(source)
     symbols: list[Symbol] = []
     reason = "parse_error" if tree.root_node.has_error else None
     stack = [(tree.root_node, "", "")]
@@ -148,13 +107,19 @@ def parse_source(path: Path, budget: ReadBudget) -> SourceFile:
         if visited > 50_000 or not budget.check():
             reason = budget.reason or "syntax_nodes_limit"
             break
-        definition = _definition(node)
+        definition = syntax.definition(node, source, owner)
         if definition is not None:
-            name, kind = definition
-            if node.type == "function_definition" and owner == "class":
-                kind = "method"
-            symbol = _symbol(node, name, kind, scope, source)
+            symbol = _symbol(definition, scope, syntax.separator, source)
             symbols.append(symbol)
-            scope, owner = symbol.qualified_name, kind
+            if definition.introduces_scope:
+                scope, owner = symbol.qualified_name, definition.kind
+        if syntax.child_scope is not None:
+            scope, owner = syntax.child_scope(node, source, scope, owner)
         stack.extend((child, scope, owner) for child in reversed(node.named_children))
+    # 同文件已声明的类型可确定类外方法归属；不推测未读取头文件中的类型。
+    classes = {symbol.qualified_name for symbol in symbols if symbol.kind == "class"}
+    symbols = [replace(symbol, kind="method")
+               if symbol.kind == "function"
+               and symbol.qualified_name.rpartition(syntax.separator)[0] in classes
+               else symbol for symbol in symbols]
     return SourceFile(text, hashlib.sha256(raw).hexdigest(), symbols, reason)

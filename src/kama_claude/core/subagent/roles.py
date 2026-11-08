@@ -11,7 +11,7 @@ from kama_claude.core.compact.estimator import estimate_bytes
 # 后台只允许已知的只读工具；Shell、写记忆、继续派生和未知工具均不自动视为只读。
 BACKGROUND_TOOLS = frozenset({
     "read_file", "list_dir", "find_files", "search_text", "memory_read",
-    "get_file_outline", "search_symbol", "read_symbol",
+    "get_file_outline", "read_symbol",
     "task_get", "task_list", "load_skill", "agent_result", "finish",
 })
 

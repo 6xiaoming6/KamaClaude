@@ -1,0 +1,21 @@
+# 日常代码阅读、修改和验证；有效窗口 256K，约 200K 输入触发摘要。
+# 启动前将 KAMA_CONFIG 指向本文件；未列出的设置使用项目内建默认值。
+
+[compaction]
+context_window_tokens = 262144
+auto_threshold = 0.8
+output_reserve_ratio = 0.0625       # 单次输出上限 16K
+safety_margin_ratio = 0.02
+keep_recent_turns = 3
+recent_history_ratio = 0.25        # 近期原文最多 64K
+summary_max_ratio = 0.0625         # 摘要输出上限 16K
+summary_target_ratio = 0.03125     # 摘要软目标最多 8K
+tool_result_limit = 32000          # 固定字符数，不随窗口变化
+tool_result_keep = 24000
+
+[memory]
+global_auto_ratio = 0.002
+project_index_ratio = 0.004
+
+[tool_search]
+max_loaded_schema_ratio = 0.04     # 已加载 MCP Schema 约 10K

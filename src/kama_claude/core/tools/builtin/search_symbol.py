@@ -10,17 +10,21 @@ from kama_claude.core.tools.base import FileTool, ToolParams, ToolResult
 from kama_claude.core.tools.errors import ToolError
 from kama_claude.core.tools.files import ReadBudget
 from kama_claude.core.tools.output import json_result
-from kama_claude.core.tools.symbols import EXTENSIONS, SymbolKind, parse_source
+from kama_claude.core.tools.symbols import parse_source
+from kama_claude.core.tools.syntax import EXTENSIONS, SUPPORTED_LANGUAGES, normalized_suffix
+from kama_claude.core.tools.syntax.common import SymbolKind
 from kama_claude.core.tools.traversal import DirectoryScanner
 from kama_claude.core.workspace import WorkspacePathError
 
 
 class SearchSymbolParams(ToolParams):
     name: str = Field(min_length=1, max_length=256,
-                      description="Case-sensitive simple or qualified name, e.g. Service.handle.")
+                      description="Case-sensitive name, e.g. Service.handle or ns::Store::get.")
     path: str = Field(default=".", min_length=1, description="Directory or concrete source file.")
     match: Literal["exact", "partial"] = Field(default="exact", description="Name matching mode.")
-    kind: SymbolKind | None = Field(default=None, description="Optional definition kind filter.")
+    kind: SymbolKind | None = Field(
+        default=None, description="Kind filter; struct/union = class, Rust trait = interface.",
+    )
     limit: int = Field(default=30, ge=1, le=200, description="Maximum definition records.")
     include_ignored: bool = Field(default=False, description="Include ignored/generated files.")
 
@@ -31,7 +35,7 @@ class SearchSymbolTool(FileTool):
     params_model = SearchSymbolParams
     input_schema = SearchSymbolParams.model_json_schema()
     description = (
-        "Locate Python, JS/JSX and TS/TSX definitions by case-sensitive simple or qualified name. "
+        f"Locate {SUPPORTED_LANGUAGES} definitions by case-sensitive simple or qualified name. "
         "Returns JSON paths, signatures and inclusive line ranges; multiple namesakes are "
         "candidates, not a resolved reference. Use read_symbol on a concrete path and name "
         "(plus its start_line if ambiguous). Does not find usages or resolve imports. "
@@ -56,7 +60,7 @@ class SearchSymbolTool(FileTool):
         reasons: set[str] = set()
         scanned = skipped = unsupported = 0
         for path in files:
-            if directory and path.suffix.lower() not in EXTENSIONS:
+            if directory and normalized_suffix(path.suffix) not in EXTENSIONS:
                 unsupported += 1
                 continue
             try:

@@ -17,24 +17,28 @@ from tests.unit.test_compactor import history, provider
 
 
 @pytest.mark.parametrize("window", [8_192, 65_536, 262_144, 1_048_576])
+# 功能：验证日常编码的软触发线、输出及近期历史额度随模型窗口按比例缩放。
+# 设计：覆盖小窗口到 1M，分别检查软阈值和硬预算，验证所有额度都使用有效窗口。
 def test_all_context_allowances_scale_with_window(window):
     config = CompactionConfig(context_window_tokens=window)
     assert config.trigger_tokens == int(window * 0.8)
-    assert config.output_reserve_tokens == int(window * 0.03125)
-    assert config.recent_token_budget == int(window * 0.2)
-    assert config.summary_max_tokens == int(window * 0.03125)
+    assert config.output_reserve_tokens == int(window * 0.0625)
+    assert config.recent_token_budget == int(window * 0.25)
+    assert config.summary_max_tokens == int(window * 0.0625)
     assert config.safety_margin_tokens == math.ceil(window * 0.02)
     assert config.input_limit == window - config.output_reserve_tokens - config.safety_margin_tokens
     assert config.summary_input_limit == window - config.summary_max_tokens - config.safety_margin_tokens
-    assert config.summary_target_for(window) == int(window * 0.0078125)
+    assert config.summary_target_for(window) == int(window * 0.03125)
 
 
+# 功能：验证窗口变更后重新计算上下文份额，小历史摘要仍不会被扩写。
+# 设计：在同一配置对象上放大窗口，避免只验证构造时一次计算的结果。
 def test_allowances_are_recomputed_not_cached_as_fixed_tokens():
     config = CompactionConfig(context_window_tokens=65_536)
     before = config.output_reserve_tokens
     config.context_window_tokens *= 4
     assert config.output_reserve_tokens == before * 4  # 此比例在所测窗口下可整除。
-    assert config.recent_token_budget == int(config.context_window_tokens * 0.2)
+    assert config.recent_token_budget == int(config.context_window_tokens * 0.25)
     assert config.summary_target_for(400) == 100  # 小历史不因窗口增大而被扩写。
 
 
@@ -111,6 +115,7 @@ def test_memory_uses_the_same_live_window_config(tmp_path):
 
 def test_mcp_budget_is_derived_when_new_run_is_frozen():
     config = KamaConfig()
+    config.tool_search.max_loaded_schema_ratio = 0.01
     config.compaction.context_window_tokens = 65_536
     runner = AgentRunner(config)
     first = runner._new_run_state("goal", "first", ["finish"])

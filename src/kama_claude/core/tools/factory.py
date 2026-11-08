@@ -13,7 +13,6 @@ from kama_claude.core.tools.builtin import (
     ListDirTool,
     ReadFileTool,
     ReadSymbolTool,
-    SearchSymbolTool,
     SearchTextTool,
     TaskCreateTool,
     TaskGetTool,
@@ -31,6 +30,6 @@ def builtin_tools(
         ReadFileTool(workspace, image_support=image_support), BashTool(workspace, execution),
         WriteFileTool(workspace), ListDirTool(workspace),
         FindFilesTool(workspace), SearchTextTool(workspace), EditFileTool(workspace),
-        GetFileOutlineTool(workspace), SearchSymbolTool(workspace), ReadSymbolTool(workspace),
+        GetFileOutlineTool(workspace), ReadSymbolTool(workspace),
         TaskCreateTool(tasks), TaskUpdateTool(tasks), TaskListTool(tasks), TaskGetTool(tasks),
     ]

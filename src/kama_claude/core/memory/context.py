@@ -17,7 +17,7 @@ DEFAULT_SYSTEM = (
     "Read relevant code and project rules before editing. Prefer focused changes that follow "
     "the existing style, and preserve unrelated user modifications. Search before reading large "
     "amounts of code. Use find_files/search_text to locate files, get_file_outline for structure, "
-    "and search_symbol/read_symbol for definitions when available. Partial searches do not prove "
+    "and read_symbol for definition source when available. Partial searches do not prove "
     "that a symbol is absent. Prefer the matching dedicated tool over bash: use file/search/edit "
     "tools for their supported operations, and read_file for supported images instead of scripts "
     "that approximate images as text. Use bash only when available dedicated tools cannot perform "

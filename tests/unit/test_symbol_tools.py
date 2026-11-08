@@ -127,8 +127,8 @@ async def test_syntax_error_is_partial_and_unsupported_is_explicit(tmp_path: Pat
     assert any(s["name"] == "good" for s in parsed["symbols"])
     incomplete = await execute(ReadSymbolTool(tmp_path), {"path": "bad.py", "name": "missing"})
     assert incomplete.error_type == "invalid_operation" and "partial parse" in incomplete.content
-    (tmp_path / "one.go").write_text("package main", encoding="utf-8")
-    result = await execute(GetFileOutlineTool(tmp_path), {"path": "one.go"})
+    (tmp_path / "one.rb").write_text("class Service; end", encoding="utf-8")
+    result = await execute(GetFileOutlineTool(tmp_path), {"path": "one.rb"})
     assert result.error_type == "invalid_operation" and "search_text" in result.content
     result = await execute(GetFileOutlineTool(tmp_path), {"path": "missing.py"})
     assert result.error_type == "not_found"
@@ -256,9 +256,12 @@ async def test_search_skips_directory_links(tmp_path: Path) -> None:
         unlink_directory(link)
 
 
+# 功能：验证默认注册保留大纲和符号阅读，不再暴露符号搜索。
+# 设计：检查主子 Agent 共用工厂及后台清单，避免仅修改单个调用入口。
 def test_shared_registration_and_background_capabilities(tmp_path: Path) -> None:
     tools = {tool.name: tool for tool in builtin_tools(tmp_path, ExecutionConfig(), TaskManager(tmp_path))}
-    for name in ("get_file_outline", "search_symbol", "read_symbol"):
+    assert "search_symbol" not in tools and "search_symbol" not in BACKGROUND_TOOLS
+    for name in ("get_file_outline", "read_symbol"):
         assert name in tools and name in BACKGROUND_TOOLS
         assert isinstance(tools[name], BaseTool)
 

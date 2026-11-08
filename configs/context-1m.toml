@@ -1,0 +1,21 @@
+# 大型仓库或长程任务；模型必须实际支持 1M，约 800K 输入触发摘要。
+# 启动前将 KAMA_CONFIG 指向本文件；未列出的设置使用项目内建默认值。
+
+[compaction]
+context_window_tokens = 1048576
+auto_threshold = 0.8
+output_reserve_ratio = 0.03125      # 单次输出上限 32K
+safety_margin_ratio = 0.02
+keep_recent_turns = 3
+recent_history_ratio = 0.20        # 近期原文最多约 200K
+summary_max_ratio = 0.03125        # 摘要输出上限 32K
+summary_target_ratio = 0.0078125   # 摘要软目标最多 8K
+tool_result_limit = 32000          # 与 256K 配置保持相同字符限制
+tool_result_keep = 24000
+
+[memory]
+global_auto_ratio = 0.0005
+project_index_ratio = 0.001
+
+[tool_search]
+max_loaded_schema_ratio = 0.01     # 已加载 MCP Schema 约 10K

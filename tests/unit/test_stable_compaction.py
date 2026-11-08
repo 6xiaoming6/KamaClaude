@@ -173,7 +173,7 @@ async def test_old_references_drop_and_required_reference_returns(tmp_path: Path
     _, loaded = validate_candidate(run, result, None, config, TokenEstimator())
     assert loaded == ["remote__get_issue"]
     # 引用展开后的定义计入近期额度，不能用短引用掩盖真实占用。
-    too_small = CompactionConfig(keep_recent_turns=1, recent_history_ratio=(100) / (1_048_576))
+    too_small = CompactionConfig(context_window_tokens=1_048_576, keep_recent_turns=1, recent_history_ratio=(100) / (1_048_576))
     model = provider()
     rejected = await Compactor(too_small).compact_messages(
         [*messages, latest, call, answer], model, tool_schemas=schemas,
@@ -288,7 +288,8 @@ def test_refreshed_memory_cannot_erase_required_savings(tmp_path: Path) -> None:
     from kama_claude.core.config import MemoryConfig
 
     run = fresh_run(tmp_path)
-    memory = MemoryStore(tmp_path, MemoryConfig(global_auto_ratio=2000 / 1_048_576))
+    memory = MemoryStore(tmp_path, MemoryConfig(global_auto_ratio=2000 / 1_048_576),
+                         context_budget=CompactionConfig(context_window_tokens=1_048_576))
     memory.home.mkdir(parents=True)
     initialize_prompt(run, memory, "BASE")
     before_memory = run.memory_snapshot.model_copy(deep=True)

@@ -28,6 +28,7 @@ def make_loop(
 ) -> tuple[AgentLoop, ExecutionContext, list[Any]]:
     config = config or CompactionConfig(
         context_window_tokens=8_192, output_reserve_ratio=(512) / (8_192),
+        recent_history_ratio=0.2,  # 小窗口用例固定保留额度，避免日常默认值改变故障注入位置。
         summary_max_ratio=(256) / (8_192), summary_target_ratio=(256) / (2 * (8_192)), auto_threshold=0.1,
         tool_result_limit=8_000, tool_result_keep=4_000,  # 小窗口故障测试显式使用小预览。
     )
