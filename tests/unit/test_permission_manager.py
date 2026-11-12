@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from kama_claude.core.config import ExecutionConfig
 from kama_claude.core.permissions.bash import CommandRule
 from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.permissions.policy import PermissionDecision, ToolPolicy
@@ -346,7 +347,7 @@ async def test_bash_approval_uses_actual_tool_directory(tmp_path: Path) -> None:
         root = tmp_path / name
         root.mkdir(exist_ok=True)
         registry = ToolRegistry()
-        registry.register(BashTool(root))
+        registry.register(BashTool(root, ExecutionConfig(backend="host")))
         result = await invoke_tool(
             registry, ToolCallBlock("same", "bash", {"command": "echo hello"}), bus, "r",
             session_id="s", permission_manager=permissions, workspace=tmp_path,

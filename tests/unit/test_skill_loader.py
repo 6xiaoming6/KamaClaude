@@ -7,7 +7,8 @@ from pathlib import Path
 import pytest
 
 from kama_claude.core.compact.estimator import estimate_bytes
-from kama_claude.core.skills.loader import BODY_TOKENS, CATALOG_TOKENS, SkillLoader, render_catalog
+from kama_claude.core.skills.context import render_catalog
+from kama_claude.core.skills.loader import BODY_TOKENS, CATALOG_TOKENS, SkillLoader
 from kama_claude.core.skills.model import SkillError
 
 
@@ -25,7 +26,7 @@ def test_examples_only_seed_global_directory_and_never_overwrite(tmp_path: Path)
     assert loader.root == (Path.home() / ".kama" / "skills").resolve()
     loader.ensure_examples()
     assert loader.load("review").body == "MY_REVIEW"
-    assert {entry.name for entry in loader.list_all_skills()} == {"review", "init", "summarize", "orchestrate"}
+    assert {entry.name for entry in loader.list_all_skills()} == {"review", "init", "summarize", "orchestrate", "github-issue-fix"}
     before = custom.read_bytes()
     loader.ensure_examples()
     assert custom.read_bytes() == before
@@ -36,7 +37,7 @@ def test_concurrent_bootstrap_is_complete(tmp_path: Path) -> None:
     root = tmp_path / "skills"
     with ThreadPoolExecutor(max_workers=4) as pool:
         list(pool.map(lambda _: SkillLoader(root).ensure_examples(), range(8)))
-    assert len(SkillLoader(root).list_all_skills()) == 4
+    assert len(SkillLoader(root).list_all_skills()) == 5
     assert not list(root.glob("*/.skill-*"))
 
 
@@ -129,3 +130,71 @@ def test_deleted_example_is_not_regenerated_after_first_initialization(tmp_path:
     assert "review" not in {entry.name for entry in loader.list_all_skills()}
     with pytest.raises(SkillError, match="cannot read"):
         loader.load("review")
+
+
+# 功能：验证旧空标记用户能获得新增 Skill，删改过的旧示例保持原样。
+# 设计：模拟升级前已初始化的真实目录，而非只测试首次安装的空目录。
+def test_legacy_initialization_adds_issue_skill_without_restoring_old_examples(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    review = write_skill(root, "review", "USER_REVIEW")
+    (root / ".examples-initialized").touch()
+    loader = SkillLoader(root)
+    snapshot = loader.load("github-issue-fix")
+    assert snapshot.name == "github-issue-fix"
+    assert estimate_bytes(snapshot.body) <= BODY_TOKENS
+    assert review.read_text(encoding="utf-8").endswith("USER_REVIEW\n")
+    assert not (root / "summarize").exists()
+    marker = (root / ".examples-initialized").read_text(encoding="utf-8")
+    assert "github-issue-fix" in marker.splitlines()
+    (root / "github-issue-fix" / "SKILL.md").unlink()
+    assert "github-issue-fix" not in {entry.name for entry in loader.list_all_skills()}
+
+
+# 功能：验证新增内置 Skill 与用户同名文件共存时不覆盖用户正文。
+# 设计：覆盖升级补齐的名称冲突，随后删除也不能被下一次加载恢复。
+def test_upgrade_keeps_custom_issue_skill_and_honors_later_deletion(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    custom = write_skill(root, "github-issue-fix", "MY_ISSUE_WORKFLOW")
+    (root / ".examples-initialized").touch()
+    loader = SkillLoader(root)
+    assert loader.load("github-issue-fix").body == "MY_ISSUE_WORKFLOW"
+    custom.unlink()
+    with pytest.raises(SkillError, match="cannot read"):
+        loader.load("github-issue-fix")
+
+
+# 功能：验证补齐标记提交失败会报错，重试不会覆盖已安装或用户编辑的 Skill。
+# 设计：只注入原子替换故障，检查无半份标记和临时残留，并真实重试读取。
+def test_initialization_record_failure_is_retryable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "skills"
+    loader = SkillLoader(root)
+    with monkeypatch.context() as patch:
+        patch.setattr("kama_claude.core.skills.loader.os.replace",
+                      lambda *args: (_ for _ in ()).throw(OSError("disk full")))
+        with pytest.raises(SkillError, match="cannot record"):
+            loader.ensure_examples()
+    assert not (root / ".examples-initialized").exists()
+    assert not list(root.glob(".examples-*"))
+    write_skill(root, "github-issue-fix", "EDITED_AFTER_FAILURE")
+    assert loader.load("github-issue-fix").body == "EDITED_AFTER_FAILURE"
+    assert len(loader.list_all_skills()) == 5
+
+
+# 功能：验证 Windows 标记文件短暂共享冲突可有界重试，内容仍完整且不覆盖 Skill。
+# 设计：在原子替换处仅注入一次 PermissionError，再真实完成文件替换。
+def test_initialization_record_retries_transient_sharing_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    replace = os.replace
+    attempts = []
+
+    # 首次模拟并发读取占用，之后使用真实系统调用。
+    def busy_once(source, destination):
+        attempts.append(destination)
+        if len(attempts) == 1:
+            raise PermissionError("sharing violation")
+        replace(source, destination)
+
+    monkeypatch.setattr("kama_claude.core.skills.loader.os.replace", busy_once)
+    loader = SkillLoader(tmp_path / "skills")
+    assert len(loader.list_all_skills()) == 5
+    assert len(attempts) == 2
+    assert {p.name for p in loader.root.glob(".examples-*")} == {".examples-initialized"}

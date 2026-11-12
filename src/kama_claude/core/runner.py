@@ -25,6 +25,9 @@ from kama_claude.core.discovery.model import digest
 from kama_claude.core.discovery.tool import SearchTool
 from kama_claude.core.events.bus import EventBus, EventHandler
 from kama_claude.core.events.writer import EventWriter
+from kama_claude.core.execution.factory import create_executor
+from kama_claude.core.execution.model import CommandBackend, execution_for_run, snapshot_execution
+from kama_claude.core.execution.owner import SandboxOwner
 from kama_claude.core.llm.base import LLMProvider
 from kama_claude.core.llm.factory import ProviderFactory
 from kama_claude.core.llm.images import supports_images
@@ -86,6 +89,7 @@ class AgentRunner:
         permission_manager: PermissionManager | None = None,
         mcp_manager: McpServerManager | None = None,
         task_registry: BackgroundTaskRegistry | None = None,
+        sandbox_owner: SandboxOwner | None = None,
     ) -> None:
         self._config = config
         self._bus = bus  # 现在事件总线放到了core里面，所有事件
@@ -97,6 +101,7 @@ class AgentRunner:
         self._runs_dir = runs_dir or RUNS_DIR
         self._permission_manager = permission_manager
         self._mcp_manager = mcp_manager
+        self._sandbox_owner = sandbox_owner or SandboxOwner()
         # Core 注入跨 Run 注册表；独立 Runner 使用自己的注册表
         self._task_registry = (
             task_registry if task_registry is not None else BackgroundTaskRegistry()
@@ -120,6 +125,7 @@ class AgentRunner:
         run: RunCheckpoint | None = None,
         budget: RunBudget | None = None,
         stop_event: asyncio.Event | None = None,
+        command_executor: CommandBackend | None = None,
     ) -> ToolRegistry:
         allowed: set[str] | None = set(tool_whitelist) if tool_whitelist is not None else None
 
@@ -130,8 +136,13 @@ class AgentRunner:
         registry = ToolRegistry()
         workspace = workspace if workspace is not None else Path.cwd()
         provider_name, model = (run.provider, run.model) if run else self._providers.identity()
-        for tool in builtin_tools(workspace, self._config.execution, task_manager,
-                                  image_support=supports_images(provider_name, model)):
+        execution = (
+            execution_for_run(run, self._config.execution) if run else self._config.execution
+        )
+        for tool in builtin_tools(
+            workspace, execution, task_manager,
+            image_support=supports_images(provider_name, model), command_executor=command_executor,
+        ):
             if _ok(tool.name):
                 registry.register(tool)
         memory = MemoryStore(
@@ -190,7 +201,7 @@ class AgentRunner:
                         session_id=session_id,
                         depth=0,
                         workspace=workspace,
-                        execution=self._config.execution,
+                        execution=execution, sandbox_owner=self._sandbox_owner,
                         agent_config=limits, compaction=self._config.compaction,
                         memory_config=self._config.memory,
                         memory_project_root=memory.project_root,
@@ -307,9 +318,15 @@ class AgentRunner:
 
                 # 和 S7 一样，在主流程中组装并运行 Loop，直接看见异常处理边界
                 cancelled = False
+                execution = create_executor(
+                    Path(context.run.workspace),
+                    execution_for_run(context.run, self._config.execution),
+                    run_id=context.run.run_id, owner=self._sandbox_owner, bus=bus,
+                )
                 try:
                     loop = self._build_loop(
                         context, bus, run_path, persistence, resuming=resuming, subagents=subagents,
+                        command_executor=execution,
                     )
                     await loop.run()
                 except CheckpointError:
@@ -347,14 +364,17 @@ class AgentRunner:
                         context.mark_failed(reason)
                 finally:
                     # 子任务只服务本轮，父任务退出后不能遗留无人接收的后台执行。
-                    if context.run.reason == "user_stopped":
-                        await self._task_registry.wait_children(
-                            context.run.run_id, session.id if session else "",
-                        )
-                    else:
-                        await self._task_registry.cancel_children(
-                            context.run.run_id, session.id if session else "",
-                        )
+                    try:
+                        if context.run.reason == "user_stopped":
+                            await self._task_registry.wait_children(
+                                context.run.run_id, session.id if session else "",
+                            )
+                        else:
+                            await self._task_registry.cancel_children(
+                                context.run.run_id, session.id if session else "",
+                            )
+                    finally:
+                        await execution.aclose()
                 # 没有异常的话就是正常执行完一次agent loop，调用该方法收尾
                 return await self._finish_run(context, bus, persistence, cancelled=cancelled)
 
@@ -412,6 +432,7 @@ class AgentRunner:
     ) -> RunCheckpoint:
         provider, model = self._providers.identity()
         return RunCheckpoint(
+            execution=snapshot_execution(self._config.execution),
             run_id=run_id, goal=goal, provider=provider, model=model, completion_mode="explicit",
             skill_catalog=(SkillLoader().list_all_skills()
                            if tool_whitelist is None or "load_skill" in tool_whitelist else []),
@@ -467,6 +488,7 @@ class AgentRunner:
         *,
         resuming: bool,
         subagents: SubagentTracker | None = None,
+        command_executor: CommandBackend | None = None,
     ) -> AgentLoop:
         task_manager = TaskManager(run_path / ".tasks")
         provider = self._providers.create(context.run, resuming=resuming)
@@ -487,6 +509,7 @@ class AgentRunner:
             workspace=Path(context.run.workspace),
             run=context.run,
             budget=budget,
+            command_executor=command_executor,
         )
         if resuming and context.run.schemas_frozen:
             # 恢复只暴露原清单，新工具不能悄悄改变旧 Run 的工具范围

@@ -7,6 +7,7 @@ import pytest
 from pydantic import BaseModel
 
 from kama_claude.core.checkpoint.checkpoint import CheckpointError
+from kama_claude.core.config import ExecutionConfig
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import ToolCallBlock
 from kama_claude.core.permissions.bash import CommandRule
@@ -21,7 +22,7 @@ from kama_claude.core.tools.registry import ToolRegistry
 class CountingBash(BashTool):
     # 记录真正执行次数，其他行为仍走本机实际 Shell。
     def __init__(self, workspace: Path) -> None:
-        super().__init__(workspace)
+        super().__init__(workspace, ExecutionConfig(backend="host"))
         self.calls = 0
 
     # 执行真实无副作用的 echo，验证解析只审批而不改写命令。

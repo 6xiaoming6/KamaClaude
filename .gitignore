@@ -23,3 +23,5 @@ uv.lock
 /docs/*
 !/docs/interview/
 !/docs/S8-二次开发改进大纲.md
+!/docs/GitHub-Issue-Fix-Skill.md
+!/docs/Docker-Run-Sandbox.md

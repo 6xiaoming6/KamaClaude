@@ -67,10 +67,13 @@ class PermissionManager:
         self.session_premission_modes[session_id] = PermissionMode(mode)
 
     # 查询静态禁止与默认策略，不读取会话文件授权。
-    def evaluate(self, tool_name: str, params: dict[str, Any]) -> PermissionDecision:
+    def evaluate(
+        self, tool_name: str, params: dict[str, Any], *, command_platform: str | None = None,
+    ) -> PermissionDecision:
         if self._is_persistently_denied(tool_name, params):
             return PermissionDecision.DENY
-        return assess(tool_name, params, self._policies.get(tool_name)).decision
+        return assess(tool_name, params, self._policies.get(tool_name),
+                      command_platform=command_platform).decision
 
     # 旧策略只继续保留明确拒绝，不重新启用工具级永久允许。
     def _is_persistently_denied(self, tool_name: str, params: dict[str, Any]) -> bool:
@@ -85,11 +88,13 @@ class PermissionManager:
         event_emitter: Callable[[dict[str, Any]], Awaitable[None]],
         path_access: PathAccess | None = None, *, run_id: str = "",
         workspace: Path | None = None,
+        command_platform: str | None = None, execution_context: str = "",
     ) -> tuple[bool, str]:
         params = deepcopy(params)
         assessment = assess(
             tool_name, params, self._policies.get(tool_name), path_access=path_access,
             mode=self.get_mode(session_id),
+            command_platform=command_platform,
         )
         if (
             assessment.decision == PermissionDecision.DENY
@@ -130,7 +135,8 @@ class PermissionManager:
             "run_id": run_id, "session_id": session_id,
             "tool_use_id": tool_use_id, "tool_name": tool_name,
             "params": params, "param_preview": param_preview(tool_name, params),
-            "workspace": str(root.resolve()), "reason": assessment.reason,
+            "workspace": str(root.resolve()),
+            "reason": assessment.reason + (f"；{execution_context}" if execution_context else ""),
             "approval_scope": description,
             "allowed_decisions": list(decisions),
             "ts": datetime.now(UTC).isoformat(),
@@ -151,7 +157,9 @@ class PermissionManager:
             if request_id not in self._pending:
                 return False, "deny_once"  # 会话已关闭，即使回答先到达也不能重新授予权限。
             # 等待期间策略可能被收紧，已有回答不能覆盖新的硬性禁止。
-            if self.evaluate(tool_name, params) == PermissionDecision.DENY:
+            if self.evaluate(
+                tool_name, params, command_platform=command_platform,
+            ) == PermissionDecision.DENY:
                 return False, "auto_deny"
             allowed = raw in {"allow_once", "always_allow"}
             if file_key is not None and raw == "always_allow":

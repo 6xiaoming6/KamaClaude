@@ -9,6 +9,7 @@ from typing import Any, Literal, Self
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
+from kama_claude.core.execution.model import ExecutionSnapshot
 from kama_claude.core.memory.model import MemorySnapshot
 from kama_claude.core.progress import ProgressState, validate_progress_limit
 from kama_claude.core.skills.model import SkillEntry, SkillSnapshot
@@ -47,6 +48,7 @@ class SubagentNotification(BaseModel):
 # 一次 Run 的检查点：目标、当前步骤和状态
 # 保存恢复阶段，以及当前工具批次应该从哪里继续
 class RunCheckpoint(BaseModel):
+    execution: ExecutionSnapshot | None = None
     run_id: str
     goal: str
     model: str

@@ -18,7 +18,7 @@ from kama_claude.core.permissions.policy import PermissionDecision, ToolPolicy
 from kama_claude.core.runner import AgentRunner
 from kama_claude.core.session.manager import SessionManager
 from kama_claude.core.session.store import SessionStore
-from kama_claude.core.skills.context import render_skill, retain_skill
+from kama_claude.core.skills.context import render_catalog, render_skill, retain_skill
 from kama_claude.core.skills.loader import SkillLoader
 from kama_claude.core.skills.tool import LoadSkillParams, LoadSkillTool
 from tests.unit.test_checkpoint_recovery import Crash, Provider, finish
@@ -82,20 +82,26 @@ async def test_skill_is_not_truncated_by_normal_output_limit(tmp_path: Path) -> 
     assert not (tmp_path / "outputs").exists()
 
 
-async def test_explicit_skill_keeps_system_original_user_and_tools(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("skill_name", ["review", "github-issue-fix"])
+# 功能：验证显式调用 Issue Skill 保留基础提示、原始用户输入及工具权限。
+# 设计：与原 review 共用真实 Manager 链路，避免只验证 Markdown 能被解析。
+async def test_explicit_skill_keeps_system_original_user_and_tools(tmp_path: Path, monkeypatch, skill_name: str) -> None:
     monkeypatch.chdir(tmp_path)
     model = Provider([LlmResponse("end_turn", text="review done"), LlmResponse("end_turn", text="next")])
     store, manager = setup(tmp_path, model)
     session = await manager.create("chat")
-    await manager.send_message(session.id, "/review src")
+    command = f"/{skill_name} src"
+    await manager.send_message(session.id, command)
     cp = store.checkpoints.load(session.id)
-    assert cp.run.goal == cp.run.user_input == "/review src"
-    assert cp.run.tool_whitelist is None and cp.run.active_skill.name == "review"
+    assert cp.run.goal == cp.run.user_input == command
+    assert cp.run.tool_whitelist is None and cp.run.active_skill.name == skill_name
     assert {s["name"] for s in cp.run.tool_schemas} >= {"write_file", "load_skill", "memory_read"}
     assert cp.run.active_skill.body not in model.calls[0]["system"]
     assert "Coding Agent" in model.calls[0]["system"]
+    catalog = render_catalog(cp.run.skill_catalog)
+    assert model.calls[0]["system"].count(catalog) == 1
     assert any(m.get("content") == render_skill(cp.run.active_skill) for m in model.calls[0]["messages"])
-    assert store.read_history(session.id)[0] == {"role": "user", "content": "/review src"}
+    assert store.read_history(session.id)[0] == {"role": "user", "content": command}
     assert len(store.read_history(session.id)) == 3
     assert sum(is_user_request(message) for message in cp.messages) == 1
     await manager.send_message(session.id, "new task")
@@ -113,19 +119,28 @@ async def test_unknown_or_invalid_skill_leaves_session_unmodified(tmp_path: Path
     assert not manager.is_running(session.id)
 
 
-async def test_automatic_load_saves_body_snapshot_and_full_history(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("skill_name", ["review", "github-issue-fix"])
+# 功能：验证模型按名称加载 Issue Skill 后，正文和快照进入既有持久化链路。
+# 设计：真实执行 load_skill 工具，确认不会替换 system 或插入伪用户轮次。
+async def test_automatic_load_saves_body_snapshot_and_full_history(tmp_path: Path, monkeypatch, skill_name: str) -> None:
     monkeypatch.chdir(tmp_path)
     model = Provider([
-        LlmResponse("tool_use", tool_calls=[ToolCallBlock("load", "load_skill", {"name": "review"})]),
+        LlmResponse("tool_use", tool_calls=[ToolCallBlock("load", "load_skill", {"name": skill_name})]),
         LlmResponse("end_turn", text="done"),
     ])
     store, manager = setup(tmp_path, model)
     session = await manager.create("chat")
     await manager.send_message(session.id, "review the code")
     cp = store.checkpoints.load(session.id)
-    assert cp.run.active_skill.name == "review"
+    assert cp.run.active_skill.name == skill_name
     assert cp.run.tool_whitelist is None
     assert model.calls[0]["system"] == model.calls[1]["system"]
+    catalog = render_catalog(cp.run.skill_catalog)
+    assert model.calls[0]["system"].count(catalog) == 1
+    assert cp.run.active_skill.body not in model.calls[0]["system"]
+    schema = next(s for s in cp.run.tool_schemas if s["name"] == "load_skill")
+    assert catalog not in schema["description"]
+    assert all(f"- {entry.name}:" not in schema["description"] for entry in cp.run.skill_catalog)
     assert render_skill(cp.run.active_skill) == model.calls[1]["messages"][-1]["content"][0]["content"]
     assert sum(is_user_request(m) for m in cp.messages) == 1
     assert store.read_history(session.id)[2]["content"][0]["content"] == render_skill(cp.run.active_skill)
@@ -217,6 +232,7 @@ async def test_compaction_carries_skill_once_without_loading_again(tmp_path: Pat
     assert store.read_history(session.id) == original_thread
     assert sum(is_user_request(m) for m in saved.messages) == 3
     assert saved.run.system_prompt == cp.run.system_prompt
+    assert saved.run.system_prompt.count(render_catalog(saved.run.skill_catalog)) == 1
 
 
 async def test_retention_reuses_existing_tool_result(tmp_path: Path) -> None:
@@ -233,11 +249,56 @@ async def test_child_skills_respect_parent_and_role_whitelists(tmp_path: Path) -
     delegated = spawn_tool(tmp_path, model, tool_whitelist=["load_skill"])
     result = await delegated.invoke({"description": "review", "prompt": "review code"})
     assert not result.is_error
+    assert "## Available skills" in model.calls[0]["system"]
+    assert "- review:" in model.calls[0]["system"]
+    load_schema = next(s for s in model.calls[0]["tool_schemas"] if s["name"] == "load_skill")
+    assert "- review:" not in load_schema["description"]
     assert model.calls[1]["messages"][2]["content"][0]["content"] == render_skill(SkillLoader().load("review"))
-    restricted = spawn_tool(tmp_path, ChildProvider(), tool_whitelist=["read_file"])
+    restricted_model = ChildProvider()
+    restricted = spawn_tool(tmp_path, restricted_model, tool_whitelist=["read_file"])
     run = run_state(tmp_path)
     registry = restricted._build_child_registry(EventBus(), "child", None, run=run)
     assert registry.get("load_skill") is None and run.skill_catalog == []
+    assert not (await restricted.invoke({"description": "read", "prompt": "inspect code"})).is_error
+    assert "## Available skills" not in restricted_model.calls[0]["system"]
+    assert "## Command execution environment" not in restricted_model.calls[0]["system"]
+
+
+# 功能：验证目录更新只影响下一 Run，工具定义不随可用 Skill 内容变化。
+# 设计：用真实 Manager 连续运行两次并修改全局描述，比较冻结 system 和实际 Schema。
+async def test_catalog_changes_update_next_prompt_without_changing_tool_schema(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    loader = SkillLoader()
+    write_skill(loader.root, "custom", description="ORIGINAL_SKILL_DESCRIPTION")
+    model = Provider([LlmResponse("end_turn", text="first"), LlmResponse("end_turn", text="second")])
+    store, manager = setup(tmp_path, model)
+    session = await manager.create("chat")
+    await manager.send_message(session.id, "first task")
+    first = store.checkpoints.load(session.id)
+    first_schema = next(s for s in first.run.tool_schemas if s["name"] == "load_skill")
+    assert "- custom: ORIGINAL_SKILL_DESCRIPTION" in first.run.system_prompt
+    write_skill(loader.root, "custom", description="UPDATED_SKILL_DESCRIPTION")
+    assert "UPDATED_SKILL_DESCRIPTION" not in first.run.system_prompt
+    await manager.send_message(session.id, "second task")
+    second = store.checkpoints.load(session.id)
+    second_schema = next(s for s in second.run.tool_schemas if s["name"] == "load_skill")
+    assert "- custom: UPDATED_SKILL_DESCRIPTION" in second.run.system_prompt
+    assert "ORIGINAL_SKILL_DESCRIPTION" not in second.run.system_prompt
+    assert first_schema == second_schema
+    assert "UPDATED_SKILL_DESCRIPTION" not in second_schema["description"]
+
+
+# 功能：验证没有加载工具权限的主 Agent 不显示无法使用的 Skill 目录。
+# 设计：通过真实 Runner 白名单执行请求，检查模型最终拿到的 system。
+async def test_restricted_runner_omits_skill_catalog(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    model = Provider([LlmResponse("end_turn", text="done")])
+    outcome = await AgentRunner(KamaConfig(), provider=model).run_and_capture(
+        "answer only", tool_whitelist=["finish"],
+    )
+    assert outcome.status == "success"
+    assert "## Available skills" not in model.calls[0]["system"]
+    assert "## Command execution environment" not in model.calls[0]["system"]
 
 
 def test_tui_lists_global_skills(tmp_path: Path, monkeypatch) -> None:

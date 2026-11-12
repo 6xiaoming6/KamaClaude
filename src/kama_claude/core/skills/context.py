@@ -2,9 +2,25 @@ from __future__ import annotations
 
 from typing import Any
 
-from kama_claude.core.skills.model import SkillSnapshot
+from kama_claude.core.skills.model import SkillEntry, SkillSnapshot
 
 SKILL_MARKER = "[KamaClaude skill instructions: "
+
+
+# 目录只列名称和简短说明；作为冻结提示的一部分，正文仍需按名称加载。
+def render_catalog(entries: list[SkillEntry]) -> str:
+    if not entries:
+        return ""
+    listing = "\n".join(
+        f"- {entry.name}: {' '.join(entry.description.split())}" for entry in entries
+    )
+    return (
+        "\n\n## Available skills\n"
+        "When the task matches a skill below, first call load_skill with its name to read "
+        "the full workflow before doing the relevant work. Load only when needed; "
+        "one skill per Run. Skills do not grant tools or permissions.\n"
+        + listing
+    )
 
 
 def render_skill(snapshot: SkillSnapshot) -> str:

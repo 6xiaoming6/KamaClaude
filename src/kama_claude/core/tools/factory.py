@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from kama_claude.core.config import ExecutionConfig
+from kama_claude.core.execution.model import CommandBackend
 from kama_claude.core.task.manager import TaskManager
 from kama_claude.core.tools.base import BaseTool
 from kama_claude.core.tools.builtin import (
@@ -25,9 +26,11 @@ from kama_claude.core.tools.builtin import (
 # 这里只列出共同工具；记忆、MCP、子任务及白名单仍由各自装配处明确处理。
 def builtin_tools(
     workspace: Path, execution: ExecutionConfig, tasks: TaskManager, *, image_support: bool = True,
+    command_executor: CommandBackend | None = None,
 ) -> list[BaseTool]:
     return [
-        ReadFileTool(workspace, image_support=image_support), BashTool(workspace, execution),
+        ReadFileTool(workspace, image_support=image_support),
+        BashTool(workspace, execution, executor=command_executor),
         WriteFileTool(workspace), ListDirTool(workspace),
         FindFilesTool(workspace), SearchTextTool(workspace), EditFileTool(workspace),
         GetFileOutlineTool(workspace), ReadSymbolTool(workspace),

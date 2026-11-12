@@ -2,6 +2,7 @@ from kama_claude.core.config.loader import get_config
 from kama_claude.core.config.models import (
     AgentConfig,
     CompactionConfig,
+    DockerConfig,
     ExecutionConfig,
     KamaConfig,
     LlmConfig,
@@ -24,6 +25,7 @@ __all__ = [
     "TraceConfig",
     "PermissionConfig",
     "ExecutionConfig",
+    "DockerConfig",
     "CompactionConfig",
     "MemoryConfig",
     "McpServerConfig",

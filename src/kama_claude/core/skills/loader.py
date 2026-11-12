@@ -4,16 +4,20 @@ import hashlib
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
 
 import yaml
 from pydantic import ValidationError
 
 from kama_claude.core.compact.estimator import estimate_bytes
+from kama_claude.core.skills.context import render_catalog
 from kama_claude.core.skills.model import NAME_PATTERN, SkillEntry, SkillError, SkillSnapshot
 
 CATALOG_TOKENS = 2_048
 BODY_TOKENS = 4_000
+# 旧版空标记代表这四个示例已处理，升级时也不恢复用户主动删除的旧示例。
+LEGACY_EXAMPLES = {"review", "summarize", "orchestrate", "init"}
 
 
 def _resolved(path: Path) -> Path:
@@ -28,7 +32,7 @@ def _resolved(path: Path) -> Path:
 
 
 class SkillLoader:
-    # 运行时唯一目录；包内文件只作为首次补齐的示例源。
+    # 运行时唯一目录；包内文件只供安装或升级时补齐示例，不参与运行时查找。
     def __init__(self, root: Path | None = None) -> None:
         self.root = _resolved((root or Path.home() / ".kama" / "skills").expanduser())
 
@@ -43,12 +47,22 @@ class SkillLoader:
         except (OSError, RuntimeError) as exc:
             raise SkillError(f"cannot resolve skill {name}: {exc}") from exc
 
+    # 按名称记录已补齐的内置示例，升级只安装新项，不覆盖或恢复用户删改内容。
     def ensure_examples(self) -> None:
         marker = self.root / ".examples-initialized"
-        if os.path.lexists(marker):
+        try:
+            recorded = marker.read_text(encoding="utf-8")
+            initialized = set(recorded.splitlines()) if recorded.strip() else LEGACY_EXAMPLES
+        except FileNotFoundError:
+            initialized = set()
+        except (OSError, UnicodeError) as exc:
+            raise SkillError(f"cannot read skill initialization: {exc}") from exc
+        sources = sorted((Path(__file__).parent / "builtin").glob("*.md"))
+        pending = [source for source in sources if source.stem not in initialized]
+        if not pending:
             return
         # 先写完整临时文件，再以硬链接原子创建目标；并发初始化也不会覆盖用户内容。
-        for source in sorted((Path(__file__).parent / "builtin").glob("*.md")):
+        for source in pending:
             target = self._path(source.stem)
             if os.path.lexists(target):
                 continue
@@ -73,14 +87,34 @@ class SkillLoader:
                 if temporary is not None:
                     Path(temporary).unlink(missing_ok=True)
 
-        # 只在首次使用补齐。用户后来删除某个示例时，不再反复生成它。
+        self._record_examples(marker, initialized | {source.stem for source in sources})
+
+    # 原子记录本次已处理名称；提交失败可安全重试，已有 Skill 仍不会被覆盖。
+    def _record_examples(self, marker: Path, names: set[str]) -> None:
+        temporary: str | None = None
         try:
-            with marker.open("x", encoding="utf-8"):
-                pass
-        except FileExistsError:
-            pass
-        except OSError as exc:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", newline="", dir=self.root,
+                prefix=".examples-", delete=False,
+            ) as file:
+                temporary = file.name
+                file.write("\n".join(sorted(names)) + "\n")
+                file.flush()
+                os.fsync(file.fileno())
+            # Windows 上其他初始化线程短暂读取标记时，替换会出现共享冲突。
+            for attempt in range(5):
+                try:
+                    os.replace(temporary, marker)
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.01)
+        except (OSError, UnicodeError) as exc:
             raise SkillError(f"cannot record skill initialization: {exc}") from exc
+        finally:
+            if temporary is not None:
+                Path(temporary).unlink(missing_ok=True)
 
     def _read(self, name: str) -> tuple[SkillEntry, SkillSnapshot]:
         path = self._path(name)
@@ -136,7 +170,3 @@ class SkillLoader:
     def load(self, name: str) -> SkillSnapshot:
         self.ensure_examples()
         return self._read(name)[1]
-
-
-def render_catalog(entries: list[SkillEntry]) -> str:
-    return "\n".join(f"- {entry.name}: {entry.description}" for entry in entries)

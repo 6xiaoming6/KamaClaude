@@ -191,6 +191,8 @@ async def _authorize(
             run_id=run_id,
             # 命令以工具实际绑定的 cwd 为准，独立构造工具时也不能借用别的目录授权。
             workspace=tool.workspace if isinstance(tool, BashTool) else workspace,
+            command_platform=tool.platform if isinstance(tool, BashTool) else None,
+            execution_context=tool.execution_context if isinstance(tool, BashTool) else "",
             **path_options,
         )
         if not allowed:

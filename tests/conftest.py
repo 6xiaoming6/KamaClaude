@@ -35,6 +35,7 @@ async def running_daemon(free_port: int, tmp_path: Path) -> AsyncGenerator[subpr
     env["KAMA_SESSIONS_DIR"] = str(tmp_path / "sessions")
     env["KAMA_LOG_FILE"] = ""
     env["KAMA_LOG_LEVEL"] = "WARNING"
+    env["KAMA_EXECUTION_BACKEND"] = "host"  # 通信测试不依赖 Docker，真实沙箱另有用例。
     env["DEEPSEEK_API_KEY"] = ""
     env["ANTHROPIC_API_KEY"] = ""
 

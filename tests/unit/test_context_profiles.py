@@ -37,7 +37,7 @@ def test_context_profile_loads(
     assert int(window * config.memory.global_auto_ratio) == 524
     assert int(window * config.memory.project_index_ratio) == 1_048
     assert config.tool_search.schema_budget(window) == 10_485
-    if profile == "context-256k.toml":
+    if profile == "context-1m.toml":
         defaults = KamaConfig()
         assert asdict(compact) == asdict(defaults.compaction)
         assert asdict(config.memory) == asdict(defaults.memory)

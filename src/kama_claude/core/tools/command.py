@@ -25,9 +25,16 @@ class CommandResult:
     returncode: int | None
     error: str = ""
     outcome_unknown: bool = False
+    error_type: str = ""
 
 
 class CommandExecutor:
+    platform = os.name
+
+    # 本机命令已经逐次回收进程，没有 Run 级容器需要释放。
+    async def aclose(self) -> bool:
+        return True
+
     # 绑定执行目录，进程树只在本次调用内管理，不创建后台守护进程
     def __init__(self, cwd: Path | None = None, execution: ExecutionConfig | None = None) -> None:
         self.cwd = (cwd or Path.cwd()).resolve()

@@ -5,9 +5,11 @@ from typing import TYPE_CHECKING
 
 from kama_claude.core.compact.estimator import estimate_bytes
 from kama_claude.core.completion import FINISH_INSTRUCTIONS
+from kama_claude.core.execution.context import execution_instructions
 from kama_claude.core.memory.files import read_optional
 from kama_claude.core.memory.model import MemorySnapshot, MemorySource
 from kama_claude.core.memory.store import MemoryStore
+from kama_claude.core.skills.context import render_catalog
 
 if TYPE_CHECKING:
     from kama_claude.core.checkpoint.checkpoint import RunCheckpoint
@@ -31,7 +33,6 @@ DEFAULT_SYSTEM = (
     "response text before a group of tool calls, and report meaningful progress on long tasks. "
     "Complete the requested scope and necessary verification; do not keep adding optional polish. "
     "When asked to explain an error, diagnose it before resuming unrelated implementation. "
-    "On Windows cmd, avoid POSIX heredocs; write complex scripts with write_file then run them. "
     "Use finite, non-interactive commands; do not start persistent servers through a command that "
     "waits for their output pipe to close. Finish with the result, verification and any remaining "
     "issue; stop calling tools once the task is complete."
@@ -86,7 +87,13 @@ def initialize_prompt(run: RunCheckpoint, store: MemoryStore, base: str) -> None
     ])
     automatic = build_memory_context(store)
     run.base_system_prompt = base
-    run.system_prompt = compose_system(base, rules)
+    command_context = (
+        execution_instructions(run.execution, run.workspace)
+        if run.tool_whitelist is None or "bash" in run.tool_whitelist else ""
+    )
+    run.system_prompt = compose_system(
+        base + render_catalog(run.skill_catalog or []) + command_context, rules,
+    )
     if run.completion_mode == "explicit":
         run.system_prompt += FINISH_INSTRUCTIONS
     run.memory_snapshot = automatic

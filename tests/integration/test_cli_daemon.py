@@ -6,7 +6,7 @@ from pathlib import Path
 import psutil
 
 from kama_claude.cli.commands import core
-from kama_claude.core.config import KamaConfig
+from kama_claude.core.config import ExecutionConfig, KamaConfig
 
 
 async def test_real_background_start_identity_and_graceful_stop(tmp_path: Path, free_port, monkeypatch):
@@ -15,10 +15,11 @@ async def test_real_background_start_identity_and_graceful_stop(tmp_path: Path, 
     monkeypatch.setattr(core, "_PID_FILE", pid_file)
     monkeypatch.setenv("KAMA_LOG_FILE", "")
     monkeypatch.setenv("KAMA_TRACE_ENABLED", "false")
+    monkeypatch.setenv("KAMA_EXECUTION_BACKEND", "host")
     monkeypatch.setenv("KAMA_SESSIONS_DIR", str(tmp_path / "sessions"))
     monkeypatch.setenv("DEEPSEEK_API_KEY", "")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "")
-    config = KamaConfig(port=free_port)
+    config = KamaConfig(port=free_port, execution=ExecutionConfig(backend="host"))
     info = None
     try:
         await asyncio.to_thread(core.cmd_core_start, config)

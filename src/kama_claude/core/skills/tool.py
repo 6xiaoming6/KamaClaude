@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 from pydantic import Field
 
 from kama_claude.core.skills.context import render_skill
-from kama_claude.core.skills.loader import SkillLoader, render_catalog
+from kama_claude.core.skills.loader import SkillLoader
 from kama_claude.core.skills.model import NAME_PATTERN, SkillError
 from kama_claude.core.tools.base import BaseTool, ToolParams, ToolResult
 
@@ -22,16 +22,16 @@ class LoadSkillTool(BaseTool):
     retry_safe = True
     params_model = LoadSkillParams
     input_schema = LoadSkillParams.model_json_schema()
+    description = (
+        "Load a skill's complete workflow by name; available names are listed in the system "
+        "prompt. One skill per Run. Loading never grants permissions or executes scripts. "
+        "Keep the task target in the user message."
+    )
 
+    # 仅绑定当前 Run 和加载器；工具描述不再携带 Skill 目录。
     def __init__(self, run: RunCheckpoint, loader: SkillLoader | None = None) -> None:
         self._run = run
         self._loader = loader or SkillLoader()
-        self.description = (
-            "Load one skill's complete instructions for the current user task. Pass only its name. "
-            "One skill per Run; loading never grants permissions or executes scripts. "
-            "Keep the task target in the user message. Available skills:\n"
-            + render_catalog(run.skill_catalog or [])
-        )
 
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = LoadSkillParams.model_validate(params)

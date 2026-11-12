@@ -24,6 +24,9 @@ from kama_claude.core.config import (
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.events.writer import EventWriter
+from kama_claude.core.execution.factory import create_executor
+from kama_claude.core.execution.model import CommandBackend, snapshot_execution
+from kama_claude.core.execution.owner import SandboxOwner
 from kama_claude.core.llm.images import supports_images
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.memory.store import MemoryStore
@@ -113,6 +116,7 @@ class SpawnAgentTool(BaseTool):
         memory_project_root: Path | None = None,
         parent_budget: RunBudget | None = None,
         stop_event: asyncio.Event | None = None,
+        sandbox_owner: SandboxOwner | None = None,
     ) -> None:
         self._provider = provider
         self._parent_budget = parent_budget
@@ -132,6 +136,7 @@ class SpawnAgentTool(BaseTool):
         self._depth = depth
         self._workspace = (workspace if workspace is not None else Path.cwd()).resolve()
         self._execution = execution or ExecutionConfig()
+        self._sandbox_owner = sandbox_owner or SandboxOwner()
         self._profiles = RoleCatalog(self._workspace)
         self.description = (
             type(self).description + "\nAvailable roles:\n" + self._profiles.description
@@ -190,9 +195,11 @@ class SpawnAgentTool(BaseTool):
             return ToolResult(content=str(exc), is_error=True, error_type="resource_limit")
 
         task: asyncio.Task[None] | None = None
+        executor: CommandBackend | None = None
         try:
             child_context = ExecutionContext(
                 run=RunCheckpoint(
+                    execution=snapshot_execution(self._execution),
                     run_id=child_run_id, goal=p.prompt, max_steps=self._agent_config.max_steps,
                     model=model, provider=self._provider_name, workspace=str(self._workspace),
                     completion_mode="explicit",
@@ -212,6 +219,10 @@ class SpawnAgentTool(BaseTool):
             )
 
             child_bus = EventBus()
+            executor = create_executor(
+                self._workspace, self._execution, run_id=child_run_id,
+                owner=self._sandbox_owner, bus=child_bus,
+            )
 
             # 将子 bus 所有事件桥接到父 bus，TUI 据此渲染嵌套进度
             async def _bridge(event: BaseModel) -> None:
@@ -225,6 +236,7 @@ class SpawnAgentTool(BaseTool):
                 child_bus, child_run_id, profile, provider=provider, model=model,
                 run=child_context.run,
                 budget=budget,
+                command_executor=executor,
             )
             child_run_path = self._runs_dir / child_run_id
             child_run_path.mkdir(parents=True, exist_ok=True)
@@ -237,7 +249,7 @@ class SpawnAgentTool(BaseTool):
             # 先登记再发布开始事件；门闩保证父任务先记录派生关系，子任务才执行。
             start = asyncio.Event()
             task = asyncio.create_task(self._run_child(
-                child_loop, child_context, child_bus, child_run_path, start,
+                child_loop, child_context, child_bus, child_run_path, start, executor,
             ))
             entry = self._task_registry.register(
                 child_run_id, task, child_context, session_id=self._session_id,
@@ -253,6 +265,8 @@ class SpawnAgentTool(BaseTool):
             if task is not None:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+            if executor is not None:
+                await executor.aclose()
             raise
         finally:
             self._task_registry.release(child_run_id, self._root_run_id, self._session_id)
@@ -276,6 +290,7 @@ class SpawnAgentTool(BaseTool):
         bus: EventBus,
         run_path: Path,
         start: asyncio.Event,
+        executor: CommandBackend,
     ) -> None:
         try:
             await start.wait()
@@ -296,12 +311,15 @@ class SpawnAgentTool(BaseTool):
             else:
                 context.mark_failed("subagent_error")
         finally:
-            if context.run.reason == "user_stopped":
-                await self._task_registry.wait_children(context.run.run_id, self._session_id)
-            else:
-                await self._task_registry.cancel_children(context.run.run_id, self._session_id)
-            # 报告落盘后才发布完成通知；失败由注册表转成明确的失败结果。
-            await self._task_registry.notify_finished(context.run.run_id)
+            try:
+                if context.run.reason == "user_stopped":
+                    await self._task_registry.wait_children(context.run.run_id, self._session_id)
+                else:
+                    await self._task_registry.cancel_children(context.run.run_id, self._session_id)
+            finally:
+                await executor.aclose()
+                # 报告落盘后才发布完成通知；失败由注册表转成明确的失败结果。
+                await self._task_registry.notify_finished(context.run.run_id)
 
     # 构造子 registry；基于角色配置过滤工具，深度允许时注册嵌套 SpawnAgentTool
     def _build_child_registry(
@@ -312,6 +330,7 @@ class SpawnAgentTool(BaseTool):
         *, provider: LLMProvider | None = None, model: str | None = None,
         run: RunCheckpoint | None = None,
         budget: RunBudget | None = None,
+        command_executor: CommandBackend | None = None,
     ) -> ToolRegistry:
         from kama_claude.core.task.manager import TaskManager
 
@@ -329,6 +348,7 @@ class SpawnAgentTool(BaseTool):
         for tool in builtin_tools(
             self._workspace, self._execution, child_task_manager,
             image_support=supports_images(self._provider_name, model or self._model),
+            command_executor=command_executor,
         ):
             if _allowed(tool.name):
                 registry.register(tool)
@@ -365,6 +385,7 @@ class SpawnAgentTool(BaseTool):
                 tool_whitelist=sorted(allowed) if allowed is not None else None,
                 parent_budget=budget,
                 stop_event=self._stop_event,
+                sandbox_owner=self._sandbox_owner,
             )
             registry.register(nested)
         if _allowed("agent_result"):

@@ -179,16 +179,24 @@ list_dir / find_files → search_text → get_file_outline → read_symbol / rea
 - **自动记忆**：全局 `AGENTS.auto.md` 和项目 `MEMORY.md` 索引通过标准上下文消息注入，不写入完整对话。普通步骤复用快照；真正采用摘要后刷新并与候选历史一起提交。主题详情通过 `memory_read` 按需读取，`memory_write` 维护自动信息和项目主题。
 - **输出入口限长**：普通工具正文超过 32,000 字符时，先保存结果并归档全文，再把头尾共 24,000 字符的预览放进工作历史。输出整理失败会中断，已完成工具不重跑。
 - **请求前估算**：使用有效的上次实际输入＋输出 Usage，加上新增部分 UTF-8 字节数除以四向上取整；前缀改变则重新全文估算。没有 tokenizer 或动态阈值校准。
-- **历史摘要**：默认有效上下文窗口为 256K，输入估算达到其中 80%（约 200K）时尝试一次；优先保留最近三轮，工具调用与结果不可拆开。旧历史合并成一份六节结构化摘要，校验后才保存。`/compact` 与自动入口共用规则，未达阈值不调用摘要模型。
-- **Skill**：只从 `~/.kama/skills/<name>/SKILL.md` 加载。可输入 `/review src`，也可让模型调用 `load_skill(name)`。每个 Run 最多一个活动 Skill，正文随检查点保存，压缩后按需补回。首次补齐 review、summarize、orchestrate、init 示例，已有文件不覆盖。
+- **历史摘要**：默认有效上下文窗口为 1M，输入估算达到其中 80%（约 800K）时尝试一次；优先保留最近三轮，工具调用与结果不可拆开。旧历史合并成一份六节结构化摘要，校验后才保存。`/compact` 与自动入口共用规则，未达阈值不调用摘要模型。
+- **Skill**：只从 `~/.kama/skills/<name>/SKILL.md` 加载。system prompt 简列可用名称和描述，要求相关任务先调用 `load_skill(name)`；工具描述不携带目录，正文按需进入工作历史。也可输入 `/review src`。每个 Run 最多一个活动 Skill，目录随 system 冻结，正文随检查点保存，压缩后按需补回。内置 review、summarize、orchestrate、init、github-issue-fix 示例；首次使用及升级时只补齐尚未安装的新名称，不覆盖用户内容，也不恢复主动删除的示例。
 
 旧 `context.md`、`notes.md` 不再自动读取或迁移；已删除 `note_save`、`/memory` 和 `memory.inspect`。用户维护的 `AGENTS.md` 对内置写入工具只读。Skill 不覆盖基础 system，不扩大工具白名单。
+
+修复 Issue 可在新一轮输入：
+
+```text
+/github-issue-fix 修复以下问题：……（附复现步骤、预期行为及相关限制）
+```
+
+也可调用 `load_skill({"name":"github-issue-fix"})`。该 Skill 按“验收清单 → 根因定位与修复前复现 → 最小修改 → 对照与回归验证 → 补丁审查和证据化回复”组织任务。普通 `finish` 仍只结束回复，不代表缺陷验收通过；受阻时必须如实报告。具体复盘和使用边界见 [GitHub Issue 修复 Skill](./docs/GitHub-Issue-Fix-Skill.md)。
 
 ## 配置与默认参数
 
 默认按“全局 `~/.kama/config.toml` → 项目 `.kama/config.toml` → 环境变量”覆盖；`.env` 不覆盖已有系统环境变量。设置 `KAMA_CONFIG` 时只读取指定 TOML，再应用环境覆盖。解析入口见 [config/](./src/kama_claude/core/config/)。
 
-提供两个完整列出上下文份额的配置，内建默认值采用 256K：
+提供两个完整列出上下文份额的配置，内建默认值采用 1M：
 
 | 配置 | 用途 | 有效窗口 | 摘要触发线 | 近期原文上限 | 单次输出 / 摘要上限 | 摘要软目标上限 |
 |---|---|---:|---:|---:|---:|---:|
@@ -199,7 +207,7 @@ list_dir / find_files → search_text → get_file_outline → read_symbol / rea
 
 ```powershell
 # 日常使用
-$env:KAMA_CONFIG = (Resolve-Path .\configs\context-256k.toml).Path
+$env:KAMA_CONFIG = (Resolve-Path .\configs\context-1m.toml).Path
 uv run kama-core
 
 # 停止 Core 后，可切换到长任务配置再启动
@@ -209,7 +217,7 @@ uv run kama-core
 
 绝对的 `KAMA_CONFIG` 路径也可用于从其他工作目录启动 Core。显式选择后不会合并原来的全局或项目 TOML；需要的 MCP 等配置应写入选中的文件，凭据仍通过环境变量提供。`KAMA_COMPACT_*` 等环境变量优先于文件中的值，比较两个配置时应清除不需要的同名覆盖。切换需重启 Core，不会自动切换模型；1M 配置只适用于实际支持该窗口的模型。两档均保留相同的工具输出字符限制，以及约 512 / 1K 的自动记忆和约 10K 的 MCP Schema 额度。
 
-下方展示内建默认值（256K）：
+下方展示内建默认值（1M）：
 
 ```toml
 [agent]
@@ -221,13 +229,13 @@ no_progress_limit = 5     # 只读调用模式重复上限；0 关闭，启用�
 
 [compaction]
 auto_threshold = 0.8      # 0 关闭自动摘要，硬预算检查仍生效
-context_window_tokens = 262144   # 日常编码使用 256K；不能超过模型实际窗口
-output_reserve_ratio = 0.0625     # 256K 下单次输出最多 16K
+context_window_tokens = 1048576   # 默认使用 1M；不能超过模型实际窗口
+output_reserve_ratio = 0.03125    # 1M 下单次输出最多 32K
 safety_margin_ratio = 0.02
 keep_recent_turns = 3
-recent_history_ratio = 0.25       # 256K 下近期原文最多 64K
-summary_max_ratio = 0.0625        # 摘要硬上限 16K
-summary_target_ratio = 0.03125    # 摘要软目标最多 8K
+recent_history_ratio = 0.20       # 1M 下近期原文最多约 200K
+summary_max_ratio = 0.03125       # 摘要硬上限 32K
+summary_target_ratio = 0.0078125  # 摘要软目标最多 8K
 tool_result_limit = 32000        # 固定字符数
 tool_result_keep = 24000
 
@@ -239,20 +247,20 @@ max_total = 6
 timeout_s = 300          # 给用户留出查看命令和编辑内容的时间
 
 [memory]
-global_auto_ratio = 0.002
-project_index_ratio = 0.004
+global_auto_ratio = 0.0005
+project_index_ratio = 0.001
 
 [tool_search]
-max_loaded_schema_ratio = 0.04  # 256K 下约 10K，不会默认注入所有 MCP Schema
+max_loaded_schema_ratio = 0.01  # 1M 下约 10K，不会默认注入所有 MCP Schema
 ```
 
 Run 的累计执行时间包含模型、工具和审批等待；恢复不重置原 Run 的预算。普通模型调用、自动摘要与子 Agent 的模型请求纳入整棵树的共享预算，手动压缩单独记用量。
 
-所有上下文额度按 `context_window_tokens × ratio` 即时推导，不另存固定 Token 配置。默认将整个有效窗口从 1M 收到 256K，用于日常代码阅读、修改和验证；这是应用层上限，不改变 DeepSeek 服务端支持的最大窗口。模型实际窗口小于该值时还须调小。自动摘要在有效窗口的 80% 触发，`0` 关闭自动摘要但保留硬预算检查；普通输入硬预算扣除 6.25% 输出预留和 2% 安全余量。摘要请求独立扣除 6.25% 摘要输出上限和相同安全余量。软阈值不是强制裁切线，摘要失败但未超过硬预算时仍可继续。
+所有上下文额度按 `context_window_tokens × ratio` 即时推导，不另存固定 Token 配置。默认有效窗口为 1M，另保留 256K 预设供切换；这是应用层上限，不改变服务端支持的最大窗口，模型实际窗口较小时必须相应调小。自动摘要在有效窗口的 80% 触发，`0` 关闭自动摘要但保留硬预算检查；默认普通输入硬预算扣除 3.125% 输出预留和 2% 安全余量。摘要请求独立扣除 3.125% 摘要输出上限和相同安全余量。软阈值不是强制裁切线，摘要失败但未超过硬预算时仍可继续。
 
-近期原文最多使用窗口的 25%，优先保留最近三轮；固定 system、用户规则、工具定义和自动记忆按实际估算占用扣除，剩余空间不足时进一步缩小近期额度，完整工具配对不可拆开。用户规则不静默截断，放不下会明确失败。
+近期原文使用当前 `recent_history_ratio` 的额度，默认 1M 预设为窗口的 20%，256K 预设为 25%，优先保留最近三轮；固定 system、用户规则、工具定义和自动记忆按实际估算占用扣除，剩余空间不足时进一步缩小近期额度，完整工具配对不可拆开。用户规则不静默截断，放不下会明确失败。
 
-摘要继续使用六节结构。软目标取“窗口的 3.125%”与“被摘要旧历史的四分之一”中的较小值；API 上限为窗口的 6.25%，不要求用满。空摘要、截断或缩减不足仍不采用。以 256K 为例：触发线 209715，近期额度最多 65536，摘要软目标最多 8192、输出上限 16384，普通输出预留 16384，安全余量 5243，普通输入硬预算 240517 Token。256K 是面向日常编码的起始配置，不是行业统一最佳值；长任务确实需要更多原文时，可在模型能力范围内调大有效窗口。窗口缩小后摘要会更早发生，也可能增加摘要请求和历史前缀缓存重建，需结合任务完成率、实际用量和缓存统计评估。
+摘要继续使用六节结构。默认软目标取“窗口的 0.78125%”与“被摘要旧历史的四分之一”中的较小值；API 上限为窗口的 3.125%，不要求用满。空摘要、截断或缩减不足仍不采用。以默认 1M 为例：触发线 838860，近期额度最多 209715，摘要软目标最多 8192、输出上限 32768，普通输出预留 32768，安全余量 20972，普通输入硬预算 994836 Token。两套预设各自提供配套比例；切到 256K 后摘要会更早发生，也可能增加摘要请求和历史前缀缓存重建，需结合任务完成率、实际用量和缓存统计评估。
 
 `KAMA_COMPACT_WINDOW_TOKENS` 指定窗口；`KAMA_COMPACT_OUTPUT_RATIO`、`KAMA_COMPACT_SAFETY_RATIO`、`KAMA_COMPACT_RECENT_RATIO`、`KAMA_COMPACT_SUMMARY_RATIO`、`KAMA_COMPACT_SUMMARY_TARGET_RATIO` 覆盖对应比例。自动记忆用 `KAMA_MEMORY_GLOBAL_AUTO_RATIO`、`KAMA_MEMORY_PROJECT_INDEX_RATIO`；MCP 加载额度用 `KAMA_TOOL_SEARCH_MAX_LOADED_SCHEMA_RATIO`。比例必须有限且在 0 与 1 之间，合计必须给固定提示留空间，触发线也须给摘要输出留余量。
 
@@ -285,6 +293,32 @@ max_loaded_schema_ratio = 0.01
 
 语义检索使用 Sentence Transformers 的 multilingual-e5-small：`uv sync --extra retrieval` 安装可选依赖。不指定模型目录时首次下载并缓存；指定目录时离线读取。依赖或模型不可用会明确降级为 `keyword_only`。工具目录只在启动和重新连接时同步；完整列表拉取成功后按定义哈希事务更新，检索文本和模型指纹未变时复用向量。
 
+## Run 级 Docker 命令沙箱
+
+`bash` 默认使用本机 Docker 的 Linux 容器。在仓库根目录先启动 Docker Desktop 的 Linux 引擎，再显式构建开发镜像：
+
+```powershell
+docker build -t kamaclaude-sandbox:py312-node24 -f docker/sandbox/Dockerfile docker/sandbox
+uv run kama-core
+```
+
+镜像包含 Python 3.12、pip、pytest、Node.js 24、npm、Git 和 Bash。运行时不自动拉取或构建镜像；Docker 不可用就明确失败，不会偷偷执行宿主命令。需要本机执行时显式配置 `KAMA_EXECUTION_BACKEND=host`，重启 Core 后对新 Run 生效。
+
+每个 Run 第一次实际执行 Bash 时创建一个容器，后续通过 `docker exec` 复用。仅把本轮工作区挂载为 `/workspace`，非 root、只读根文件系统，提供有限的可写 `/tmp` 和用户目录。默认 2 CPU、2 GiB 内存、128 个进程，允许 bridge 联网，不映射端口、不挂 Docker socket。创建时遮蔽根目录已有 `.env` 与 `.env.*`，保留 `.env.example`，宿主原文件不变。
+
+命令每次从 `/workspace` 开始，`cd`、`export` 不跨调用保留；工作区文件、用户安装依赖和临时文件可在容器存续期间复用。Runner 退出、异常或取消时回收；TUI 断线不结束 Run，也不销毁容器。超时或失联时销毁容器并保留未知结果确认，恢复使用新容器，不复活旧进程。配置、限制和阅读入口见 [Docker 沙箱说明](./docs/Docker-Run-Sandbox.md)。
+
+```toml
+[execution]
+backend = "docker" # host 为显式本机执行
+
+[execution.docker]
+image = "kamaclaude-sandbox:py312-node24"
+cpus = 2
+memory_mb = 2048
+pids_limit = 128
+```
+
 ## 文件、命令与审批
 
 按 `Ctrl+P` 切换当前会话的审批模式，顶部显示 Core 确认的实际模式，`Esc` 关闭选择框。模式弹窗和连接使用独立 Worker 组，切换不会取消 TCP 连接或正在等待的请求。
@@ -302,11 +336,11 @@ max_loaded_schema_ratio = 0.01
 
 ASK 下的文件授权键仍是“会话＋工具＋后端实际文件路径”，不匹配原始字符串或父目录。所有模式执行前都重新解析路径，目标变化则拒绝。明确禁止包括工具策略、持久拒绝和可识别的命令禁止规则；用户 `AGENTS.md` 只读保护、工具白名单、Run 预算和未知结果恢复确认不会因切换模式失效。
 
-Bash 独立判断：Windows 使用保守 cmd 解析，POSIX 使用 Bash AST。ASK 下只有完整解析且所有命令匹配允许规则时才自动允许，默认允许规则为空。APPROVE 额外保留高危询问：删除、格式化、权限修改、终止进程、危险 Git 操作，以及解释器执行脚本、嵌套 Shell 等无法分析内容的调用；普通允许规则不能盖过该检查，显式询问规则也仍有效。该列表是保守分类，不能识别任意程序内部的危险行为；FULL 仍检查可识别的禁止规则，但不会因为无法解析而询问。
+Bash 按实际后端独立判断：Docker 始终使用 Bash AST，包括 Windows 宿主；host 模式在 Windows 使用保守 cmd 解析，其他平台使用 Bash AST。ASK 下只有完整解析且所有命令匹配允许规则时才自动允许，默认允许规则为空。APPROVE 额外保留高危询问：删除、格式化、权限修改、终止进程、危险 Git 操作，以及解释器执行脚本、嵌套 Shell 等无法分析内容的调用；普通允许规则不能盖过该检查，显式询问规则也仍有效。该列表是保守分类，不能识别任意程序内部的危险行为；FULL 仍检查可识别的禁止规则，但不会因为无法解析而询问。
 
 模式保存在 `PermissionManager.session_premission_modes`，只在当前 Core 内存中生效；主、子 Agent 共用所属会话模式。断线重连保留，切换会话同步对应模式，关闭会话清除，Core 重启默认恢复 ASK。切换只影响后续工具调用，已发出的审批仍需按原选项回答，正在执行的工具不会被撤回。模式通过 `session.set_permission_mode` 修改，并向同一会话的前端广播；不写入检查点或模型参数。
 
-这些是应用层检查。获批 Shell 和远程 MCP 的实际能力不受文件工具路径校验限制；命令执行和子 Agent 没有系统沙箱。
+审批与隔离是两层：Docker Bash 受容器边界限制，host 模式是明确的宿主执行。工作区内的真实文件仍能被获批命令修改或删除；远程 MCP 的能力不由本地容器约束。文件工具对 `AGENTS.md` 的保护不等于容器内 Shell 对该文件只读。允许联网也不保证阻止访问可达的局域网服务或上传工作区内容。
 
 ## 子 Agent 协作
 
@@ -378,6 +412,8 @@ uv run python scripts/gen_protocol_doc.py --check
 ```
 
 这里的 `integration` 标记专指付费模型测试；非付费命令仍覆盖真实 TCP、Core 进程重启、MCP JSON/SSE 与 TUI。Embedding 真实离线验证需配置 `KAMA_TEST_E5_MODEL_PATH`。测试数量和实测结果以运行输出为准；机制测试不代表真实代码修复成功率或 Prompt Cache 收益。
+
+真实 Docker 用例要求引擎运行且开发镜像已经构建，缺少前置条件会明确跳过。可单独运行 `uv run pytest tests/integration/test_docker_sandbox.py -q`；其中包含少量公开 Python/npm 依赖下载，不调用模型 API。
 
 测试守护进程最多等待 15 秒启动；进程提前退出时立即失败，报告 PID、退出码和最多 8 KiB 的 stderr 尾部。失败和测试结束都会回收进程，避免只留下笼统的启动超时。
 

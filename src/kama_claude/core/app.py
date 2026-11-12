@@ -51,6 +51,7 @@ from kama_claude.core.bus.commands import (
 from kama_claude.core.bus.envelope import EventPushEnvelope, HandlerError
 from kama_claude.core.config import KamaConfig, get_config
 from kama_claude.core.events.bus import EventBus
+from kama_claude.core.execution.owner import SandboxOwner, cleanup_orphans
 from kama_claude.core.llm.provider import DeepseekProvider
 from kama_claude.core.logging_setup import config_summary, setup_logging
 from kama_claude.core.mcp.server import McpServerManager
@@ -329,6 +330,7 @@ class CoreApp:
         store = SessionStore(sessions_root)
         assert self._config is not None
         config = self._config
+        sandbox_owner = SandboxOwner.for_core(sessions_root, config.host, config.port)
         self._mcp_manager = McpServerManager(config.tool_search)
         if self._config.mcp.servers:
             logger.info("mcp: starting %d server(s)", len(self._config.mcp.servers))
@@ -343,6 +345,7 @@ class CoreApp:
                 permission_manager=self._permission_manager,
                 mcp_manager=self._mcp_manager,
                 task_registry=self._task_registry,
+                sandbox_owner=sandbox_owner,
             ),
             bus=self._bus,
             provider_factory=lambda: DeepseekProvider(config.llm.default_model),
@@ -376,6 +379,8 @@ class CoreApp:
             "session.set_permission_mode", self._session_permission_mode_handler, control=True,
         )
 
+        if config.execution.backend == "docker":
+            await cleanup_orphans(sandbox_owner)
         addr = await server.start()
         logger.info("kama-core %s listening addr=%s", kama_claude.__version__, addr)
         logger.info("config summary: %s", config_summary(self._config))

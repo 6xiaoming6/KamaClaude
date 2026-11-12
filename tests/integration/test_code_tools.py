@@ -8,7 +8,7 @@ import pytest
 from pydantic import BaseModel
 
 from kama_claude.core.bus.events import PermissionRequestedEvent
-from kama_claude.core.config import KamaConfig
+from kama_claude.core.config import ExecutionConfig, KamaConfig
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock, UsageStats
 from kama_claude.core.permissions.manager import PermissionManager
@@ -77,7 +77,7 @@ async def test_locate_read_edit_verify_pipeline(tmp_path: Path, monkeypatch: pyt
                 f"call-{step}", name, params,
             )], usage=UsageStats(100, 10))
 
-    config = KamaConfig()
+    config = KamaConfig(execution=ExecutionConfig(backend="host"))
     registry = BackgroundTaskRegistry()
     store = SessionStore(tmp_path / "sessions")
     manager = SessionManager(

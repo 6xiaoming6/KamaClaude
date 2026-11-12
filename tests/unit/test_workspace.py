@@ -9,7 +9,7 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from kama_claude.core.bus.events import PermissionRequestedEvent
-from kama_claude.core.config import KamaConfig
+from kama_claude.core.config import ExecutionConfig, KamaConfig
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import ToolCallBlock
@@ -86,7 +86,7 @@ async def test_tools_capture_workspace(tmp_path: Path, monkeypatch: pytest.Monke
     other.mkdir()
     (root / "file.txt").write_text("original", encoding="utf-8")
     monkeypatch.chdir(root)
-    reader, bash = ReadFileTool(), BashTool()
+    reader, bash = ReadFileTool(), BashTool(execution=ExecutionConfig(backend="host"))
     monkeypatch.chdir(other)
     assert (await reader.invoke({"path": "file.txt"})).content.endswith("1 | original")
     result = await bash.invoke({"command": "cd" if os.name == "nt" else "pwd"})

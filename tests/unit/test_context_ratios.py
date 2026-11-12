@@ -22,13 +22,13 @@ from tests.unit.test_compactor import history, provider
 def test_all_context_allowances_scale_with_window(window):
     config = CompactionConfig(context_window_tokens=window)
     assert config.trigger_tokens == int(window * 0.8)
-    assert config.output_reserve_tokens == int(window * 0.0625)
-    assert config.recent_token_budget == int(window * 0.25)
-    assert config.summary_max_tokens == int(window * 0.0625)
+    assert config.output_reserve_tokens == int(window * 0.03125)
+    assert config.recent_token_budget == int(window * 0.20)
+    assert config.summary_max_tokens == int(window * 0.03125)
     assert config.safety_margin_tokens == math.ceil(window * 0.02)
     assert config.input_limit == window - config.output_reserve_tokens - config.safety_margin_tokens
     assert config.summary_input_limit == window - config.summary_max_tokens - config.safety_margin_tokens
-    assert config.summary_target_for(window) == int(window * 0.03125)
+    assert config.summary_target_for(window) == int(window * 0.0078125)
 
 
 # 功能：验证窗口变更后重新计算上下文份额，小历史摘要仍不会被扩写。
@@ -38,7 +38,7 @@ def test_allowances_are_recomputed_not_cached_as_fixed_tokens():
     before = config.output_reserve_tokens
     config.context_window_tokens *= 4
     assert config.output_reserve_tokens == before * 4  # 此比例在所测窗口下可整除。
-    assert config.recent_token_budget == int(config.context_window_tokens * 0.25)
+    assert config.recent_token_budget == int(config.context_window_tokens * 0.20)
     assert config.summary_target_for(400) == 100  # 小历史不因窗口增大而被扩写。
 
 

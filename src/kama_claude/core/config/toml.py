@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from typing import Any
 from urllib.parse import urlsplit
 
-from kama_claude.core.config.models import KamaConfig, McpServerConfig, ToolSearchConfig
+from kama_claude.core.config.models import (
+    DockerConfig,
+    ExecutionConfig,
+    KamaConfig,
+    McpServerConfig,
+    ToolSearchConfig,
+)
 
 
 # 校验顶层配置名，再委托各小节解析。
@@ -190,12 +197,22 @@ def _apply_permission(config: KamaConfig, value: Any) -> None:
 
 def _apply_execution(config: KamaConfig, value: Any) -> None:
     execution = value
-    if not isinstance(execution, dict) or set(execution) - {"env", "forward_env"}:
-        raise SystemExit("Config error: [execution] accepts only env and forward_env")
-    config.execution.env = _env_values(execution.get("env", config.execution.env))
-    config.execution.forward_env = _env_names(
-        execution.get("forward_env", config.execution.forward_env),
-    )
+    if not isinstance(execution, dict) or set(execution) - {
+        "env", "forward_env", "backend", "docker",
+    }:
+        raise SystemExit("Config error: unknown [execution] settings")
+    docker = execution.get("docker", {})
+    if not isinstance(docker, dict) or set(docker) - set(asdict(config.execution.docker)):
+        raise SystemExit("Config error: unknown [execution.docker] settings")
+    try:
+        config.execution = ExecutionConfig(
+            env=_env_values(execution.get("env", config.execution.env)),
+            forward_env=_env_names(execution.get("forward_env", config.execution.forward_env)),
+            backend=execution.get("backend", config.execution.backend),
+            docker=DockerConfig(**{**asdict(config.execution.docker), **docker}),
+        )
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"Config error: {exc}") from exc
 
 
 def _apply_compaction(config: KamaConfig, value: Any) -> None:

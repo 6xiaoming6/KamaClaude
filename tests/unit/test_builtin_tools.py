@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from kama_claude.core.config import ExecutionConfig
 from kama_claude.core.tools.builtin.bash import BashTool
 from kama_claude.core.tools.builtin.list_dir import ListDirTool
 from kama_claude.core.tools.builtin.write_file import WriteFileTool
@@ -15,7 +16,7 @@ from kama_claude.core.tools.builtin.write_file import WriteFileTool
 # 设计：用 echo 命令避免外部依赖，直接比较输出内容，无需 mock
 @pytest.mark.asyncio
 async def test_bash_success_stdout() -> None:
-    result = await BashTool().invoke({"command": "echo hello"})
+    result = await BashTool(execution=ExecutionConfig(backend="host")).invoke({"command": "echo hello"})
     assert not result.is_error
     assert "hello" in result.content
 
@@ -24,7 +25,7 @@ async def test_bash_success_stdout() -> None:
 # 设计：`exit 2` 是最简单的非零退出；不依赖任何外部命令行为
 @pytest.mark.asyncio
 async def test_bash_nonzero_exit_is_error() -> None:
-    result = await BashTool().invoke({"command": "exit 2"})
+    result = await BashTool(execution=ExecutionConfig(backend="host")).invoke({"command": "exit 2"})
     assert result.is_error
     assert "[exit 2]" in result.content
 
@@ -34,7 +35,7 @@ async def test_bash_nonzero_exit_is_error() -> None:
 @pytest.mark.asyncio
 async def test_bash_timeout() -> None:
     command = f'"{sys.executable}" -c "import time; time.sleep(5)"'
-    result = await BashTool().invoke({"command": command, "timeout": 1})
+    result = await BashTool(execution=ExecutionConfig(backend="host")).invoke({"command": command, "timeout": 1})
     assert result.is_error
     assert result.error_type == "timeout"
 
@@ -43,7 +44,7 @@ async def test_bash_timeout() -> None:
 # 设计：只写 stderr 的命令（>&2 echo），输出应该出现在合并后的 content 里
 @pytest.mark.asyncio
 async def test_bash_stderr_merged() -> None:
-    result = await BashTool().invoke({"command": "echo err >&2"})
+    result = await BashTool(execution=ExecutionConfig(backend="host")).invoke({"command": "echo err >&2"})
     assert not result.is_error
     assert "err" in result.content
 

@@ -12,6 +12,13 @@ from kama_claude.core.config import KamaConfig
 from kama_claude.core.config.models import McpServerConfig
 
 
+@pytest.fixture(autouse=True)
+# 功能：Core 单元测试不访问真实 Docker，启动清理在独立真实容器测试中验证。
+# 设计：与已有服务器、MCP 替身保持同一边界，避免外部引擎耗时影响信号测试。
+def isolated_orphan_scan(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(core_app, "cleanup_orphans", AsyncMock())
+
+
 @pytest.mark.parametrize(
     ("platform", "shutdown_mode"),
     [("win32", "cancel"), ("linux", "cancel"), ("linux", "signal")],

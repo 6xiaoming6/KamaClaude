@@ -98,6 +98,7 @@ def assess(
     tool_name: str, params: dict[str, Any], policy: ToolPolicy | None = None, *,
     path_access: PathAccess | None = None,
     mode: PermissionMode = PermissionMode.ASK,
+    command_platform: str | None = None,
 ) -> PermissionAssessment:
     policy = policy or DEFAULT_POLICIES.get(tool_name)
     if policy is not None and policy.default == PermissionDecision.DENY:
@@ -105,7 +106,7 @@ def assess(
     if tool_name == "bash":
         decision, reason = command_decision(
             str(params.get("command", "")), rules=policy.command_rules if policy else [],
-            mode=mode,
+            mode=mode, platform=command_platform,
         )
         return PermissionAssessment(PermissionDecision(decision), reason, reusable=False)
     if mode == PermissionMode.FULL:

@@ -51,6 +51,7 @@ def config_summary(config: KamaConfig) -> dict[str, object]:
         "tool_search_enabled": config.tool_search.enabled,
         "mcp_server_count": len(config.mcp.servers),
         "execution_env_count": len(config.execution.env),
+        "execution_backend": config.execution.backend,
         "execution_forward_env_count": len(config.execution.forward_env),
     }
 

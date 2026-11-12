@@ -3,7 +3,12 @@ from __future__ import annotations
 import os
 from dataclasses import asdict
 
-from kama_claude.core.config.models import KamaConfig, ToolSearchConfig
+from kama_claude.core.config.models import (
+    DockerConfig,
+    ExecutionConfig,
+    KamaConfig,
+    ToolSearchConfig,
+)
 
 
 # 按配置小节应用环境覆盖，各小节自行完成类型校验。
@@ -15,9 +20,27 @@ def apply_env(config: KamaConfig) -> None:
     _apply_llm(config)
     _apply_trace(config)
     _apply_permission(config)
+    _apply_execution(config)
     _apply_compaction(config)
     _apply_memory(config)
     _apply_tool_search(config)
+
+
+# Docker 环境覆盖只包含非敏感设置，命令环境仍由现有显式名单控制。
+def _apply_execution(config: KamaConfig) -> None:
+    values = asdict(config.execution.docker)
+    try:
+        for key in values:
+            raw = os.environ.get(f"KAMA_DOCKER_{key.upper()}")
+            if raw is not None:
+                values[key] = raw if key == "image" else float(raw) if key == "cpus" else int(raw)
+        config.execution = ExecutionConfig(
+            backend=os.environ.get("KAMA_EXECUTION_BACKEND", config.execution.backend),
+            docker=DockerConfig(**values),
+            env=config.execution.env, forward_env=config.execution.forward_env,
+        )
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"Config error: {exc}") from exc
 
 
 # 环境变量沿用 TOML 的字段和验证规则，不读取远程模型地址或密钥。
