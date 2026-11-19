@@ -44,7 +44,7 @@ async def test_stable_prefix_and_atomic_memory_refresh(tmp_path: Path) -> None:
     run = fresh_run(tmp_path)
     initialize_prompt(run, memory, "BASE")
     run.tool_loading_mode = "deferred"
-    run.tool_schemas = [{"name": "search_tool", "input_schema": {}},
+    run.tool_schemas = [{"name": "search_tool_candidates", "input_schema": {}},
                         {"name": "remote", "input_schema": {}}]
     run.schemas_frozen = True
     run.mcp_tool_names = ["remote"]

@@ -22,7 +22,7 @@ from kama_claude.core.config import KamaConfig, SubagentConfig
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.discovery.exposure import load_tools
 from kama_claude.core.discovery.model import digest
-from kama_claude.core.discovery.tool import SearchTool
+from kama_claude.core.discovery.tool import GetToolSchema, SearchToolCandidates
 from kama_claude.core.events.bus import EventBus, EventHandler
 from kama_claude.core.events.writer import EventWriter
 from kama_claude.core.execution.factory import create_executor
@@ -224,9 +224,13 @@ class AgentRunner:
                     registry.register(mcp_tool)
                     records.append(mcp_tool.record)
             if run is not None and run.tool_loading_mode in ("on_demand", "deferred") and records:
-                # MCP 全部延迟时搜索入口必需，检索范围仍严格受 MCP 白名单约束。
-                if run.tool_loading_mode == "deferred" or _ok("search_tool"):
-                    registry.register(SearchTool(run, records, self._mcp_manager.retriever))
+                # MCP 全部延迟时两个发现入口必需，检索范围仍严格受 MCP 白名单约束。
+                if run.tool_loading_mode == "deferred" or _ok("search_tool_candidates"):
+                    registry.register(SearchToolCandidates(
+                        run, records, self._mcp_manager.retriever,
+                    ))
+                if run.tool_loading_mode == "deferred" or _ok("get_tool_schema"):
+                    registry.register(GetToolSchema(run))
         return registry
 
 

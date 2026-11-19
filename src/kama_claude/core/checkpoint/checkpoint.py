@@ -5,7 +5,7 @@ import os
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
@@ -72,7 +72,10 @@ class RunCheckpoint(BaseModel):
     tool_loading_mode: Literal["all", "on_demand", "deferred"] = "all"
     mcp_tool_names: list[str] = Field(default_factory=list)
     mcp_definition_hashes: dict[str, str] = Field(default_factory=dict)
+    # 当前模型上下文中的已激活工具；压缩采用候选时重算，不是本轮曾加载过的全集。
     loaded_tool_names: list[str] = Field(default_factory=list)
+    # 搜索返回过的候选及首次出现的 Step；不是已加载定义，也不授予执行权限。
+    tool_candidates: dict[str, Annotated[int, Field(ge=0)]] = Field(default_factory=dict)
     max_loaded_schema_tokens: int = Field(default=8_192, gt=0)
     max_steps: int = Field(ge=0)  # 0 不限步数；恢复保留原限制和已运行步数。
     max_run_seconds: int = Field(default=0, ge=0)
@@ -118,6 +121,8 @@ class RunCheckpoint(BaseModel):
                 raise ValueError("duplicate loaded tool names")
             if not set(self.loaded_tool_names) <= set(self.mcp_tool_names) <= names:
                 raise ValueError("loaded MCP tool is outside frozen catalog")
+            if not set(self.tool_candidates) <= set(self.mcp_tool_names):
+                raise ValueError("candidate MCP tool is outside frozen catalog")
         return self
 
 # 一个完整的检查点(当前 session 信息 + 模型工作 messages + 当前 Run)

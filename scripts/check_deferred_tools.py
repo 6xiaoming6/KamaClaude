@@ -9,7 +9,7 @@ from typing import Any
 import anthropic
 from dotenv import load_dotenv
 
-from kama_claude.core.discovery.tool import SearchToolParams
+from kama_claude.core.discovery.tool import GetToolSchemaParams
 
 
 async def check() -> None:
@@ -18,10 +18,10 @@ async def check() -> None:
     if not key:
         raise SystemExit("DEEPSEEK_API_KEY is not configured; live probe skipped")
     tools: list[Any] = [
-        {"name": "search_tool", "description": (
-            "Find an echo tool. Search only once; after receiving its tool reference, "
+        {"name": "get_tool_schema", "description": (
+            "Load verification_echo with names=['verification_echo']; after receiving its reference, "
             "call the referenced tool with text hello."),
-         "input_schema": SearchToolParams.model_json_schema(), "defer_loading": False},
+         "input_schema": GetToolSchemaParams.model_json_schema(), "defer_loading": False},
         {"name": "verification_echo", "description": "Echo the given text without side effects.",
          "input_schema": {"type": "object", "properties": {"text": {"type": "string"}},
                           "required": ["text"]}, "defer_loading": True},
@@ -35,12 +35,13 @@ async def check() -> None:
             "max_tokens": 256, "thinking": {"type": "disabled"}, "tools": tools,
         }
         first = await client.messages.create(
-            **options, messages=messages, tool_choice={"type": "tool", "name": "search_tool"},
+            **options, messages=messages, tool_choice={"type": "tool", "name": "get_tool_schema"},
         )
         calls = [block for block in first.content if block.type == "tool_use"]
-        if len(calls) != 1 or calls[0].name != "search_tool":
-            raise RuntimeError("first response did not produce the requested search tool call")
-        SearchToolParams.model_validate(calls[0].input)
+        if len(calls) != 1 or calls[0].name != "get_tool_schema":
+            raise RuntimeError("first response did not produce the requested schema loading call")
+        if GetToolSchemaParams.model_validate(calls[0].input).names != ["verification_echo"]:
+            raise RuntimeError("schema loading did not select the verification tool")
         messages.extend([
             {"role": "assistant", "content": [block.model_dump(exclude_none=True) for block in first.content]},
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": calls[0].id,

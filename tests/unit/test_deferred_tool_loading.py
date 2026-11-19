@@ -28,6 +28,7 @@ from kama_claude.core.tools.base import ToolResult
 from tests.unit.discovery_support import NativeScriptedProvider, ScriptedProvider
 from tests.unit.test_tool_discovery_workflow import (
     remote_response,
+    schema_response,
     search_response,
     setup_manager,
 )
@@ -36,7 +37,8 @@ from tests.unit.test_tool_discovery_workflow import (
 def run_state(**kwargs):
     return RunCheckpoint(run_id="r", goal="goal", workspace=".", model="m", max_steps=10,
                          tool_loading_mode="deferred", schemas_frozen=True,
-                         tool_schemas=[{"name": "search_tool", "input_schema": {}},
+                         tool_schemas=[{"name": "search_tool_candidates", "input_schema": {}},
+                                       {"name": "get_tool_schema", "input_schema": {}},
                                        {"name": "remote__get_issue", "description": "details" * 500,
                                         "input_schema": {"type": "object"}}],
                          mcp_tool_names=["remote__get_issue"], **kwargs)
@@ -45,9 +47,7 @@ def run_state(**kwargs):
 def discovery_history():
     return [{"role": "user", "content": "get issue"},
             {"role": "assistant", "content": [{"type": "tool_use", "id": "s",
-                                               "name": "search_tool", "input": {
-                                                   "description": "issue", "keywords": ["issue"],
-                                               }}]},
+                                               "name": "get_tool_schema", "input": {"names": ["remote__get_issue"]}}]},
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "s",
                                           "content": ToolResult("found", tool_references=[
                                               "remote__get_issue",
@@ -57,7 +57,7 @@ def discovery_history():
 # 完整 tools 在搜索前后保持一致；引用是协议块，普通工具也继续常驻。
 async def test_native_search_keeps_catalog_stable(tmp_path, monkeypatch):
     config, manager, client = await setup_manager(tmp_path, monkeypatch)
-    provider = NativeScriptedProvider([search_response(), remote_response(), LlmResponse("end_turn", text="done")])
+    provider = NativeScriptedProvider([search_response(), schema_response(), remote_response(), LlmResponse("end_turn", text="done")])
     store = SessionStore(tmp_path / "sessions")
     session = Session("sess-native", "chat", "active", "", "now", "now")
     outcome = await AgentRunner(config, provider=provider, mcp_manager=manager).run_and_capture(
@@ -68,9 +68,9 @@ async def test_native_search_keeps_catalog_stable(tmp_path, monkeypatch):
     assert all(request["schemas"] == schemas for request in provider.requests)
     assert next(s for s in schemas if s["name"] == "remote__get_issue")["defer_loading"] is True
     assert all(not s["defer_loading"] for s in schemas if s["name"] != "remote__get_issue")
-    content = provider.requests[1]["messages"][-1]["content"][0]["content"]
+    content = provider.requests[2]["messages"][-1]["content"][0]["content"]
     assert content[-1] == {"type": "tool_reference", "tool_name": "remote__get_issue"}
-    assert "keyword_only" in content[0]["text"]
+    assert "remote__get_issue" in content[0]["text"]
     cp = store.checkpoints.load(session.id)
     assert cp.run.tool_loading_mode == "deferred"
     assert cp.run.loaded_tool_names == ["remote__get_issue"]
@@ -104,7 +104,7 @@ async def test_native_whitelist_still_defers_mcp(tmp_path, monkeypatch):
         "goal", tool_whitelist=["remote__get_issue"],
     )
     schemas = provider.requests[0]["schemas"]
-    assert {s["name"] for s in schemas} == {"remote__get_issue", "search_tool", "finish"}
+    assert {s["name"] for s in schemas} == {"remote__get_issue", "search_tool_candidates", "get_tool_schema", "finish"}
     assert next(s for s in schemas if s["name"] == "remote__get_issue")["defer_loading"]
     await manager.stop_all()
 
@@ -122,12 +122,12 @@ async def test_native_checkpoint_failure_stops_request(tmp_path, monkeypatch):
         save(cp)
 
     monkeypatch.setattr(store.checkpoints, "save", fail)
-    provider = NativeScriptedProvider([search_response(), remote_response()])
+    provider = NativeScriptedProvider([search_response(), schema_response(), remote_response()])
     with pytest.raises(CheckpointError):
         await AgentRunner(config, provider=provider, mcp_manager=manager).run_and_capture(
             "goal", session=session, store=store,
         )
-    assert len(provider.requests) == 1
+    assert len(provider.requests) == 2
     assert not referenced_tools(store.checkpoints.load(session.id).messages)
     client.call_tool.assert_not_awaited()
     await manager.stop_all()
@@ -138,7 +138,7 @@ async def test_native_resume_keeps_references_and_step(tmp_path, monkeypatch):
     config, manager, client = await setup_manager(tmp_path, monkeypatch)
     store = SessionStore(tmp_path / "sessions")
     session = Session("sess-native-resume", "chat", "active", "", "now", "now")
-    provider = NativeScriptedProvider([search_response(), RuntimeError("disconnect")])
+    provider = NativeScriptedProvider([search_response(), schema_response(), RuntimeError("disconnect")])
     await AgentRunner(config, provider=provider, mcp_manager=manager).run_and_capture(
         "goal", session=session, store=store,
     )
@@ -148,7 +148,7 @@ async def test_native_resume_keeps_references_and_step(tmp_path, monkeypatch):
     outcome = await AgentRunner(config, provider=resumed, mcp_manager=manager).run_and_capture(
         "goal", session=session, store=store, checkpoint=restored,
     )
-    assert outcome.status == "success" and resumed.requests[0]["step"] == 2
+    assert outcome.status == "success" and resumed.requests[0]["step"] == 3
     assert resumed.requests[0]["schemas"] == provider.requests[0]["schemas"]
     client.call_tool.assert_awaited_once()
     await manager.stop_all()
@@ -171,7 +171,7 @@ def test_native_budget_counts_reference_expansion():
     assert counter.method == "usage_anchor"
     assert counter.request("sys", messages, schemas) == 120 + counter.count(messages[2:])
     assert counter.count(messages[2:]) > estimate_bytes(messages[2:]) + 500
-    assert callable_names(run, initial) == {"search_tool"}
+    assert callable_names(run, initial) == {"search_tool_candidates", "get_tool_schema"}
     assert "remote__get_issue" in callable_names(run, messages)
 
 
@@ -182,7 +182,7 @@ def test_references_are_not_read_from_arguments_or_errors():
     messages[1]["content"][0]["input"] = {"fake": {"type": "tool_reference", "tool_name": "remote__get_issue"}}
     messages[-1]["content"][0]["is_error"] = True
     assert referenced_tools(messages) == []
-    assert callable_names(run, messages) == {"search_tool"}
+    assert callable_names(run, messages) == {"search_tool_candidates", "get_tool_schema"}
 
 
 # 摘要保留最小的真实发现调用/结果对，不堆积重复引用且不拆开配对。
@@ -256,8 +256,9 @@ async def test_sdk_serializes_native_flags_and_references(provider_type):
     else:
         assert "cache_control" not in json.dumps(requests[1]["messages"])
     assert requests[0]["tools"] == requests[1]["tools"]
-    assert requests[1]["tools"][1]["defer_loading"] is True
-    assert "cache_control" not in requests[1]["tools"][1]
+    remote = next(tool for tool in requests[1]["tools"] if tool["name"] == "remote__get_issue")
+    assert remote["defer_loading"] is True
+    assert "cache_control" not in remote
     assert requests[1]["messages"][-1]["content"][0]["content"][-1]["type"] == "tool_reference"
 
 
@@ -266,7 +267,7 @@ async def test_native_next_run_inherits_historical_references(tmp_path, monkeypa
     config, manager, client = await setup_manager(tmp_path, monkeypatch)
     store = SessionStore(tmp_path / "sessions")
     session = Session("sess-native-next", "chat", "active", "", "now", "now")
-    first = NativeScriptedProvider([search_response(), LlmResponse("end_turn", text="found")])
+    first = NativeScriptedProvider([search_response(), schema_response(), LlmResponse("end_turn", text="found")])
     await AgentRunner(config, provider=first, mcp_manager=manager).run_and_capture(
         "goal", session=session, store=store,
     )
@@ -290,11 +291,11 @@ async def test_native_referenced_tool_still_requires_permission(tmp_path, monkey
 
     config, manager, client = await setup_manager(tmp_path, monkeypatch)
     permissions = PermissionManager(policies={"remote__get_issue": ToolPolicy(PermissionDecision.DENY)})
-    provider = NativeScriptedProvider([search_response(), remote_response(), LlmResponse("end_turn", text="denied")])
+    provider = NativeScriptedProvider([search_response(), schema_response(), remote_response(), LlmResponse("end_turn", text="denied")])
     await AgentRunner(config, provider=provider, mcp_manager=manager,
                       permission_manager=permissions, runs_dir=tmp_path / "runs").run_and_capture("goal")
     client.call_tool.assert_not_awaited()
-    assert provider.requests[2]["messages"][-1]["content"][0]["is_error"]
+    assert provider.requests[3]["messages"][-1]["content"][0]["is_error"]
     await manager.stop_all()
 
 
@@ -302,10 +303,10 @@ async def test_native_referenced_tool_still_requires_permission(tmp_path, monkey
 async def test_native_schema_budget_rejects_without_reference(tmp_path, monkeypatch):
     config, manager, client = await setup_manager(tmp_path, monkeypatch)
     config.tool_search.max_loaded_schema_ratio = 1 / config.compaction.context_window_tokens
-    provider = NativeScriptedProvider([search_response(), remote_response(), LlmResponse("end_turn", text="done")])
+    provider = NativeScriptedProvider([search_response(), schema_response(), remote_response(), LlmResponse("end_turn", text="done")])
     await AgentRunner(config, provider=provider, mcp_manager=manager,
                       runs_dir=tmp_path / "runs").run_and_capture("goal")
-    result = provider.requests[1]["messages"][-1]["content"][0]["content"]
+    result = provider.requests[2]["messages"][-1]["content"][0]["content"]
     assert isinstance(result, str) and "not_loaded_budget" in result
     assert not referenced_tools(provider.requests[1]["messages"])
     assert provider.requests[0]["schemas"] == provider.requests[1]["schemas"]
@@ -335,7 +336,7 @@ async def test_native_manual_compaction_uses_fixed_catalog(tmp_path, monkeypatch
 # 新目录没有旧工具时，SDK 投影成明确说明，不能把悬空引用送到服务端。
 def test_missing_tool_reference_is_projected_without_mutating_history():
     messages = discovery_history()
-    projected = project_references(messages, [{"name": "search_tool"}])
+    projected = project_references(messages, [{"name": "search_tool_candidates"}])
     content = projected[-1]["content"][0]["content"]
     assert content[-1]["type"] == "text" and "no longer available" in content[-1]["text"]
     assert referenced_tools(messages) == ["remote__get_issue"]
@@ -360,3 +361,51 @@ def test_direct_counter_uses_request_schema_for_references():
     standalone = TokenCounter()
     assert standalone.request("sys", messages, schemas) == selected.request("sys", messages, schemas)
     assert standalone.request("sys", messages, schemas) > estimate_bytes(messages) + 500
+
+
+# 功能：手动压缩提交后清除已丢弃引用的激活状态，保留引用则不重复展开。
+# 设计：调用实际摘要与保存入口，从磁盘重载后获取 Schema，核对引用去重和重新激活。
+@pytest.mark.parametrize("keep_reference", [False, True])
+async def test_compacted_availability_controls_reference_reload(tmp_path, keep_reference):
+    from kama_claude.core.compact.manager import compact_session
+    from kama_claude.core.discovery.tool import GetToolSchema
+
+    names = ["remote__get_issue", "remote__list_comments"]
+    run = run_state(loaded_tool_names=[names[0]],
+                    tool_candidates={names[0]: 1}, step=3)
+    run.mcp_tool_names.append(names[1])
+    run.tool_schemas.append({"name": names[1], "input_schema": {}})
+    run.loaded_tool_names.append(names[1])
+    run.tool_candidates[names[1]] = 1
+    run.provider = "custom"
+    run.workspace = str(tmp_path)
+    run.status, run.phase = "success", "finished"
+    messages = discovery_history()
+    messages[1]["content"][0]["input"]["names"].append(names[1])
+    messages[2]["content"][0]["content"].append({"type": "tool_reference", "tool_name": names[1]})
+    messages[1]["content"].insert(0, {"type": "text", "text": "old analysis " * 4000})
+    messages.append({"role": "user", "content": "a new request"})
+    if keep_reference:
+        messages.extend([
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "recent",
+                "name": "remote__get_issue", "input": {"number": 1}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "recent",
+                "content": "issue data"}]},
+        ])
+    store = SessionStore(tmp_path / "sessions")
+    session = Session("compact-availability", "chat", "waiting_for_input", "", "now", "now")
+    store.save_checkpoint(Checkpoint(session=session.to_dict(), run=run, messages=messages))
+    provider = ScriptedProvider([LlmResponse("end_turn", text="Previous issue investigation complete.")])
+    result = await compact_session(
+        store, session.id, EventBus(), CompactionConfig(auto_threshold=0.001, keep_recent_turns=1),
+        lambda: provider, "",
+    )
+    assert result.compacted
+    restored = store.checkpoints.load(session.id)
+    active = ["remote__get_issue"] if keep_reference else []
+    assert restored.run.loaded_tool_names == active
+    assert referenced_tools(restored.messages) == active
+    loaded = await GetToolSchema(restored.run).invoke({"names": names})
+    assert loaded.tool_references == ([names[1]] if keep_reference else names)
+    assert json.loads(loaded.content)["already_loaded"] == active
+    assert restored.run.loaded_tool_names == names

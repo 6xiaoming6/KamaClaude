@@ -68,7 +68,8 @@ def preserve_references(
                 call = calls.pop(str(block.get("tool_use_id", "")), None)
                 names = [name for name in result_references(block) if name in missing]
                 if (
-                    call is None or call.get("name") != "search_tool"
+                    # 旧历史只兼容引用记录；运行时不再注册旧搜索工具。
+                    call is None or call.get("name") not in ("get_tool_schema", "search_tool")
                     or not names or block.get("is_error")
                 ):
                     continue

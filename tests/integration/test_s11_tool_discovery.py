@@ -26,7 +26,10 @@ async def test_search_then_call_real_mcp(mcp_endpoint, tmp_path, native):
         provider_type = NativeScriptedProvider if native else ScriptedProvider
         provider = provider_type([
             LlmResponse("tool_use", tool_calls=[ToolCallBlock(
-                "search", "search_tool", {"description": "add two numbers", "keywords": ["add"]},
+                "search", "search_tool_candidates", {"description": "add two numbers", "keywords": ["add"]},
+            )]),
+            LlmResponse("tool_use", tool_calls=[ToolCallBlock(
+                "schema", "get_tool_schema", {"names": ["remote__add"]},
             )]),
             LlmResponse("tool_use", tool_calls=[ToolCallBlock(
                 "add", "remote__add", {"a": 10, "b": 20},
@@ -36,17 +39,20 @@ async def test_search_then_call_real_mcp(mcp_endpoint, tmp_path, native):
         outcome = await AgentRunner(config, provider=provider, mcp_manager=manager,
                                    runs_dir=tmp_path / "runs").run_and_capture("Add 10 and 20")
         assert outcome.status == "success" and outcome.result == "30"
+        candidates = provider.requests[1]["messages"][-1]["content"][0]["content"]
+        assert isinstance(candidates, str) and '"candidates"' in candidates
+        assert "tool_reference" not in candidates and "input_schema" not in candidates
         if native:
             assert provider.requests[0]["schemas"] == provider.requests[1]["schemas"]
             assert all(schema["defer_loading"] == schema["name"].startswith("remote__")
                        for schema in provider.requests[0]["schemas"])
-            content = provider.requests[1]["messages"][-1]["content"][0]["content"]
+            content = provider.requests[2]["messages"][-1]["content"][0]["content"]
             assert any(block.get("type") == "tool_reference" for block in content)
         else:
             assert all(not schema["name"].startswith("remote__")
                        for schema in provider.requests[0]["schemas"])
-        assert "remote__add" in {schema["name"] for schema in provider.requests[1]["schemas"]}
-        assert provider.requests[2]["messages"][-1]["content"][0]["content"] == "30"
+        assert "remote__add" in {schema["name"] for schema in provider.requests[2]["schemas"]}
+        assert provider.requests[3]["messages"][-1]["content"][0]["content"] == "30"
         first = manager.get_tools()[0].record
         assert manager.catalog.current_hash(first.server_id, first.name) == first.definition_hash
     finally:

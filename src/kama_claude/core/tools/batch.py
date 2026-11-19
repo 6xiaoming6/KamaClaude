@@ -107,7 +107,9 @@ class ToolBatchExecutor:
                 tool.name in run.mcp_tool_names and tool.name not in visible
             ):
                 result = ToolResult(
-                    "Tool was not exposed on this model turn. Search and use it on the next turn.",
+                    "Tool was not exposed on this model turn. For MCP tools, first call "
+                    "search_tool_candidates, inspect candidates, then get_tool_schema(names). "
+                    "Use the loaded tool on the next turn.",
                     is_error=True, error_type="schema_error",
                 )
             elif (

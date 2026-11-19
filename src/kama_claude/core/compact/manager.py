@@ -100,6 +100,7 @@ def validate_candidate(
         )
         if not required <= set(run.mcp_tool_names):
             raise ValueError("tool_reference_outside_frozen_catalog")
+        # 只保留当前候选上下文中的激活定义；移除的引用下次允许重新加载。
         loaded = [str(schema["name"]) for schema in run.tool_schemas
                   if schema["name"] in required]
         definitions = [s for s in run.tool_schemas if s["name"] in loaded]

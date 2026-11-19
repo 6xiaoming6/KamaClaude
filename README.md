@@ -20,15 +20,21 @@ Core 持有后台 Task，客户端通过 `asyncio.shield()` 等待。TUI 断线�
 
 **接入很多 MCP 工具，会全部塞进模型上下文吗？**
 
-DeepSeek / Anthropic 使用原生延迟加载模式：完整目录及顺序在本轮冻结，MCP 标记 `defer_loading=true`，内置工具和 `search_tool` 常驻。模型调用 `search_tool` 后，本地 BM25＋E5 向量检索、RRF 融合返回 `tool_reference`，下一步再使用对应工具。完整目录仍通过 HTTP 发送；非原生 Provider 使用本地按需展示完整 Schema 的兼容路径。
+发现与加载分开：先调用 `search_tool_candidates(description, keywords, topk=3)`，本地 BM25＋E5 向量检索、RRF 融合只返回候选的工具名、服务名、简短描述及是否已激活；模型看过结果后，再调用 `get_tool_schema(names)`，一次选择 1～10 个工具，只为尚未激活的工具返回引用，不再加载所有候选。
 
-`search_tool` 接收两个必填参数：`description` 描述所需能力，用于“本轮原始用户输入＋描述”的语义检索；`keywords` 是 1～3 个关键词的数组，只供 BM25 词面匹配，可填写服务名、工具名或参数名。两路仍用 RRF 融合，关键词不是必须全部命中的硬过滤。语义模型不可用时只使用关键词降级检索，不把描述和背景重新混入关键词查询。例如：
+DeepSeek / Anthropic 使用原生延迟加载模式：完整目录及顺序在本轮冻结，MCP 标记 `defer_loading=true`，内置工具与两个发现工具常驻。`get_tool_schema` 返回所选工具的 `tool_reference`，由接口展开定义，下一次模型请求才能使用该工具。完整目录仍通过 HTTP 发送；非原生 Provider 则在确认加载后的下一次请求中展示完整 Schema。候选搜索本身不改变可见 Schema、不占用已加载额度。
+
+`search_tool_candidates` 接收两个必填参数：`description` 用于“本轮原始用户输入＋描述”的语义检索；`keywords` 是 1～3 个关键词，只供 BM25 词面匹配，例如服务名、工具名或参数名。两路用 RRF 融合，关键词不是必须全部命中的硬过滤。语义模型不可用时明确降级为 `keyword_only`。例如先搜索：
 
 ```json
 {"description": "读取 GitHub 问题的详情及讨论，定位用户反馈的故障", "keywords": ["github", "get_issue", "comments"]}
 ```
 
-关键词去掉首尾空白后每项为 1～100 字符，描述最多 2000 字符。工具名称仍为 `search_tool`，数据库和向量缓存格式不变；此次入参 Schema 已变更，冻结旧定义的中断 Run 仍按原规则拒绝续跑，可终止旧 Run 后开始新任务。
+可选参数 `topk` 控制本次最多返回多少候选，范围 1～10。省略时使用 `[tool_search].top_k`，默认 3；结果不合适时，模型可以调整检索词或传入 `"topk": 10` 扩大候选范围。它不扩大白名单，不自动加载定义，也不修改后续调用的默认值。
+
+看到候选后，调用 `get_tool_schema({"names":["github__get_issue","github__list_comments"]})`；确认加载成功，下一步再调用业务工具。不能跳过候选搜索，也不能把首次搜索与猜测候选的加载放在同一模型回复中。重复名称自动去重；当前上下文已激活的工具只返回 `already_loaded`，不重复返回引用。超出 Schema 预算的工具不加载。搜索和加载均不授予执行权限。
+
+关键词去掉首尾空白后每项为 1～100 字符，描述最多 2000 字符。候选及激活列表随检查点保存；压缩保留近期必需的真实加载记录，并从激活列表移除已丢弃引用的工具，下次需要时可以重新加载。数据库与向量缓存格式不变，旧 `search_tool` 不再注册；冻结旧工具定义的中断 Run 仍按原规则拒绝续跑，可终止旧 Run 后开始新任务。详见[渐进式 MCP 工具加载](docs/MCP-Progressive-Loading.md)。
 
 **加载工具或 Skill，就获得执行权限了吗？**
 

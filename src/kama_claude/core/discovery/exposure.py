@@ -37,7 +37,7 @@ def load_tools(run: RunCheckpoint, names: list[str]) -> tuple[list[str], list[st
     return selected, rejected
 
 
-# 原生延迟加载始终发送完整目录与固定标记，搜索后不移动或改写顶层 tools。
+# 原生延迟加载始终发送冻结目录，候选搜索和单工具加载都不改写顶层 tools。
 def request_schemas(run: RunCheckpoint) -> list[dict[str, Any]]:
     if run.tool_loading_mode != "deferred":
         return visible_schemas(run)
