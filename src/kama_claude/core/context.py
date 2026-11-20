@@ -4,13 +4,19 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
-from kama_claude.core.checkpoint.checkpoint import RunCheckpoint
+from kama_claude.core.checkpoint.checkpoint import RunCheckpoint, ToolCheckpoint
 from kama_claude.core.memory.context import compose_system
 from kama_claude.core.memory.model import MemorySnapshot
 
 
 class RunStopRequested(Exception):
     """只在安全边界退出，不用于取消正在执行的工具。"""
+
+
+# 并发结果按声明顺序放入模型历史，完整 thread 仍保留实际完成顺序。
+def order_tool_results(blocks: list[dict[str, Any]], tools: list[ToolCheckpoint]) -> None:
+    order = {tool.id: index for index, tool in enumerate(tools)}
+    blocks.sort(key=lambda block: order.get(str(block.get("tool_use_id", "")), len(order)))
 
 
 @dataclass
@@ -65,6 +71,7 @@ class ExecutionContext:
             and all(b.get("type") == "tool_result" for b in last["content"])
         ):
             last["content"].append(block)
+            order_tool_results(last["content"], self.run.tools)
         else:
             self.messages.append({"role": "user", "content": [block]})
         return block

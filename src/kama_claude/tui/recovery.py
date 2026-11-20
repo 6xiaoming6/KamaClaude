@@ -92,11 +92,14 @@ class RecoveryActions(Vertical):
         elif unknown:
             import json
 
-            tool = unknown[0]
-            yield Static(
-                f"工具结果未知：{tool['name']}\n"
+            details = "\n\n".join(
+                f"{index}. {tool['name']}\n"
                 + json.dumps(tool["input"], ensure_ascii=False, indent=2)
-                + "\n请先核实外部操作和进程是否已完成，再决定是否重试。",
+                for index, tool in enumerate(unknown, 1)
+            )
+            yield Static(
+                f"工具结果未知（{len(unknown)} 个）：\n" + details
+                + "\n请核实以上全部操作；“核实后重试”会重试所有列出的未知调用。",
                 markup=False,
             )
         with Horizontal():

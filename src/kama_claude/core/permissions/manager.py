@@ -75,6 +75,16 @@ class PermissionManager:
         return assess(tool_name, params, self._policies.get(tool_name),
                       command_platform=command_platform).decision
 
+    # 只预判是否无需询问，不创建 Future、不修改授权；真实调用仍重新校验。
+    def can_auto_allow(
+        self, tool_name: str, params: dict[str, Any], session_id: str, *,
+        path_access: PathAccess,
+    ) -> bool:
+        return not self._is_persistently_denied(tool_name, params) and assess(
+            tool_name, params, self._policies.get(tool_name), path_access=path_access,
+            mode=self.get_mode(session_id),
+        ).decision == PermissionDecision.ALLOW
+
     # 旧策略只继续保留明确拒绝，不重新启用工具级永久允许。
     def _is_persistently_denied(self, tool_name: str, params: dict[str, Any]) -> bool:
         return tool_name in self._persistent_denials or (

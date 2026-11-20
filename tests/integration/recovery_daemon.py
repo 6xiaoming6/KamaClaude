@@ -15,6 +15,7 @@ from kama_claude.core.session.manager import SessionManager
 from kama_claude.core.session.store import SessionStore
 from kama_claude.core.tools.base import BaseTool, ToolResult
 from kama_claude.core.tools.builtin.finish import FinishTool
+from kama_claude.core.tools.builtin.read_file import ReadFileTool
 from kama_claude.core.tools.registry import ToolRegistry
 from kama_claude.core.transport.ipc_broadcaster import IpcEventBroadcaster
 from kama_claude.core.transport.socket_server import SocketServer
@@ -75,15 +76,35 @@ class Provider:
         return LlmResponse(
             "tool_use",
             tool_calls=[
+                ToolCallBlock("tool-a", "read_file", {"path": "a"}),
+                ToolCallBlock("tool-b", "read_file", {"path": "b"}),
+            ] if (self.root / "parallel-mode").exists() else [
                 ToolCallBlock("tool-a", "probe", {"name": "a"}),
                 ToolCallBlock("tool-b", "probe", {"name": "b"}),
             ],
         )
 
 
+class ParallelRead(ReadFileTool):
+    # 门闩与计数仅用于测试仪器，真正的读工具没有这些记录文件副作用。
+    async def _invoke_path(self, params: dict[str, object], path: Path) -> ToolResult:
+        root = self.paths.root
+        with (root / "read-calls.txt").open("a", encoding="utf-8") as file:
+            file.write(path.name + "\n")
+            file.flush()
+            os.fsync(file.fileno())
+        if path.name == "a":
+            (root / "a-started").touch()
+            while not (root / "release-a").exists():
+                await asyncio.sleep(0.02)
+        return ToolResult("read:" + path.name)
+
+
 # 运行真实 Core handler、检查点与 TCP，只替换模型和有副作用工具
 async def main(root: Path, port: int) -> None:
     root.mkdir(parents=True, exist_ok=True)
+    if (root / "parallel-mode").exists():
+        os.chdir(root)  # 固定工作区与重启恢复校验使用同一个临时目录。
     if (root / "long-output").exists():
         from kama_claude.core.compact import budget
 
@@ -103,7 +124,8 @@ async def main(root: Path, port: int) -> None:
         # 每个 Run 仍由真实 Runner 组装，只注册受控实验工具
         def _build_registry(self, task_manager: Any, **kwargs: Any) -> ToolRegistry:
             registry = ToolRegistry()
-            registry.register(FileProbe(root))
+            registry.register(ParallelRead(root) if (root / "parallel-mode").exists()
+                              else FileProbe(root))
             run = kwargs.get("run")
             if run is not None and run.completion_mode == "explicit":
                 registry.register(FinishTool())

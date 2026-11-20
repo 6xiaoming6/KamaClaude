@@ -469,7 +469,7 @@ async def test_result_save_failure_stops_execution(
 
     # 阻止副作用之后的第一份结果提交
     def fail_result(cp: Any) -> None:
-        if cp.run and cp.run.tool_index == 1:
+        if cp.run and cp.run.tools and cp.run.tools[0].status == "completed":
             raise CheckpointError("disk full")
         original(cp)
 

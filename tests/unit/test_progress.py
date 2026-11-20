@@ -232,6 +232,8 @@ async def test_real_loop_stops_after_warning_and_new_run_starts_clean(tmp_path, 
     assert new.run.run_id != cp.run.run_id
 
 
+# 功能：无进展停止后不越过写操作屏障，并为未执行调用补齐结果。
+# 设计：读取可并行，写入必须等待；用未创建的文件验证屏障后的操作确实没有发生。
 async def test_stop_does_not_execute_remaining_calls_and_keeps_message_pairs(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "a.txt").write_text("unchanged", encoding="utf-8")
@@ -240,7 +242,9 @@ async def test_stop_does_not_execute_remaining_calls_and_keeps_message_pairs(tmp
         async def chat(self, **kwargs):
             response = await super().chat(**kwargs)
             if kwargs["step"] == 5:
-                response.tool_calls.append(ToolCallBlock("extra", "read_file", {"path": "b.txt"}))
+                response.tool_calls.append(ToolCallBlock(
+                    "extra", "write_file", {"path": "b.txt", "content": "must not be written"},
+                ))
             return response
 
     calls = []
@@ -258,6 +262,7 @@ async def test_stop_does_not_execute_remaining_calls_and_keeps_message_pairs(tmp
     cp = store.checkpoints.load(session.id)
     assert cp.run.reason == "no_progress" and len(model.calls) == 5
     assert calls == ["a.txt"] * 5
+    assert not (tmp_path / "b.txt").exists()
     assert validate_pairs(cp.messages)
     assert cp.run.tools[-1].status == "completed"
     assert "not executed: no_progress" in cp.run.tools[-1].result["content"]

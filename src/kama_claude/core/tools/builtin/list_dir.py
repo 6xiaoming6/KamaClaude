@@ -20,6 +20,7 @@ class ListDirParams(ToolParams):
 
 
 class ListDirTool(FileTool):
+    parallel_safe = True
     retry_safe = True
     params_model = ListDirParams
     name = "list_dir"

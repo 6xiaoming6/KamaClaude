@@ -5,12 +5,31 @@ import json
 from typing import Any
 
 import pytest
-from textual.widgets import Button
+from textual.widgets import Button, Static
 
 from kama_claude.tui.app import KamaTuiApp
 from kama_claude.tui.recovery import RecoveryActions, SessionPicker
 from kama_claude.tui.widgets.conversation import ToolCallBlock
 from kama_claude.tui.widgets.input import ChatTextArea
+
+
+# 功能：多个未知调用全部展示，重试按钮说明覆盖全部未知项。
+# 设计：运行真实恢复控件，避免后端批量重试但前端只告知第一个工具。
+async def test_recovery_displays_all_unknown_tools(monkeypatch):
+    monkeypatch.setattr(KamaTuiApp, "_socket_loop", idle_socket)
+    app = KamaTuiApp("127.0.0.1", 1)
+    client = Client(unknown=True)
+    client.state["run"]["tools"].append({
+        "id": "tool-b", "name": "read_file", "input": {"path": "b.txt"}, "status": "unknown",
+    })
+    async with app.run_test(size=(110, 40)) as pilot:
+        app._client = client
+        await app._open_session("sess-test")
+        await pilot.pause()
+        panel = app.query_one(RecoveryActions)
+        text = "\n".join(str(widget.render()) for widget in panel.query(Static))
+        assert "write_file" in text and "a.txt" in text
+        assert "read_file" in text and "b.txt" in text and "所有列出的未知调用" in text
 
 
 # 构造真实快照形状的假后端，不调用模型

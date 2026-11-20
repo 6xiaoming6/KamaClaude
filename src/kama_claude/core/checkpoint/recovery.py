@@ -122,6 +122,8 @@ class SessionRecovery:
 
     # 终止原 Run，为未完成调用补充中断说明，保证后续消息可以合法续聊
     def _abort(self, cp: Checkpoint, run: RunCheckpoint) -> None:
+        from kama_claude.core.context import order_tool_results
+
         run.status = "failed"
         run.phase = "finished"
         run.reason = "recovery_aborted"
@@ -149,6 +151,8 @@ class SessionRecovery:
                 last["content"].append(block)
             else:
                 cp.messages.append({"role": "user", "content": [block]})
+        if cp.messages and isinstance(cp.messages[-1].get("content"), list):
+            order_tool_results(cp.messages[-1]["content"], run.tools)
         cp.session["status"] = (
             "closed" if cp.session["mode"] == "one_shot" else "waiting_for_input"
         )

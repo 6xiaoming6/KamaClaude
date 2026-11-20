@@ -19,6 +19,7 @@ class ReadFileParams(ToolParams):
 
 class ReadFileTool(FileTool):
     retry_safe = True
+    parallel_safe = True
     params_model = ReadFileParams
     name = "read_file"
     description = (

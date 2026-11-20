@@ -180,3 +180,69 @@ async def test_client_reconnect_attaches_to_existing_run(tmp_path: Path, free_po
             await asyncio.gather(waiter, return_exceptions=True)
         await close(client, receiver)
         daemon.kill()
+
+
+# 功能：并行读取中 B 先提交，断线或真实 Core 硬重启后都不重复执行 B。
+# 设计：实际 TCP、子进程和磁盘快照，只替换付费模型与受控读取 I/O。
+@pytest.mark.parametrize("restart", [False, True])
+async def test_parallel_completed_peer_survives_disconnect_or_restart(
+    tmp_path: Path, free_port: int, restart: bool,
+) -> None:
+    (tmp_path / "parallel-mode").touch()
+    daemon = Daemon(tmp_path, free_port)
+    await daemon.start()
+    client, receiver = await connect(free_port)
+    waiter = None
+    saved_b = asyncio.Event()
+
+    # 回调只置位，不在同一接收循环中等待 RPC。
+    async def observe(event: dict[str, Any]) -> None:
+        if event.get("type") == "tool.call_finished" and event.get("tool_use_id") == "tool-b":
+            saved_b.set()
+
+    client.on_event(observe)
+    try:
+        sid = (await client.send_command("session.create", {"mode": "chat"}))["session_id"]
+        await client.send_command("session.open", {"session_id": sid})
+        waiter = asyncio.create_task(client.send_command(
+            "session.send_message", {"session_id": sid, "content": "inspect files"},
+        ))
+        await asyncio.wait_for(saved_b.wait(), 10)
+        await wait_file(tmp_path / "a-started")
+        state = await client.send_command("session.open", {"session_id": sid})
+        original_id = state["run"]["run_id"]
+        assert [t["status"] for t in state["run"]["tools"]] == ["executing", "completed"]
+        assert state["run"]["tool_index"] == 0
+        if restart:
+            daemon.kill()
+        await close(client, receiver)
+        with pytest.raises(ConnectionError):
+            await asyncio.wait_for(waiter, 3)
+        if restart:
+            await daemon.start()
+        client, receiver = await connect(free_port)
+        opened = await client.send_command("session.open", {"session_id": sid})
+        assert opened["run"]["tools"][1]["status"] == "completed"
+        (tmp_path / "release-a").touch()
+        if restart:
+            assert opened["run"]["tools"][0]["status"] == "unknown"
+            await client.send_command("session.resume", {
+                "session_id": sid, "expected_revision": opened["revision"], "action": "retry_tool",
+            })
+        else:
+            assert opened["running"]
+        final = await wait_status(client, sid, "success")
+        assert final["run"]["run_id"] == original_id and final["run"]["step"] == 2
+        calls = (tmp_path / "read-calls.txt").read_text(encoding="utf-8").splitlines()
+        assert calls.count("b") == 1 and calls.count("a") == (2 if restart else 1)
+        raw = json.loads((tmp_path / "sessions" / sid / "checkpoint.json").read_text(encoding="utf-8"))
+        ids = [block["tool_use_id"] for message in raw["messages"]
+               if message["role"] == "user" and isinstance(message["content"], list)
+               for block in message["content"] if block.get("tool_use_id") in {"tool-a", "tool-b"}]
+        assert ids == ["tool-a", "tool-b"]
+    finally:
+        if waiter is not None and not waiter.done():
+            waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+        await close(client, receiver)
+        daemon.kill()

@@ -90,6 +90,7 @@ async def invoke_tool(
     workspace: Path | None = None,
     checkpoint_hook: ToolCheckpointHook | None = None,
     notify_result: bool = True,
+    allow_prompt: bool = True,
 ) -> ToolResult:
     t0 = time.monotonic()
     await bus.publish_safe(
@@ -147,6 +148,7 @@ async def invoke_tool(
         tool, tool_call, params, path_access, bus, run_id,
         permission_manager=permission_manager, session_id=session_id,
         workspace=workspace, checkpoint_hook=checkpoint_hook,
+        allow_prompt=allow_prompt,
     )
     if denied is not None:
         return await finish(denied)
@@ -163,7 +165,19 @@ async def _authorize(
     path_access: PathAccess | None, bus: EventBus, run_id: str, *,
     permission_manager: PermissionManager | None, session_id: str,
     workspace: Path | None, checkpoint_hook: ToolCheckpointHook | None,
+    allow_prompt: bool,
 ) -> ToolResult | None:
+    # 并行只读调用在路径或策略变化后停止，不在后台创建新的审批等待。
+    if not allow_prompt and (
+        path_access is None or path_access.outside_workspace
+        or (permission_manager is not None and not permission_manager.can_auto_allow(
+            tool_call.name, params, session_id, path_access=path_access,
+        ))
+    ):
+        return ToolResult(
+            "Path or permission changed; retry this operation through normal approval.",
+            is_error=True, error_type="permission_denied",
+        )
     if path_access is not None and path_access.outside_workspace and permission_manager is None:
         return ToolResult(
             content=f"outside workspace; approval unavailable: {path_access.target}",

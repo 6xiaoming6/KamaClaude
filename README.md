@@ -60,6 +60,12 @@ flowchart TD
 
 普通执行与恢复使用同一条 Loop。`context.run` 是唯一执行状态来源；Runner 负责组装和收尾，Loop 通过注入的组件管理上下文、工具批次、预算和保存。
 
+**同一回复中的工具会并行吗？**
+
+`read_file`、`list_dir`、`find_files`、`search_text` 在工作区内且无需审批时，每组最多 3 个并行执行。按模型声明顺序分组，整组结束后才处理下一组；写入、编辑、Bash、MCP 和修改运行状态的工具保持串行。例如 `read(A), read(B), edit(A), read(C)` 会先并行读取 A/B，编辑结束后再读取 C。
+
+每个结果完成就单独保存；模型工作历史按声明顺序排列，完整 `thread.jsonl` 保留实际完成时追加的原文。游标后也可能存在已完成工具，恢复会复用其结果。Ctrl+C 不再启动下一组，等待已启动组结束后保存中断；真正取消后仍未提交的调用沿用 `unknown` 确认流程。详见[只读工具受控并行](docs/Parallel-Read-Tools.md)。
+
 | 职责 | 代码入口 |
 | --- | --- |
 | 会话、锁、Core 持有的后台任务 | [session/manager.py](./src/kama_claude/core/session/manager.py) |

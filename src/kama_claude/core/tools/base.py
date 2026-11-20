@@ -45,6 +45,7 @@ class BaseTool(ABC):
     description: str
     input_schema: dict[str, object]
     retry_safe: ClassVar[bool] = False
+    parallel_safe: ClassVar[bool] = False  # 可并发与可重试分别声明，不由模型控制。
     ends_run: ClassVar[bool] = False
     timeout_s: ClassVar[float | None] = 120.0  # None 表示由工具自身和外层 Run 预算约束。
     params_model: ClassVar[type[BaseModel] | None] = None

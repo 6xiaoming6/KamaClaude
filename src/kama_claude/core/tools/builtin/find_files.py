@@ -27,6 +27,7 @@ class FindFilesParams(ToolParams):
 
 
 class FindFilesTool(FileTool):
+    parallel_safe = True
     name = "find_files"
     retry_safe = True
     description = (

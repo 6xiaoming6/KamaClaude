@@ -46,6 +46,7 @@ class SearchTextParams(ToolParams):
 
 
 class SearchTextTool(FileTool):
+    parallel_safe = True
     name = "search_text"
     retry_safe = True
     description = (

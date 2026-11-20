@@ -195,8 +195,17 @@ class CheckpointStore:
                 for tool in run.tools[: run.tool_index]:
                     if tool.status != "completed" or tool.result is None:
                         raise CheckpointError("tool cursor skips an uncommitted result")
-                if any(t.status == "completed" for t in run.tools[run.tool_index :]):
-                    raise CheckpointError("tool result and cursor are inconsistent")
+                # 并行工具可先于游标完成，但结果和配对消息必须已经一起提交。
+                paired = {
+                    str(block.get("tool_use_id", "")) for message in cp.messages[-1:]
+                    if message["role"] == "user" and isinstance(message["content"], list)
+                    for block in message["content"] if block.get("type") == "tool_result"
+                }
+                if any(
+                    tool.status == "completed" and (tool.result is None or tool.id not in paired)
+                    for tool in run.tools[run.tool_index:]
+                ):
+                    raise CheckpointError("completed tool is missing its result or paired message")
             return cp
         except (OSError, ValueError, ValidationError) as exc:
             raise CheckpointError(f"cannot load checkpoint for {sid}: {exc}") from exc
